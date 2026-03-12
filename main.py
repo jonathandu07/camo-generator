@@ -1,19 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 Camouflage Armée Fédérale Europe
-Générateur de 100 variantes cohérentes
+Générateur filtré de 100 variantes cohérentes
 
 Objectif :
-- produire 100 camouflages différents
-- tout en respectant la même doctrine visuelle :
-  * fond coyote dominant
-  * grandes masses olive verticales/obliques
-  * terre de transition
-  * gris de rupture
-  * micro-clusters uniquement sur interfaces
-  * pas de formes rondes
-  * pas de répétition périodique
-  * pas de symétrie
+- 100 camouflages différents mais de la même famille visuelle
+- respect de la hiérarchie Macro / Transition / Micro
+- contrôle des proportions
+- rejet automatique des variantes trop éloignées de la cible
 
 Dépendances :
     pip install pillow numpy
@@ -33,24 +27,25 @@ import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw
 
 
 # ============================================================
-# CONFIGURATION GÉNÉRALE
+# CONFIGURATION GLOBALE
 # ============================================================
 
 OUTPUT_DIR = Path("camouflages_federale_europe")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-WIDTH = 1400
-HEIGHT = 2000
-PX_PER_CM = 4.6
+WIDTH = 1200
+HEIGHT = 1700
+PX_PER_CM = 4.2
 
-N_VARIANTS = 100
+N_VARIANTS_REQUIRED = 100
+MAX_ATTEMPTS = 3000
 
 COLOR_NAMES = [
     "coyote_brown",
@@ -61,12 +56,17 @@ COLOR_NAMES = [
 
 RGB = np.array([
     (0x81, 0x61, 0x3C),  # coyote brown
-    (0x55, 0x54, 0x3F),  # olive
-    (0x7C, 0x6D, 0x66),  # terre
+    (0x55, 0x54, 0x3F),  # vert olive
+    (0x7C, 0x6D, 0x66),  # terre de france
     (0x57, 0x5D, 0x57),  # vert-de-gris
 ], dtype=np.uint8)
 
 TARGET = np.array([0.32, 0.28, 0.22, 0.18], dtype=float)
+
+# Tolérances d'acceptation
+# On impose une proximité réelle à la cible.
+MAX_ABS_ERROR_PER_COLOR = np.array([0.09, 0.09, 0.08, 0.08], dtype=float)
+MAX_MEAN_ABS_ERROR = 0.055
 
 BASE_ANGLES = [-35, -30, -25, -20, -15, 0, 15, 20, 25, 30, 35]
 
@@ -89,56 +89,49 @@ DENSITY_ZONES = [
 @dataclass
 class VariantProfile:
     seed: int
+    allowed_angles: List[int]
     n_macro_olive: int
     n_macro_terre: int
     n_macro_gris: int
-    n_transitions_min: int
-    n_transitions_max: int
+    n_transition_total: int
     n_micro_clusters: int
     micro_cluster_min: int
     micro_cluster_max: int
-    width_variation_macro: float
-    lateral_jitter_macro: float
-    edge_break_macro: float
-    tip_taper_macro: float
-    width_variation_micro: float
-    lateral_jitter_micro: float
-    edge_break_micro: float
-    tip_taper_micro: float
-    allowed_angles: List[int]
+    macro_width_variation: float
+    macro_lateral_jitter: float
+    macro_tip_taper: float
+    macro_edge_break: float
+    micro_width_variation: float
+    micro_lateral_jitter: float
+    micro_tip_taper: float
+    micro_edge_break: float
 
 
-def make_variant_profile(index: int) -> VariantProfile:
-    """
-    Génère une variante différente mais cohérente avec la doctrine.
-    """
-    seed = 2026031200 + index
+def make_profile(seed: int) -> VariantProfile:
     rng = random.Random(seed)
 
-    # Variation contrôlée autour d'un même style
-    angle_pool = BASE_ANGLES[:]
-    rng.shuffle(angle_pool)
-    allowed_angles = sorted(angle_pool[: rng.randint(7, len(BASE_ANGLES))])
+    allowed = BASE_ANGLES[:]
+    rng.shuffle(allowed)
+    allowed = sorted(allowed[:rng.randint(8, len(BASE_ANGLES))])
 
     return VariantProfile(
         seed=seed,
-        n_macro_olive=rng.randint(16, 24),
-        n_macro_terre=rng.randint(9, 15),
-        n_macro_gris=rng.randint(3, 6),
-        n_transitions_min=rng.randint(2, 4),
-        n_transitions_max=rng.randint(5, 8),
-        n_micro_clusters=rng.randint(700, 1300),
+        allowed_angles=allowed,
+        n_macro_olive=rng.randint(24, 34),
+        n_macro_terre=rng.randint(16, 24),
+        n_macro_gris=rng.randint(4, 7),
+        n_transition_total=rng.randint(180, 320),
+        n_micro_clusters=rng.randint(420, 780),
         micro_cluster_min=2,
         micro_cluster_max=rng.randint(4, 5),
-        width_variation_macro=rng.uniform(0.24, 0.34),
-        lateral_jitter_macro=rng.uniform(0.16, 0.24),
-        edge_break_macro=rng.uniform(0.09, 0.15),
-        tip_taper_macro=rng.uniform(0.36, 0.48),
-        width_variation_micro=rng.uniform(0.20, 0.28),
-        lateral_jitter_micro=rng.uniform(0.14, 0.20),
-        edge_break_micro=rng.uniform(0.12, 0.18),
-        tip_taper_micro=rng.uniform(0.42, 0.54),
-        allowed_angles=allowed_angles,
+        macro_width_variation=rng.uniform(0.24, 0.34),
+        macro_lateral_jitter=rng.uniform(0.16, 0.24),
+        macro_tip_taper=rng.uniform(0.34, 0.46),
+        macro_edge_break=rng.uniform(0.09, 0.15),
+        micro_width_variation=rng.uniform(0.20, 0.28),
+        micro_lateral_jitter=rng.uniform(0.14, 0.20),
+        micro_tip_taper=rng.uniform(0.42, 0.54),
+        micro_edge_break=rng.uniform(0.12, 0.18),
     )
 
 
@@ -150,14 +143,13 @@ def cm_to_px(cm: float) -> int:
     return max(1, int(round(cm * PX_PER_CM)))
 
 
-def ratios(canvas: np.ndarray) -> np.ndarray:
+def compute_ratios(canvas: np.ndarray) -> np.ndarray:
     counts = np.bincount(canvas.ravel(), minlength=4).astype(float)
     return counts / canvas.size
 
 
 def render_canvas(canvas: np.ndarray) -> Image.Image:
-    arr = RGB[canvas]
-    return Image.fromarray(arr, "RGB")
+    return Image.fromarray(RGB[canvas], "RGB")
 
 
 def rotate(x: float, y: float, deg: float) -> Tuple[float, float]:
@@ -190,10 +182,6 @@ def boundary_mask(canvas: np.ndarray) -> np.ndarray:
     diff[:, :-1] |= (canvas[:, :-1] != canvas[:, 1:])
     return diff
 
-
-# ============================================================
-# FORMES
-# ============================================================
 
 def jagged_spine_poly(
     rng: random.Random,
@@ -270,7 +258,6 @@ def attached_transition(
         mx + tx * (base * 0.80) + nx * (tip * 0.74),
         my + ty * (base * 0.80) + ny * (tip * 0.74),
     )
-
     return [a, d1, c, d2, b]
 
 
@@ -280,13 +267,12 @@ def attached_transition(
 
 def generate_one_variant(profile: VariantProfile) -> Tuple[Image.Image, np.ndarray]:
     rng = random.Random(profile.seed)
-    np.random.seed(profile.seed % (2**32 - 1))
-
     canvas = np.zeros((HEIGHT, WIDTH), dtype=np.uint8)  # fond coyote
+
     macro_polys: List[Tuple[int, List[Tuple[float, float]]]] = []
 
     # --------------------------------------------------------
-    # 1) Macro olive
+    # 1) Macros Olive
     # --------------------------------------------------------
     for _ in range(profile.n_macro_olive):
         cx, cy = choose_biased_center(rng)
@@ -298,17 +284,16 @@ def generate_one_variant(profile: VariantProfile) -> Tuple[Image.Image, np.ndarr
             width_px=cm_to_px(rng.uniform(15, 35)),
             angle_from_vertical_deg=rng.choice(profile.allowed_angles),
             segments=rng.randint(7, 10),
-            width_variation=profile.width_variation_macro,
-            lateral_jitter=profile.lateral_jitter_macro,
-            tip_taper=profile.tip_taper_macro,
-            edge_break=profile.edge_break_macro,
+            width_variation=profile.macro_width_variation,
+            lateral_jitter=profile.macro_lateral_jitter,
+            tip_taper=profile.macro_tip_taper,
+            edge_break=profile.macro_edge_break,
         )
-        mask = polygon_mask(poly)
-        canvas[mask] = 1
+        canvas[polygon_mask(poly)] = 1
         macro_polys.append((1, poly))
 
     # --------------------------------------------------------
-    # 2) Macro terre
+    # 2) Macros Terre
     # --------------------------------------------------------
     for _ in range(profile.n_macro_terre):
         cx, cy = choose_biased_center(rng)
@@ -320,17 +305,16 @@ def generate_one_variant(profile: VariantProfile) -> Tuple[Image.Image, np.ndarr
             width_px=cm_to_px(rng.uniform(12, 26)),
             angle_from_vertical_deg=rng.choice(profile.allowed_angles),
             segments=rng.randint(6, 9),
-            width_variation=max(0.18, profile.width_variation_macro - 0.03),
-            lateral_jitter=max(0.12, profile.lateral_jitter_macro - 0.02),
-            tip_taper=profile.tip_taper_macro,
-            edge_break=profile.edge_break_macro,
+            width_variation=max(0.18, profile.macro_width_variation - 0.03),
+            lateral_jitter=max(0.12, profile.macro_lateral_jitter - 0.02),
+            tip_taper=profile.macro_tip_taper,
+            edge_break=profile.macro_edge_break,
         )
-        mask = polygon_mask(poly)
-        canvas[mask] = 2
+        canvas[polygon_mask(poly)] = 2
         macro_polys.append((2, poly))
 
     # --------------------------------------------------------
-    # 3) Macro gris rare
+    # 3) Intrusions rares gris
     # --------------------------------------------------------
     for _ in range(profile.n_macro_gris):
         cx, cy = choose_biased_center(rng)
@@ -342,39 +326,38 @@ def generate_one_variant(profile: VariantProfile) -> Tuple[Image.Image, np.ndarr
             width_px=cm_to_px(rng.uniform(10, 18)),
             angle_from_vertical_deg=rng.choice(profile.allowed_angles),
             segments=rng.randint(5, 8),
-            width_variation=max(0.16, profile.width_variation_macro - 0.08),
-            lateral_jitter=max(0.10, profile.lateral_jitter_macro - 0.05),
-            tip_taper=profile.tip_taper_macro,
-            edge_break=profile.edge_break_macro,
+            width_variation=max(0.16, profile.macro_width_variation - 0.08),
+            lateral_jitter=max(0.10, profile.macro_lateral_jitter - 0.05),
+            tip_taper=profile.macro_tip_taper,
+            edge_break=profile.macro_edge_break,
         )
-        mask = polygon_mask(poly)
-        canvas[mask] = 3
+        canvas[polygon_mask(poly)] = 3
         macro_polys.append((3, poly))
 
     # --------------------------------------------------------
     # 4) Transitions attachées
     # --------------------------------------------------------
-    for color_idx, parent in macro_polys:
-        n_trans = rng.randint(profile.n_transitions_min, profile.n_transitions_max)
-        for _ in range(n_trans):
-            poly = attached_transition(
-                rng=rng,
-                parent=parent,
-                length_px=cm_to_px(rng.uniform(10, 30)),
-                width_px=cm_to_px(rng.uniform(5, 15)),
-            )
-            mask = polygon_mask(poly)
+    for _ in range(profile.n_transition_total):
+        parent_color, parent = rng.choice(macro_polys)
+        poly = attached_transition(
+            rng=rng,
+            parent=parent,
+            length_px=cm_to_px(rng.uniform(10, 30)),
+            width_px=cm_to_px(rng.uniform(5, 15)),
+        )
+        mask = polygon_mask(poly)
 
-            r = rng.random()
-            if r < 0.66:
-                canvas[mask] = 2  # terre dominante
-            elif r < 0.87:
-                canvas[mask] = 1  # olive secondaire
-            else:
-                canvas[mask] = 0  # coyote secondaire
+        # Terre dominante en transition
+        r = rng.random()
+        if r < 0.68:
+            canvas[mask] = 2
+        elif r < 0.88:
+            canvas[mask] = 1
+        else:
+            canvas[mask] = 0
 
     # --------------------------------------------------------
-    # 5) Micro-clusters sur frontières uniquement
+    # 5) Micro-clusters uniquement sur frontières
     # --------------------------------------------------------
     for _ in range(profile.n_micro_clusters):
         b = boundary_mask(canvas)
@@ -401,10 +384,10 @@ def generate_one_variant(profile: VariantProfile) -> Tuple[Image.Image, np.ndarr
                 width_px=size * rng.uniform(0.45, 0.90),
                 angle_from_vertical_deg=rng.choice(profile.allowed_angles),
                 segments=rng.randint(4, 6),
-                width_variation=profile.width_variation_micro,
-                lateral_jitter=profile.lateral_jitter_micro,
-                tip_taper=profile.tip_taper_micro,
-                edge_break=profile.edge_break_micro,
+                width_variation=profile.micro_width_variation,
+                lateral_jitter=profile.micro_lateral_jitter,
+                tip_taper=profile.micro_tip_taper,
+                edge_break=profile.micro_edge_break,
             )
             mask = polygon_mask(poly)
             cur = canvas[mask]
@@ -413,16 +396,17 @@ def generate_one_variant(profile: VariantProfile) -> Tuple[Image.Image, np.ndarr
             if len(np.unique(cur)) < 2:
                 continue
 
+            # gris dominant, terre secondaire
             canvas[mask] = 3 if rng.random() < 0.74 else 2
 
     # --------------------------------------------------------
     # 6) Ajustement léger sur frontières
     # --------------------------------------------------------
-    for _ in range(4):
-        rs = ratios(canvas)
+    for _ in range(5):
+        rs = compute_ratios(canvas)
         deficits = TARGET - rs
 
-        if np.max(np.abs(deficits)) < 0.012:
+        if np.max(np.abs(deficits)) < 0.010:
             break
 
         b = boundary_mask(canvas)
@@ -430,7 +414,7 @@ def generate_one_variant(profile: VariantProfile) -> Tuple[Image.Image, np.ndarr
         if len(xs) == 0:
             break
 
-        picks = np.random.permutation(len(xs))[: min(len(xs), int(canvas.size * 0.002))]
+        picks = np.random.permutation(len(xs))[: min(len(xs), int(canvas.size * 0.0025))]
 
         for j in picks:
             x = int(xs[j])
@@ -450,53 +434,104 @@ def generate_one_variant(profile: VariantProfile) -> Tuple[Image.Image, np.ndarr
             x1, x2 = max(0, x - 2), min(WIDTH, x + 3)
             neigh = canvas[y1:y2, x1:x2]
 
-            if chosen not in neigh and rng.random() < 0.70:
+            if chosen not in neigh and rng.random() < 0.65:
                 continue
 
             canvas[y, x] = chosen
 
-    return render_canvas(canvas), ratios(canvas)
+    return render_canvas(canvas), compute_ratios(canvas)
+
+
+# ============================================================
+# VALIDATION
+# ============================================================
+
+def variant_is_valid(rs: np.ndarray) -> bool:
+    abs_err = np.abs(rs - TARGET)
+    if np.any(abs_err > MAX_ABS_ERROR_PER_COLOR):
+        return False
+    if float(np.mean(abs_err)) > MAX_MEAN_ABS_ERROR:
+        return False
+
+    # Contraintes supplémentaires doctrinales
+    # coyote doit rester dominant ou co-dominant, mais pas écrasant
+    if rs[0] < 0.20 or rs[0] > 0.46:
+        return False
+
+    # olive doit rester forte
+    if rs[1] < 0.18:
+        return False
+
+    # terre doit être réellement présente
+    if rs[2] < 0.14:
+        return False
+
+    # gris doit être visible
+    if rs[3] < 0.10:
+        return False
+
+    return True
 
 
 # ============================================================
 # GÉNÉRATION DES 100 VARIANTES
 # ============================================================
 
-def generate_100_camouflages() -> None:
-    report_rows = []
+def generate_all() -> None:
+    rows = []
+    accepted = 0
+    attempts = 0
 
-    for i in range(1, N_VARIANTS + 1):
-        profile = make_variant_profile(i)
+    while accepted < N_VARIANTS_REQUIRED and attempts < MAX_ATTEMPTS:
+        attempts += 1
+        seed = 2026031200 + attempts
+        profile = make_profile(seed)
+
         img, rs = generate_one_variant(profile)
 
-        filename = OUTPUT_DIR / f"camouflage_{i:03d}.png"
+        if not variant_is_valid(rs):
+            print(f"[{attempts:04d}] rejeté")
+            continue
+
+        accepted += 1
+        filename = OUTPUT_DIR / f"camouflage_{accepted:03d}.png"
         img.save(filename)
 
-        report_rows.append({
-            "index": i,
+        rows.append({
+            "index": accepted,
             "seed": profile.seed,
-            "coyote_brown_pct": round(rs[0] * 100, 2),
-            "vert_olive_pct": round(rs[1] * 100, 2),
-            "terre_de_france_pct": round(rs[2] * 100, 2),
-            "vert_de_gris_pct": round(rs[3] * 100, 2),
-            "n_macro_olive": profile.n_macro_olive,
-            "n_macro_terre": profile.n_macro_terre,
-            "n_macro_gris": profile.n_macro_gris,
-            "n_micro_clusters": profile.n_micro_clusters,
+            "coyote_brown_pct": round(float(rs[0] * 100), 2),
+            "vert_olive_pct": round(float(rs[1] * 100), 2),
+            "terre_de_france_pct": round(float(rs[2] * 100), 2),
+            "vert_de_gris_pct": round(float(rs[3] * 100), 2),
+            "macro_olive": profile.n_macro_olive,
+            "macro_terre": profile.n_macro_terre,
+            "macro_gris": profile.n_macro_gris,
+            "transitions": profile.n_transition_total,
+            "micro_clusters": profile.n_micro_clusters,
             "angles": " ".join(map(str, profile.allowed_angles)),
         })
 
-        print(f"[{i:03d}/{N_VARIANTS}] {filename.name} généré")
+        print(
+            f"[{attempts:04d}] accepté -> camouflage_{accepted:03d}.png | "
+            f"C={rs[0]*100:.1f} O={rs[1]*100:.1f} T={rs[2]*100:.1f} G={rs[3]*100:.1f}"
+        )
+
+    if not rows:
+        print("Aucune variante valide n'a été produite.")
+        return
 
     csv_path = OUTPUT_DIR / "rapport_camouflages.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(report_rows[0].keys()))
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
-        writer.writerows(report_rows)
+        writer.writerows(rows)
 
     print("\nTerminé.")
+    print(f"Variantes acceptées : {accepted}/{N_VARIANTS_REQUIRED}")
+    print(f"Tentatives : {attempts}")
     print(f"Dossier : {OUTPUT_DIR.resolve()}")
-    print(f"Rapport : {csv_path.resolve()}")
+    print(f"CSV : {csv_path.resolve()}")
 
 
 # ============================================================
@@ -504,4 +539,4 @@ def generate_100_camouflages() -> None:
 # ============================================================
 
 if __name__ == "__main__":
-    generate_100_camouflages()
+    generate_all()
