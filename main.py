@@ -1,18 +1,22 @@
 # -*- coding: utf-8 -*-
 """
+main.py
 Camouflage Armée Fédérale Europe
-Version renforcée : budgets surfaciques, validation multi-échelle,
-contrôles structurels renforcés, génération séquentielle stricte.
+Version renforcée, corrigée et pensée pour être utilisée comme module par start.py.
+
+Fonctions principales exposées :
+- build_seed(...)
+- make_profile(...)
+- generate_one_variant(...)
+- generate_candidate_from_seed(...)
+- validate_candidate_result(...)
+- save_candidate_image(...)
+- candidate_row(...)
+- write_report(...)
+- generate_all(...)
 
 Dépendances :
     pip install pillow numpy
-
-Sorties :
-    ./camouflages_federale_europe/
-        camouflage_001.png
-        ...
-        camouflage_100.png
-        rapport_camouflages.csv
 """
 
 from __future__ import annotations
@@ -22,7 +26,7 @@ import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -40,6 +44,7 @@ HEIGHT = 2000
 PX_PER_CM = 4.6
 
 N_VARIANTS_REQUIRED = 100
+DEFAULT_BASE_SEED = 202603120000
 
 # Couleurs
 IDX_COYOTE = 0
@@ -174,9 +179,25 @@ class MacroRecord:
     zone_count: int
 
 
+@dataclass
+class CandidateResult:
+    seed: int
+    profile: VariantProfile
+    image: Image.Image
+    ratios: np.ndarray
+    metrics: Dict[str, float]
+
+
 # ============================================================
 # PROFIL
 # ============================================================
+
+def build_seed(target_index: int, local_attempt: int, base_seed: int = DEFAULT_BASE_SEED) -> int:
+    """
+    Construit un seed unique et stable par image + tentative.
+    """
+    return int(base_seed + target_index * 100000 + local_attempt)
+
 
 def make_profile(seed: int) -> VariantProfile:
     rng = random.Random(seed)
@@ -298,6 +319,36 @@ def mirror_similarity_score(canvas: np.ndarray) -> float:
     h = min(left.shape[0], right_flipped.shape[0])
     w = min(left.shape[1], right_flipped.shape[1])
     return float(np.mean(left[:h, :w] == right_flipped[:h, :w]))
+
+
+def infer_origin_from_neighbors(
+    canvas: np.ndarray,
+    origin_map: np.ndarray,
+    x: int,
+    y: int,
+    chosen_color: int,
+    fallback_origin: int,
+) -> int:
+    """
+    Choisit une origine cohérente pour un pixel retouché pendant le nudge.
+    On récupère l'origine majoritaire des voisins portant déjà la couleur choisie.
+    """
+    y1, y2 = max(0, y - 2), min(canvas.shape[0], y + 3)
+    x1, x2 = max(0, x - 2), min(canvas.shape[1], x + 3)
+
+    neigh_colors = canvas[y1:y2, x1:x2]
+    neigh_origins = origin_map[y1:y2, x1:x2]
+
+    same = neigh_colors == chosen_color
+    if not np.any(same):
+        return fallback_origin
+
+    vals = neigh_origins[same]
+    if vals.size == 0:
+        return fallback_origin
+
+    counts = np.bincount(vals.astype(int), minlength=4)
+    return int(np.argmax(counts))
 
 
 # ============================================================
@@ -839,6 +890,8 @@ def add_micro_clusters(
 def nudge_proportions(canvas: np.ndarray, origin_map: np.ndarray, rng: random.Random) -> None:
     """
     Ajustement doux sur frontières.
+    Correction importante :
+    l'origine visible du pixel est réassignée de manière cohérente.
     """
     for _ in range(BOUNDARY_NUDGE_PASSES):
         rs = compute_ratios(canvas)
@@ -878,8 +931,11 @@ def nudge_proportions(canvas: np.ndarray, origin_map: np.ndarray, rng: random.Ra
             if chosen in (IDX_TERRE, IDX_GRIS) and local_color_variety(canvas, x, y, radius=2) < 2:
                 continue
 
+            fallback_origin = int(origin_map[y, x])
+            new_origin = infer_origin_from_neighbors(canvas, origin_map, x, y, chosen, fallback_origin)
+
             canvas[y, x] = chosen
-            # origine conservée
+            origin_map[y, x] = new_origin
 
 
 # ============================================================
@@ -947,6 +1003,21 @@ def generate_one_variant(profile: VariantProfile) -> Tuple[Image.Image, np.ndarr
     }
 
     return render_canvas(canvas), rs, metrics
+
+
+def generate_candidate_from_seed(seed: int) -> CandidateResult:
+    """
+    API module-friendly pour start.py.
+    """
+    profile = make_profile(seed)
+    image, ratios, metrics = generate_one_variant(profile)
+    return CandidateResult(
+        seed=seed,
+        profile=profile,
+        image=image,
+        ratios=ratios,
+        metrics=metrics,
+    )
 
 
 # ============================================================
@@ -1021,98 +1092,175 @@ def variant_is_valid(rs: np.ndarray, metrics: Dict[str, float]) -> bool:
     return True
 
 
+def validate_candidate_result(candidate: CandidateResult) -> bool:
+    return variant_is_valid(candidate.ratios, candidate.metrics)
+
+
 # ============================================================
-# GÉNÉRATION STRICTEMENT SÉQUENTIELLE
+# EXPORT / MODULE API
 # ============================================================
 
-def generate_all() -> None:
-    rows = []
-    total_attempts = 0
+def save_candidate_image(candidate: CandidateResult, path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    candidate.image.save(path)
+    return path
 
-    for target_index in range(1, N_VARIANTS_REQUIRED + 1):
-        local_attempt = 0
 
-        while True:
-            total_attempts += 1
-            local_attempt += 1
+def candidate_row(
+    target_index: int,
+    local_attempt: int,
+    global_attempt: int,
+    candidate: CandidateResult,
+) -> Dict[str, object]:
+    rs = candidate.ratios
+    metrics = candidate.metrics
 
-            seed = 202603120000 + target_index * 100000 + local_attempt
-            profile = make_profile(seed)
+    return {
+        "index": target_index,
+        "seed": candidate.seed,
+        "attempts_for_this_image": local_attempt,
+        "global_attempt": global_attempt,
+        "coyote_brown_pct": round(float(rs[IDX_COYOTE] * 100), 2),
+        "vert_olive_pct": round(float(rs[IDX_OLIVE] * 100), 2),
+        "terre_de_france_pct": round(float(rs[IDX_TERRE] * 100), 2),
+        "vert_de_gris_pct": round(float(rs[IDX_GRIS] * 100), 2),
+        "largest_olive_component_ratio": round(metrics["largest_olive_component_ratio"], 5),
+        "largest_olive_component_ratio_small": round(metrics["largest_olive_component_ratio_small"], 5),
+        "olive_multizone_share": round(metrics["olive_multizone_share"], 5),
+        "center_empty_ratio": round(metrics["center_empty_ratio"], 5),
+        "center_empty_ratio_small": round(metrics["center_empty_ratio_small"], 5),
+        "boundary_density": round(metrics["boundary_density"], 5),
+        "boundary_density_small": round(metrics["boundary_density_small"], 5),
+        "boundary_density_tiny": round(metrics["boundary_density_tiny"], 5),
+        "mirror_similarity": round(metrics["mirror_similarity"], 5),
+        "oblique_share": round(metrics["oblique_share"], 5),
+        "vertical_share": round(metrics["vertical_share"], 5),
+        "angle_dominance_ratio": round(metrics["angle_dominance_ratio"], 5),
+        "olive_macro_share": round(metrics["vert_olive_macro_share"], 5),
+        "terre_transition_share": round(metrics["terre_de_france_transition_share"], 5),
+        "gris_micro_share": round(metrics["vert_de_gris_micro_share"], 5),
+        "gris_macro_share": round(metrics["vert_de_gris_macro_share"], 5),
+        "angles": " ".join(map(str, candidate.profile.allowed_angles)),
+    }
 
-            img, rs, metrics = generate_one_variant(profile)
 
-            if not variant_is_valid(rs, metrics):
-                print(
-                    f"[global={total_attempts:06d}] "
-                    f"[image={target_index:03d}] "
-                    f"[essai={local_attempt:04d}] rejeté | "
-                    f"C={rs[IDX_COYOTE]*100:.1f} "
-                    f"O={rs[IDX_OLIVE]*100:.1f} "
-                    f"T={rs[IDX_TERRE]*100:.1f} "
-                    f"G={rs[IDX_GRIS]*100:.1f}"
-                )
-                continue
+def write_report(rows: List[Dict[str, object]], output_dir: Path, filename: str = "rapport_camouflages.csv") -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = output_dir / filename
+    if not rows:
+        return csv_path
 
-            filename = OUTPUT_DIR / f"camouflage_{target_index:03d}.png"
-            img.save(filename)
-
-            rows.append({
-                "index": target_index,
-                "seed": profile.seed,
-                "attempts_for_this_image": local_attempt,
-                "global_attempt": total_attempts,
-                "coyote_brown_pct": round(float(rs[IDX_COYOTE] * 100), 2),
-                "vert_olive_pct": round(float(rs[IDX_OLIVE] * 100), 2),
-                "terre_de_france_pct": round(float(rs[IDX_TERRE] * 100), 2),
-                "vert_de_gris_pct": round(float(rs[IDX_GRIS] * 100), 2),
-                "largest_olive_component_ratio": round(metrics["largest_olive_component_ratio"], 5),
-                "largest_olive_component_ratio_small": round(metrics["largest_olive_component_ratio_small"], 5),
-                "olive_multizone_share": round(metrics["olive_multizone_share"], 5),
-                "center_empty_ratio": round(metrics["center_empty_ratio"], 5),
-                "center_empty_ratio_small": round(metrics["center_empty_ratio_small"], 5),
-                "boundary_density": round(metrics["boundary_density"], 5),
-                "boundary_density_small": round(metrics["boundary_density_small"], 5),
-                "boundary_density_tiny": round(metrics["boundary_density_tiny"], 5),
-                "mirror_similarity": round(metrics["mirror_similarity"], 5),
-                "oblique_share": round(metrics["oblique_share"], 5),
-                "vertical_share": round(metrics["vertical_share"], 5),
-                "angle_dominance_ratio": round(metrics["angle_dominance_ratio"], 5),
-                "olive_macro_share": round(metrics["vert_olive_macro_share"], 5),
-                "terre_transition_share": round(metrics["terre_de_france_transition_share"], 5),
-                "gris_micro_share": round(metrics["vert_de_gris_micro_share"], 5),
-                "gris_macro_share": round(metrics["vert_de_gris_macro_share"], 5),
-                "angles": " ".join(map(str, profile.allowed_angles)),
-            })
-
-            print(
-                f"[global={total_attempts:06d}] "
-                f"[image={target_index:03d}] "
-                f"[essai={local_attempt:04d}] accepté -> {filename.name} | "
-                f"C={rs[IDX_COYOTE]*100:.1f} "
-                f"O={rs[IDX_OLIVE]*100:.1f} "
-                f"T={rs[IDX_TERRE]*100:.1f} "
-                f"G={rs[IDX_GRIS]*100:.1f} | "
-                f"olive_conn={metrics['largest_olive_component_ratio']:.3f} "
-                f"multizone={metrics['olive_multizone_share']:.3f} "
-                f"center={metrics['center_empty_ratio']:.3f} "
-                f"bd={metrics['boundary_density']:.3f} "
-                f"mirror={metrics['mirror_similarity']:.3f}"
-            )
-
-            # NE PAS PASSER AU SUIVANT tant que le précédent n'est pas validé
-            break
-
-    csv_path = OUTPUT_DIR / "rapport_camouflages.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
 
-    print("\nTerminé.")
-    print(f"Images validées : {N_VARIANTS_REQUIRED}/{N_VARIANTS_REQUIRED}")
-    print(f"Tentatives globales : {total_attempts}")
-    print(f"Dossier : {OUTPUT_DIR.resolve()}")
-    print(f"CSV : {csv_path.resolve()}")
+    return csv_path
+
+
+# ============================================================
+# GÉNÉRATION STRICTEMENT SÉQUENTIELLE
+# ============================================================
+
+def generate_all(
+    target_count: int = N_VARIANTS_REQUIRED,
+    output_dir: Path = OUTPUT_DIR,
+    base_seed: int = DEFAULT_BASE_SEED,
+    progress_callback: Optional[
+        Callable[[int, int, int, int, CandidateResult, bool], None]
+    ] = None,
+    stop_requested: Optional[Callable[[], bool]] = None,
+) -> List[Dict[str, object]]:
+    """
+    Génération séquentielle stricte.
+
+    Paramètres :
+    - target_count : nombre d'images validées à produire
+    - output_dir : dossier de sortie
+    - base_seed : seed de base
+    - progress_callback :
+        appelé à chaque tentative avec :
+        (target_index, local_attempt, global_attempt, target_count, candidate, accepted)
+    - stop_requested :
+        callable sans argument ; si True => arrêt propre
+
+    Retour :
+    - liste des lignes du rapport CSV
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    rows: List[Dict[str, object]] = []
+    total_attempts = 0
+
+    for target_index in range(1, target_count + 1):
+        local_attempt = 0
+
+        while True:
+            if stop_requested is not None and stop_requested():
+                return rows
+
+            total_attempts += 1
+            local_attempt += 1
+
+            seed = build_seed(target_index, local_attempt, base_seed=base_seed)
+            candidate = generate_candidate_from_seed(seed)
+            accepted = validate_candidate_result(candidate)
+
+            if progress_callback is not None:
+                progress_callback(
+                    target_index,
+                    local_attempt,
+                    total_attempts,
+                    target_count,
+                    candidate,
+                    accepted,
+                )
+
+            if not accepted:
+                print(
+                    f"[global={total_attempts:06d}] "
+                    f"[image={target_index:03d}] "
+                    f"[essai={local_attempt:04d}] rejeté | "
+                    f"C={candidate.ratios[IDX_COYOTE]*100:.1f} "
+                    f"O={candidate.ratios[IDX_OLIVE]*100:.1f} "
+                    f"T={candidate.ratios[IDX_TERRE]*100:.1f} "
+                    f"G={candidate.ratios[IDX_GRIS]*100:.1f}"
+                )
+                continue
+
+            filename = output_dir / f"camouflage_{target_index:03d}.png"
+            save_candidate_image(candidate, filename)
+
+            rows.append(
+                candidate_row(
+                    target_index=target_index,
+                    local_attempt=local_attempt,
+                    global_attempt=total_attempts,
+                    candidate=candidate,
+                )
+            )
+
+            print(
+                f"[global={total_attempts:06d}] "
+                f"[image={target_index:03d}] "
+                f"[essai={local_attempt:04d}] accepté -> {filename.name} | "
+                f"C={candidate.ratios[IDX_COYOTE]*100:.1f} "
+                f"O={candidate.ratios[IDX_OLIVE]*100:.1f} "
+                f"T={candidate.ratios[IDX_TERRE]*100:.1f} "
+                f"G={candidate.ratios[IDX_GRIS]*100:.1f} | "
+                f"olive_conn={candidate.metrics['largest_olive_component_ratio']:.3f} "
+                f"multizone={candidate.metrics['olive_multizone_share']:.3f} "
+                f"center={candidate.metrics['center_empty_ratio']:.3f} "
+                f"bd={candidate.metrics['boundary_density']:.3f} "
+                f"mirror={candidate.metrics['mirror_similarity']:.3f}"
+            )
+
+            # NE PAS PASSER AU SUIVANT tant que le précédent n'est pas validé
+            break
+
+    write_report(rows, output_dir)
+    return rows
 
 
 # ============================================================
@@ -1120,4 +1268,15 @@ def generate_all() -> None:
 # ============================================================
 
 if __name__ == "__main__":
-    generate_all()
+    rows = generate_all(
+        target_count=N_VARIANTS_REQUIRED,
+        output_dir=OUTPUT_DIR,
+        base_seed=DEFAULT_BASE_SEED,
+    )
+
+    csv_path = write_report(rows, OUTPUT_DIR)
+
+    print("\nTerminé.")
+    print(f"Images validées : {len(rows)}/{N_VARIANTS_REQUIRED}")
+    print(f"Dossier : {OUTPUT_DIR.resolve()}")
+    print(f"CSV : {csv_path.resolve()}")
