@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 start.py
-Interface Kivy moderne, asynchrone, resizable, stylée selon une direction :
+Interface Kivy moderne, asynchrone, redimensionnable, stylée selon une direction :
 - glassmorphisme
 - neumorphisme
 - bento design
@@ -16,6 +16,7 @@ Fonctions :
 - monitoring CPU / RAM / processus
 - prévention de la mise en veille sous Windows
 - réglage léger de l'intensité machine
+- boutons Commencer / Arrêter
 
 Pré-requis :
     pip install kivy pillow numpy psutil
@@ -121,6 +122,7 @@ PALETTE_HEX = {
     "white": "#ffffff",
 }
 
+
 def hex_rgba(name: str, alpha: float = 1.0) -> Tuple[float, float, float, float]:
     hx = PALETTE_HEX[name].lstrip("#")
     return (
@@ -129,6 +131,7 @@ def hex_rgba(name: str, alpha: float = 1.0) -> Tuple[float, float, float, float]
         int(hx[4:6], 16) / 255.0,
         alpha,
     )
+
 
 C = {
     "bg_root": hex_rgba("BFW", 1.0),
@@ -405,14 +408,26 @@ def build_silhouette_mask(width: int, height: int) -> np.ndarray:
     left_arm_x1 = int(width * 0.15)
     right_arm_x1 = width - left_arm_x1 - arm_w
     arm_y1 = int(height * 0.20)
-    draw.rounded_rectangle([left_arm_x1, arm_y1, left_arm_x1 + arm_w, arm_y1 + arm_h], radius=int(width * 0.02), fill=255)
-    draw.rounded_rectangle([right_arm_x1, arm_y1, right_arm_x1 + arm_w, arm_y1 + arm_h], radius=int(width * 0.02), fill=255)
+    draw.rounded_rectangle(
+        [left_arm_x1, arm_y1, left_arm_x1 + arm_w, arm_y1 + arm_h],
+        radius=int(width * 0.02),
+        fill=255,
+    )
+    draw.rounded_rectangle(
+        [right_arm_x1, arm_y1, right_arm_x1 + arm_w, arm_y1 + arm_h],
+        radius=int(width * 0.02),
+        fill=255,
+    )
 
     pelvis_w = int(width * 0.30)
     pelvis_h = int(height * 0.10)
     pelvis_x1 = (width - pelvis_w) // 2
     pelvis_y1 = int(height * 0.51)
-    draw.rounded_rectangle([pelvis_x1, pelvis_y1, pelvis_x1 + pelvis_w, pelvis_y1 + pelvis_h], radius=int(width * 0.02), fill=255)
+    draw.rounded_rectangle(
+        [pelvis_x1, pelvis_y1, pelvis_x1 + pelvis_w, pelvis_y1 + pelvis_h],
+        radius=int(width * 0.02),
+        fill=255,
+    )
 
     leg_w = int(width * 0.12)
     leg_h = int(height * 0.32)
@@ -420,8 +435,16 @@ def build_silhouette_mask(width: int, height: int) -> np.ndarray:
     left_leg_x1 = (width // 2) - leg_gap // 2 - leg_w
     right_leg_x1 = (width // 2) + leg_gap // 2
     leg_y1 = int(height * 0.58)
-    draw.rounded_rectangle([left_leg_x1, leg_y1, left_leg_x1 + leg_w, leg_y1 + leg_h], radius=int(width * 0.018), fill=255)
-    draw.rounded_rectangle([right_leg_x1, leg_y1, right_leg_x1 + leg_w, leg_y1 + leg_h], radius=int(width * 0.018), fill=255)
+    draw.rounded_rectangle(
+        [left_leg_x1, leg_y1, left_leg_x1 + leg_w, leg_y1 + leg_h],
+        radius=int(width * 0.018),
+        fill=255,
+    )
+    draw.rounded_rectangle(
+        [right_leg_x1, leg_y1, right_leg_x1 + leg_w, leg_y1 + leg_h],
+        radius=int(width * 0.018),
+        fill=255,
+    )
 
     return np.array(img, dtype=np.uint8) > 0
 
@@ -458,20 +481,27 @@ def silhouette_projection_image(index_canvas: np.ndarray) -> PILImage.Image:
     h, w = index_canvas.shape
     sil = build_silhouette_mask(w, h)
 
-    background = np.full((h, w, 3), (
-        int(hex_rgba("BFW")[0] * 255),
-        int(hex_rgba("BFW")[1] * 255),
-        int(hex_rgba("BFW")[2] * 255),
-    ), dtype=np.uint8)
+    background = np.full(
+        (h, w, 3),
+        (
+            int(hex_rgba("BFW")[0] * 255),
+            int(hex_rgba("BFW")[1] * 255),
+            int(hex_rgba("BFW")[2] * 255),
+        ),
+        dtype=np.uint8,
+    )
     rgb = camo.RGB[index_canvas]
     background[sil] = rgb[sil]
 
     bound = silhouette_boundary(sil)
-    background[bound] = np.array([
-        int(hex_rgba("BL")[0] * 255),
-        int(hex_rgba("BL")[1] * 255),
-        int(hex_rgba("BL")[2] * 255),
-    ], dtype=np.uint8)
+    background[bound] = np.array(
+        [
+            int(hex_rgba("BL")[0] * 255),
+            int(hex_rgba("BL")[1] * 255),
+            int(hex_rgba("BL")[2] * 255),
+        ],
+        dtype=np.uint8,
+    )
 
     return PILImage.fromarray(background, "RGB")
 
@@ -617,7 +647,12 @@ class GlassProgressBar(Widget):
         super().__init__(**kwargs)
         self.size_hint_y = None
         self.height = dp(28)
-        self.bind(pos=self._redraw, size=self._redraw, value=self._redraw, max_value=self._redraw)
+        self.bind(
+            pos=self._redraw,
+            size=self._redraw,
+            value=self._redraw,
+            max_value=self._redraw,
+        )
 
     def _redraw(self, *_):
         self.canvas.before.clear()
@@ -628,7 +663,6 @@ class GlassProgressBar(Widget):
         fill_w = max(dp(8), (self.width - pad * 2) * progress)
 
         with self.canvas.before:
-            # ombre
             Color(*C["shadow"])
             RoundedRectangle(
                 pos=(self.x, self.y - dp(2)),
@@ -636,7 +670,6 @@ class GlassProgressBar(Widget):
                 radius=[radius] * 4,
             )
 
-            # fond neumorphique / glass
             Color(*C["progress_bg"])
             RoundedRectangle(
                 pos=self.pos,
@@ -644,7 +677,6 @@ class GlassProgressBar(Widget):
                 radius=[radius] * 4,
             )
 
-            # reflet haut
             Color(*C["glass_top"])
             RoundedRectangle(
                 pos=(self.x + pad, self.y + self.height * 0.52),
@@ -652,7 +684,6 @@ class GlassProgressBar(Widget):
                 radius=[radius] * 4,
             )
 
-            # barre principale
             Color(*C["progress_fill"])
             RoundedRectangle(
                 pos=(self.x + pad, self.y + pad),
@@ -660,7 +691,6 @@ class GlassProgressBar(Widget):
                 radius=[radius] * 4,
             )
 
-            # surbrillance liquid glass
             Color(*C["progress_glow"])
             RoundedRectangle(
                 pos=(self.x + pad + dp(2), self.y + self.height * 0.52),
@@ -668,7 +698,6 @@ class GlassProgressBar(Widget):
                 radius=[radius] * 4,
             )
 
-            # contour
             Color(*C["stroke"])
             Line(
                 rounded_rectangle=(self.x, self.y, self.width, self.height, radius),
@@ -687,7 +716,6 @@ class GlassCard(BoxLayout):
         self.canvas.before.clear()
         r = dp(24)
         with self.canvas.before:
-            # ombre douce
             Color(*C["shadow"])
             RoundedRectangle(
                 pos=(self.x, self.y - dp(3)),
@@ -695,7 +723,6 @@ class GlassCard(BoxLayout):
                 radius=[r] * 4,
             )
 
-            # fond principal
             Color(*C["bg_panel"])
             RoundedRectangle(
                 pos=self.pos,
@@ -703,7 +730,6 @@ class GlassCard(BoxLayout):
                 radius=[r] * 4,
             )
 
-            # voile glass supérieur
             Color(*C["glass_top"])
             RoundedRectangle(
                 pos=(self.x + dp(2), self.y + self.height * 0.52),
@@ -711,7 +737,6 @@ class GlassCard(BoxLayout):
                 radius=[r] * 4,
             )
 
-            # contour
             Color(*C["stroke"])
             Line(
                 rounded_rectangle=(self.x, self.y, self.width, self.height, r),
@@ -769,7 +794,7 @@ class GalleryThumb(Button):
         self.container = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(8))
         self.add_widget(self.container)
 
-        self.thumb = Image()
+        self.thumb = Image(allow_stretch=True, keep_ratio=True)
         self.caption = Label(
             text=image_path.name,
             size_hint_y=None,
@@ -843,6 +868,27 @@ class CamouflageApp(App):
         self.process = psutil.Process() if psutil else None
         self.machine_intensity = 85.0
 
+        self.title_label: Optional[Label] = None
+        self.status_label: Optional[Label] = None
+        self.count_input: Optional[TextInput] = None
+        self.start_btn: Optional[Button] = None
+        self.stop_btn: Optional[Button] = None
+        self.progress_bar: Optional[GlassProgressBar] = None
+        self.progress_text: Optional[Label] = None
+        self.attempt_text: Optional[Label] = None
+        self.intensity_slider: Optional[Slider] = None
+        self.intensity_label: Optional[Label] = None
+        self.resource_text: Optional[Label] = None
+        self.resource_hint: Optional[Label] = None
+        self.score_text: Optional[Label] = None
+        self.color_text: Optional[Label] = None
+        self.extra_text: Optional[Label] = None
+        self.gallery_scroll: Optional[ScrollView] = None
+        self.gallery_grid: Optional[GridLayout] = None
+        self.preview_img: Optional[Image] = None
+        self.preview_silhouette: Optional[Image] = None
+        self.log_view: Optional[LogView] = None
+
     def build(self):
         Window.clearcolor = C["bg_root"]
         root = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(10))
@@ -877,7 +923,13 @@ class CamouflageApp(App):
         # Colonne gauche
         left = BoxLayout(orientation="vertical", size_hint_x=0.34, spacing=dp(10))
 
-        controls = GlassCard(orientation="vertical", size_hint_y=0.48)
+        # Correction importante : hauteur fixe suffisante pour afficher les boutons
+        controls = GlassCard(
+            orientation="vertical",
+            size_hint_y=None,
+            height=dp(520),
+        )
+
         controls.add_widget(self._label("Nombre de camouflages"))
         self.count_input = TextInput(
             text=str(DEFAULT_TARGET_COUNT),
@@ -895,22 +947,8 @@ class CamouflageApp(App):
         controls.add_widget(self.count_input)
 
         btn_row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(10))
-        self.start_btn = Button(
-            text="Lancer",
-            background_normal="",
-            background_down="",
-            background_color=C["btn_launch"],
-            color=C["text_main"],
-        )
-        self.stop_btn = Button(
-            text="Arrêter",
-            background_normal="",
-            background_down="",
-            background_color=C["btn_stop"],
-            color=C["text_main"],
-        )
-        self.start_btn.bind(on_release=self.start_generation)
-        self.stop_btn.bind(on_release=self.stop_generation)
+        self.start_btn = self._styled_button("Commencer", C["btn_launch"], self.start_generation)
+        self.stop_btn = self._styled_button("Arrêter", C["btn_stop"], self.stop_generation)
         btn_row.add_widget(self.start_btn)
         btn_row.add_widget(self.stop_btn)
         controls.add_widget(btn_row)
@@ -968,8 +1006,8 @@ class CamouflageApp(App):
 
         previews = BoxLayout(spacing=dp(10), size_hint_y=0.58)
 
-        self.preview_img = Image()
-        self.preview_silhouette = Image()
+        self.preview_img = Image(allow_stretch=True, keep_ratio=True)
+        self.preview_silhouette = Image(allow_stretch=True, keep_ratio=True)
 
         previews.add_widget(self._carded_view("Camouflage courant / validé", self.preview_img))
         previews.add_widget(self._carded_view("Projection silhouette", self.preview_silhouette))
@@ -999,6 +1037,19 @@ class CamouflageApp(App):
             pass
 
     # ---------------- style helpers ----------------
+
+    def _styled_button(self, text: str, bg_color, on_release_callback) -> Button:
+        btn = Button(
+            text=text,
+            size_hint_y=None,
+            height=dp(52),
+            background_normal="",
+            background_down="",
+            background_color=bg_color,
+            color=C["text_main"],
+        )
+        btn.bind(on_release=on_release_callback)
+        return btn
 
     def _carded_view(self, title: str, widget: Widget) -> Widget:
         box = GlassCard(orientation="vertical")
@@ -1032,15 +1083,21 @@ class CamouflageApp(App):
 
     def _on_intensity_change(self, _slider, value):
         self.machine_intensity = float(value)
-        self.intensity_label.text = f"{int(value)} %"
+        if self.intensity_label is not None:
+            self.intensity_label.text = f"{int(value)} %"
 
     @mainthread
     def _refresh_controls_state(self):
-        self.start_btn.disabled = self.running or self.stopping
-        self.stop_btn.disabled = (not self.running) and (not self.stopping)
+        if self.start_btn is not None:
+            self.start_btn.disabled = self.running or self.stopping
+        if self.stop_btn is not None:
+            self.stop_btn.disabled = (not self.running) and (not self.stopping)
 
     @mainthread
     def reload_gallery(self):
+        if self.gallery_grid is None:
+            return
+
         self.gallery_grid.clear_widgets()
 
         if not self.current_output_dir.exists():
@@ -1056,6 +1113,9 @@ class CamouflageApp(App):
     # ---------------- monitoring ----------------
 
     def _update_resource_monitor(self, _dt):
+        if self.resource_text is None:
+            return
+
         if psutil is None:
             self.resource_text.text = "Installer psutil pour voir CPU / RAM / disque."
             return
@@ -1147,6 +1207,10 @@ class CamouflageApp(App):
 
         if self.current_future is not None and not self.current_future.done():
             self.log("Une génération est déjà en cours.")
+            return
+
+        if self.count_input is None or self.progress_bar is None:
+            self.log("Interface incomplète.")
             return
 
         try:
@@ -1272,42 +1336,44 @@ class CamouflageApp(App):
                     self.best_records.append(record)
                     self.best_records.sort(key=lambda r: r.score_final, reverse=True)
 
-                    rows.append({
-                        "index": target_index,
-                        "seed": candidate.seed,
-                        "attempts_for_this_image": local_attempt,
-                        "global_attempt": total_attempts,
-                        "coyote_brown_pct": round(float(candidate.ratios[camo.IDX_COYOTE] * 100), 2),
-                        "vert_olive_pct": round(float(candidate.ratios[camo.IDX_OLIVE] * 100), 2),
-                        "terre_de_france_pct": round(float(candidate.ratios[camo.IDX_TERRE] * 100), 2),
-                        "vert_de_gris_pct": round(float(candidate.ratios[camo.IDX_GRIS] * 100), 2),
-                        "score_final": round(extra_scores["score_final"], 5),
-                        "score_ratio": round(extra_scores["score_ratio"], 5),
-                        "score_silhouette": round(extra_scores["score_silhouette"], 5),
-                        "score_contour": round(extra_scores["score_contour"], 5),
-                        "score_main": round(extra_scores["score_main"], 5),
-                        "silhouette_color_diversity": round(extra_scores["silhouette_color_diversity"], 5),
-                        "contour_break_score": round(extra_scores["contour_break_score"], 5),
-                        "outline_band_diversity": round(extra_scores["outline_band_diversity"], 5),
-                        "small_scale_structural_score": round(extra_scores["small_scale_structural_score"], 5),
-                        "largest_olive_component_ratio": round(candidate.metrics["largest_olive_component_ratio"], 5),
-                        "largest_olive_component_ratio_small": round(candidate.metrics["largest_olive_component_ratio_small"], 5),
-                        "olive_multizone_share": round(candidate.metrics["olive_multizone_share"], 5),
-                        "center_empty_ratio": round(candidate.metrics["center_empty_ratio"], 5),
-                        "center_empty_ratio_small": round(candidate.metrics["center_empty_ratio_small"], 5),
-                        "boundary_density": round(candidate.metrics["boundary_density"], 5),
-                        "boundary_density_small": round(candidate.metrics["boundary_density_small"], 5),
-                        "boundary_density_tiny": round(candidate.metrics["boundary_density_tiny"], 5),
-                        "mirror_similarity": round(candidate.metrics["mirror_similarity"], 5),
-                        "oblique_share": round(candidate.metrics["oblique_share"], 5),
-                        "vertical_share": round(candidate.metrics["vertical_share"], 5),
-                        "angle_dominance_ratio": round(candidate.metrics["angle_dominance_ratio"], 5),
-                        "olive_macro_share": round(candidate.metrics["vert_olive_macro_share"], 5),
-                        "terre_transition_share": round(candidate.metrics["terre_de_france_transition_share"], 5),
-                        "gris_micro_share": round(candidate.metrics["vert_de_gris_micro_share"], 5),
-                        "gris_macro_share": round(candidate.metrics["vert_de_gris_macro_share"], 5),
-                        "angles": " ".join(map(str, candidate.profile.allowed_angles)),
-                    })
+                    rows.append(
+                        {
+                            "index": target_index,
+                            "seed": candidate.seed,
+                            "attempts_for_this_image": local_attempt,
+                            "global_attempt": total_attempts,
+                            "coyote_brown_pct": round(float(candidate.ratios[camo.IDX_COYOTE] * 100), 2),
+                            "vert_olive_pct": round(float(candidate.ratios[camo.IDX_OLIVE] * 100), 2),
+                            "terre_de_france_pct": round(float(candidate.ratios[camo.IDX_TERRE] * 100), 2),
+                            "vert_de_gris_pct": round(float(candidate.ratios[camo.IDX_GRIS] * 100), 2),
+                            "score_final": round(extra_scores["score_final"], 5),
+                            "score_ratio": round(extra_scores["score_ratio"], 5),
+                            "score_silhouette": round(extra_scores["score_silhouette"], 5),
+                            "score_contour": round(extra_scores["score_contour"], 5),
+                            "score_main": round(extra_scores["score_main"], 5),
+                            "silhouette_color_diversity": round(extra_scores["silhouette_color_diversity"], 5),
+                            "contour_break_score": round(extra_scores["contour_break_score"], 5),
+                            "outline_band_diversity": round(extra_scores["outline_band_diversity"], 5),
+                            "small_scale_structural_score": round(extra_scores["small_scale_structural_score"], 5),
+                            "largest_olive_component_ratio": round(candidate.metrics["largest_olive_component_ratio"], 5),
+                            "largest_olive_component_ratio_small": round(candidate.metrics["largest_olive_component_ratio_small"], 5),
+                            "olive_multizone_share": round(candidate.metrics["olive_multizone_share"], 5),
+                            "center_empty_ratio": round(candidate.metrics["center_empty_ratio"], 5),
+                            "center_empty_ratio_small": round(candidate.metrics["center_empty_ratio_small"], 5),
+                            "boundary_density": round(candidate.metrics["boundary_density"], 5),
+                            "boundary_density_small": round(candidate.metrics["boundary_density_small"], 5),
+                            "boundary_density_tiny": round(candidate.metrics["boundary_density_tiny"], 5),
+                            "mirror_similarity": round(candidate.metrics["mirror_similarity"], 5),
+                            "oblique_share": round(candidate.metrics["oblique_share"], 5),
+                            "vertical_share": round(candidate.metrics["vertical_share"], 5),
+                            "angle_dominance_ratio": round(candidate.metrics["angle_dominance_ratio"], 5),
+                            "olive_macro_share": round(candidate.metrics["vert_olive_macro_share"], 5),
+                            "terre_transition_share": round(candidate.metrics["terre_de_france_transition_share"], 5),
+                            "gris_micro_share": round(candidate.metrics["vert_de_gris_micro_share"], 5),
+                            "gris_macro_share": round(candidate.metrics["vert_de_gris_macro_share"], 5),
+                            "angles": " ".join(map(str, candidate.profile.allowed_angles)),
+                        }
+                    )
 
                     self.accepted_count = len(rows)
                     self.update_progress(len(rows), target_count)
@@ -1363,26 +1429,28 @@ class CamouflageApp(App):
             dst = best_dir / f"best_{rank:03d}_camouflage_{rec.index:03d}.png"
             await asyncio.to_thread(shutil.copy2, rec.image_path, dst)
 
-            rows.append({
-                "rank": rank,
-                "source_index": rec.index,
-                "seed": rec.seed,
-                "global_attempt": rec.global_attempt,
-                "attempts_for_this_image": rec.local_attempt,
-                "score_final": round(rec.score_final, 5),
-                "score_ratio": round(rec.score_ratio, 5),
-                "score_silhouette": round(rec.score_silhouette, 5),
-                "score_contour": round(rec.score_contour, 5),
-                "score_main": round(rec.score_main, 5),
-                "silhouette_color_diversity": round(rec.silhouette_color_diversity, 5),
-                "contour_break_score": round(rec.contour_break_score, 5),
-                "outline_band_diversity": round(rec.outline_band_diversity, 5),
-                "small_scale_structural_score": round(rec.small_scale_structural_score, 5),
-                "coyote_brown_pct": round(float(rec.rs[camo.IDX_COYOTE] * 100), 2),
-                "vert_olive_pct": round(float(rec.rs[camo.IDX_OLIVE] * 100), 2),
-                "terre_de_france_pct": round(float(rec.rs[camo.IDX_TERRE] * 100), 2),
-                "vert_de_gris_pct": round(float(rec.rs[camo.IDX_GRIS] * 100), 2),
-            })
+            rows.append(
+                {
+                    "rank": rank,
+                    "source_index": rec.index,
+                    "seed": rec.seed,
+                    "global_attempt": rec.global_attempt,
+                    "attempts_for_this_image": rec.local_attempt,
+                    "score_final": round(rec.score_final, 5),
+                    "score_ratio": round(rec.score_ratio, 5),
+                    "score_silhouette": round(rec.score_silhouette, 5),
+                    "score_contour": round(rec.score_contour, 5),
+                    "score_main": round(rec.score_main, 5),
+                    "silhouette_color_diversity": round(rec.silhouette_color_diversity, 5),
+                    "contour_break_score": round(rec.contour_break_score, 5),
+                    "outline_band_diversity": round(rec.outline_band_diversity, 5),
+                    "small_scale_structural_score": round(rec.small_scale_structural_score, 5),
+                    "coyote_brown_pct": round(float(rec.rs[camo.IDX_COYOTE] * 100), 2),
+                    "vert_olive_pct": round(float(rec.rs[camo.IDX_OLIVE] * 100), 2),
+                    "terre_de_france_pct": round(float(rec.rs[camo.IDX_TERRE] * 100), 2),
+                    "vert_de_gris_pct": round(float(rec.rs[camo.IDX_GRIS] * 100), 2),
+                }
+            )
 
         if rows:
             await asyncio.to_thread(self._write_best_of_csv_sync, best_dir, rows)
@@ -1451,15 +1519,20 @@ class CamouflageApp(App):
 
     @mainthread
     def status(self, text: str, ok: bool = True):
+        if self.status_label is None:
+            return
         self.status_label.text = text
         self.status_label.color = C["success"] if ok else C["danger"]
 
     @mainthread
     def log(self, line: str):
-        self.log_view.append(line)
+        if self.log_view is not None:
+            self.log_view.append(line)
 
     @mainthread
     def update_progress(self, current: int, total: int):
+        if self.progress_bar is None:
+            return
         self.progress_bar.max_value = total
         self.progress_bar.value = current
 
@@ -1474,36 +1547,43 @@ class CamouflageApp(App):
         extra_scores: Dict[str, float],
         metrics: Dict[str, float],
     ):
-        self.progress_text.text = f"{accepted_count} / {target_total} validé(s)"
-        self.attempt_text.text = f"Image {target_index:03d} | essai {attempt_idx:04d}"
+        if self.progress_text is not None:
+            self.progress_text.text = f"{accepted_count} / {target_total} validé(s)"
+        if self.attempt_text is not None:
+            self.attempt_text.text = f"Image {target_index:03d} | essai {attempt_idx:04d}"
 
-        self.color_text.text = (
-            f"C {rs[camo.IDX_COYOTE]*100:.2f}% | "
-            f"O {rs[camo.IDX_OLIVE]*100:.2f}% | "
-            f"T {rs[camo.IDX_TERRE]*100:.2f}% | "
-            f"G {rs[camo.IDX_GRIS]*100:.2f}%"
-        )
+        if self.color_text is not None:
+            self.color_text.text = (
+                f"C {rs[camo.IDX_COYOTE]*100:.2f}% | "
+                f"O {rs[camo.IDX_OLIVE]*100:.2f}% | "
+                f"T {rs[camo.IDX_TERRE]*100:.2f}% | "
+                f"G {rs[camo.IDX_GRIS]*100:.2f}%"
+            )
 
-        self.score_text.text = (
-            f"Score {extra_scores['score_final']:.3f} | "
-            f"ratio {extra_scores['score_ratio']:.3f} | "
-            f"silhouette {extra_scores['score_silhouette']:.3f} | "
-            f"contour {extra_scores['score_contour']:.3f}"
-        )
+        if self.score_text is not None:
+            self.score_text.text = (
+                f"Score {extra_scores['score_final']:.3f} | "
+                f"ratio {extra_scores['score_ratio']:.3f} | "
+                f"silhouette {extra_scores['score_silhouette']:.3f} | "
+                f"contour {extra_scores['score_contour']:.3f}"
+            )
 
-        self.extra_text.text = (
-            f"Olive conn. {metrics['largest_olive_component_ratio']:.3f} | "
-            f"centre {metrics['center_empty_ratio']:.3f} | "
-            f"limites {metrics['boundary_density']:.3f} | "
-            f"miroir {metrics['mirror_similarity']:.3f}"
-        )
+        if self.extra_text is not None:
+            self.extra_text.text = (
+                f"Olive conn. {metrics['largest_olive_component_ratio']:.3f} | "
+                f"centre {metrics['center_empty_ratio']:.3f} | "
+                f"limites {metrics['boundary_density']:.3f} | "
+                f"miroir {metrics['mirror_similarity']:.3f}"
+            )
 
     @mainthread
     def update_preview(self, pil_img: PILImage.Image, silhouette_img: PILImage.Image):
         self.current_preview_img = pil_img
         self.current_silhouette_preview = silhouette_img
-        self.preview_img.texture = pil_to_coreimage(pil_img).texture
-        self.preview_silhouette.texture = pil_to_coreimage(silhouette_img).texture
+        if self.preview_img is not None:
+            self.preview_img.texture = pil_to_coreimage(pil_img).texture
+        if self.preview_silhouette is not None:
+            self.preview_silhouette.texture = pil_to_coreimage(silhouette_img).texture
 
     def on_stop(self):
         self.stop_flag = True
