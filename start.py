@@ -1,24 +1,26 @@
 # -*- coding: utf-8 -*-
 """
 start.py
-Interface Kivy moderne, asynchrone, resizable, orientée production,
-pour piloter main.py comme module.
+Interface Kivy moderne, asynchrone, resizable, stylée selon une direction :
+- glassmorphisme
+- neumorphisme
+- bento design
+- flat design
+- liquid glass (simulation visuelle)
 
 Fonctions :
-- interface épurée : lancer / arrêter / nombre de camouflages
-- génération séquentielle stricte
-- orchestration asynchrone
-- barre de progression
+- génération séquentielle stricte via main.py
+- barre de chargement stylée
 - aperçu principal + projection silhouette
-- galerie des camouflages déjà générés
-- monitoring ressources (CPU / RAM / disque / process)
-- prévention de la mise en veille pendant la génération
-- adaptation légère de cadence si la machine est trop chargée
+- galerie des camouflages générés
+- monitoring CPU / RAM / processus
+- prévention de la mise en veille sous Windows
+- réglage léger de l'intensité machine
 
 Pré-requis :
     pip install kivy pillow numpy psutil
 
-Arborescence attendue :
+Arborescence :
     .
     ├── main.py
     └── start.py
@@ -36,7 +38,6 @@ import platform
 import shutil
 import subprocess
 import threading
-import time
 from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,7 +59,7 @@ Config.set("graphics", "fullscreen", "0")
 Config.set("graphics", "resizable", "1")
 Config.set("graphics", "minimum_width", "1200")
 Config.set("graphics", "minimum_height", "760")
-Config.set("graphics", "width", "1600")
+Config.set("graphics", "width", "1680")
 Config.set("graphics", "height", "980")
 Config.set("input", "mouse", "mouse,multitouch_on_demand")
 
@@ -66,15 +67,16 @@ from kivy.app import App
 from kivy.clock import Clock, mainthread
 from kivy.core.image import Image as CoreImage
 from kivy.core.window import Window
+from kivy.graphics import Color, Line, RoundedRectangle
 from kivy.metrics import dp, sp
-from kivy.properties import StringProperty
+from kivy.properties import NumericProperty, StringProperty
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.gridlayout import GridLayout
 from kivy.uix.image import Image
 from kivy.uix.label import Label
-from kivy.uix.progressbar import ProgressBar
 from kivy.uix.scrollview import ScrollView
+from kivy.uix.slider import Slider
 from kivy.uix.textinput import TextInput
 from kivy.uix.widget import Widget
 
@@ -83,12 +85,87 @@ import main as camo
 
 
 # ============================================================
+# PALETTE STRICTE — UNIQUEMENT TES COULEURS
+# ============================================================
+
+PALETTE_HEX = {
+    "BL": "#f4fefe",
+    "GW": "#f7f7ff",
+    "BG": "#e5e5e5",
+    "GF": "#d9d9d9",
+    "GAXD": "#707070",
+    "VG": "#6B6C66",
+    "TDF": "#81613C",
+    "BT": "#644E41",
+    "BC": "#9F8670",
+    "JA": "#FFCB60",
+    "JB": "#E8D630",
+    "JO": "#EFD807",
+    "JV": "#FFC600",
+    "NG": "#3E5349",
+    "VDG": "#95A595",
+    "VO": "#424530",
+    "BF": "#051440",
+    "BA": "#81A1B8",
+    "BM": "#03224C",
+    "BFW": "#091226",
+    "GS": "#0A0B0A",
+    "NF": "#1E1E1E",
+    "NA": "#303030",
+    "RS": "#75161E",
+    "RV": "#FF0000",
+    "RF": "#EC1920",
+    "Vermeil": "#FF0921",
+    "RP": "#8B0000",
+    "black": "#000000",
+    "white": "#ffffff",
+}
+
+def hex_rgba(name: str, alpha: float = 1.0) -> Tuple[float, float, float, float]:
+    hx = PALETTE_HEX[name].lstrip("#")
+    return (
+        int(hx[0:2], 16) / 255.0,
+        int(hx[2:4], 16) / 255.0,
+        int(hx[4:6], 16) / 255.0,
+        alpha,
+    )
+
+C = {
+    "bg_root": hex_rgba("BFW", 1.0),
+    "bg_panel": hex_rgba("BM", 0.78),
+    "bg_panel_soft": hex_rgba("BF", 0.70),
+    "bg_input": hex_rgba("NA", 0.86),
+    "stroke": hex_rgba("BA", 0.42),
+    "stroke_soft": hex_rgba("VDG", 0.22),
+    "text_main": hex_rgba("BL", 1.0),
+    "text_soft": hex_rgba("GF", 1.0),
+    "text_muted": hex_rgba("BA", 1.0),
+    "success": hex_rgba("NG", 1.0),
+    "warning": hex_rgba("JA", 1.0),
+    "danger": hex_rgba("RF", 1.0),
+    "accent": hex_rgba("BA", 1.0),
+    "accent_soft": hex_rgba("BA", 0.32),
+    "progress_bg": hex_rgba("NA", 0.95),
+    "progress_fill": hex_rgba("BA", 0.95),
+    "progress_glow": hex_rgba("BL", 0.16),
+    "thumb_bg": hex_rgba("BM", 0.82),
+    "thumb_border": hex_rgba("BA", 0.30),
+    "shadow": hex_rgba("GS", 0.45),
+    "glass_top": hex_rgba("BL", 0.06),
+    "glass_bottom": hex_rgba("BFW", 0.10),
+    "btn_launch": hex_rgba("NG", 1.0),
+    "btn_stop": hex_rgba("RS", 1.0),
+    "btn_neutral": hex_rgba("BT", 1.0),
+}
+
+
+# ============================================================
 # CONSTANTES UI / EXPORT
 # ============================================================
 
 APP_TITLE = "Camouflage Armée Fédérale Europe"
-REPORT_NAME = "rapport_camouflages_v3.csv"
 BEST_DIR_NAME = "best_of"
+REPORT_NAME = "rapport_camouflages_v3.csv"
 DEFAULT_OUTPUT_DIR = Path("camouflages_federale_europe")
 DEFAULT_TARGET_COUNT = 100
 DEFAULT_TOP_K = 20
@@ -103,10 +180,9 @@ MIN_CONTOUR_BREAK_SCORE = 0.44
 MIN_OUTLINE_BAND_DIVERSITY = 0.58
 MIN_SMALL_SCALE_STRUCTURAL_SCORE = 0.42
 
-THUMB_SIZE = (220, 140)
+THUMB_SIZE = (240, 150)
 GALLERY_COLUMNS = 3
 
-# Anti-veille Windows
 ES_CONTINUOUS = 0x80000000
 ES_SYSTEM_REQUIRED = 0x00000001
 ES_DISPLAY_REQUIRED = 0x00000002
@@ -206,7 +282,7 @@ def pil_to_coreimage(pil_img: PILImage.Image) -> CoreImage:
 def make_thumbnail(pil_img: PILImage.Image, size: Tuple[int, int]) -> PILImage.Image:
     img = pil_img.copy()
     img.thumbnail(size, PILImage.Resampling.LANCZOS)
-    canvas = PILImage.new("RGB", size, (22, 24, 28))
+    canvas = PILImage.new("RGB", size, tuple(int(v * 255) for v in C["bg_root"][:3]))
     x = (size[0] - img.width) // 2
     y = (size[1] - img.height) // 2
     canvas.paste(img, (x, y))
@@ -329,26 +405,14 @@ def build_silhouette_mask(width: int, height: int) -> np.ndarray:
     left_arm_x1 = int(width * 0.15)
     right_arm_x1 = width - left_arm_x1 - arm_w
     arm_y1 = int(height * 0.20)
-    draw.rounded_rectangle(
-        [left_arm_x1, arm_y1, left_arm_x1 + arm_w, arm_y1 + arm_h],
-        radius=int(width * 0.02),
-        fill=255,
-    )
-    draw.rounded_rectangle(
-        [right_arm_x1, arm_y1, right_arm_x1 + arm_w, arm_y1 + arm_h],
-        radius=int(width * 0.02),
-        fill=255,
-    )
+    draw.rounded_rectangle([left_arm_x1, arm_y1, left_arm_x1 + arm_w, arm_y1 + arm_h], radius=int(width * 0.02), fill=255)
+    draw.rounded_rectangle([right_arm_x1, arm_y1, right_arm_x1 + arm_w, arm_y1 + arm_h], radius=int(width * 0.02), fill=255)
 
     pelvis_w = int(width * 0.30)
     pelvis_h = int(height * 0.10)
     pelvis_x1 = (width - pelvis_w) // 2
     pelvis_y1 = int(height * 0.51)
-    draw.rounded_rectangle(
-        [pelvis_x1, pelvis_y1, pelvis_x1 + pelvis_w, pelvis_y1 + pelvis_h],
-        radius=int(width * 0.02),
-        fill=255,
-    )
+    draw.rounded_rectangle([pelvis_x1, pelvis_y1, pelvis_x1 + pelvis_w, pelvis_y1 + pelvis_h], radius=int(width * 0.02), fill=255)
 
     leg_w = int(width * 0.12)
     leg_h = int(height * 0.32)
@@ -356,16 +420,8 @@ def build_silhouette_mask(width: int, height: int) -> np.ndarray:
     left_leg_x1 = (width // 2) - leg_gap // 2 - leg_w
     right_leg_x1 = (width // 2) + leg_gap // 2
     leg_y1 = int(height * 0.58)
-    draw.rounded_rectangle(
-        [left_leg_x1, leg_y1, left_leg_x1 + leg_w, leg_y1 + leg_h],
-        radius=int(width * 0.018),
-        fill=255,
-    )
-    draw.rounded_rectangle(
-        [right_leg_x1, leg_y1, right_leg_x1 + leg_w, leg_y1 + leg_h],
-        radius=int(width * 0.018),
-        fill=255,
-    )
+    draw.rounded_rectangle([left_leg_x1, leg_y1, left_leg_x1 + leg_w, leg_y1 + leg_h], radius=int(width * 0.018), fill=255)
+    draw.rounded_rectangle([right_leg_x1, leg_y1, right_leg_x1 + leg_w, leg_y1 + leg_h], radius=int(width * 0.018), fill=255)
 
     return np.array(img, dtype=np.uint8) > 0
 
@@ -402,12 +458,21 @@ def silhouette_projection_image(index_canvas: np.ndarray) -> PILImage.Image:
     h, w = index_canvas.shape
     sil = build_silhouette_mask(w, h)
 
-    background = np.full((h, w, 3), 24, dtype=np.uint8)
+    background = np.full((h, w, 3), (
+        int(hex_rgba("BFW")[0] * 255),
+        int(hex_rgba("BFW")[1] * 255),
+        int(hex_rgba("BFW")[2] * 255),
+    ), dtype=np.uint8)
     rgb = camo.RGB[index_canvas]
     background[sil] = rgb[sil]
 
     bound = silhouette_boundary(sil)
-    background[bound] = np.array([230, 230, 230], dtype=np.uint8)
+    background[bound] = np.array([
+        int(hex_rgba("BL")[0] * 255),
+        int(hex_rgba("BL")[1] * 255),
+        int(hex_rgba("BL")[2] * 255),
+    ], dtype=np.uint8)
+
     return PILImage.fromarray(background, "RGB")
 
 
@@ -541,8 +606,118 @@ async def async_evaluate_candidate_v3(
 
 
 # ============================================================
-# WIDGETS
+# WIDGETS STYLE
 # ============================================================
+
+class GlassProgressBar(Widget):
+    max_value = NumericProperty(100.0)
+    value = NumericProperty(0.0)
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.size_hint_y = None
+        self.height = dp(28)
+        self.bind(pos=self._redraw, size=self._redraw, value=self._redraw, max_value=self._redraw)
+
+    def _redraw(self, *_):
+        self.canvas.before.clear()
+        radius = dp(14)
+        pad = dp(1.5)
+
+        progress = 0.0 if self.max_value <= 0 else max(0.0, min(1.0, self.value / self.max_value))
+        fill_w = max(dp(8), (self.width - pad * 2) * progress)
+
+        with self.canvas.before:
+            # ombre
+            Color(*C["shadow"])
+            RoundedRectangle(
+                pos=(self.x, self.y - dp(2)),
+                size=self.size,
+                radius=[radius] * 4,
+            )
+
+            # fond neumorphique / glass
+            Color(*C["progress_bg"])
+            RoundedRectangle(
+                pos=self.pos,
+                size=self.size,
+                radius=[radius] * 4,
+            )
+
+            # reflet haut
+            Color(*C["glass_top"])
+            RoundedRectangle(
+                pos=(self.x + pad, self.y + self.height * 0.52),
+                size=(self.width - pad * 2, self.height * 0.40),
+                radius=[radius] * 4,
+            )
+
+            # barre principale
+            Color(*C["progress_fill"])
+            RoundedRectangle(
+                pos=(self.x + pad, self.y + pad),
+                size=(fill_w, self.height - pad * 2),
+                radius=[radius] * 4,
+            )
+
+            # surbrillance liquid glass
+            Color(*C["progress_glow"])
+            RoundedRectangle(
+                pos=(self.x + pad + dp(2), self.y + self.height * 0.52),
+                size=(max(dp(4), fill_w - dp(4)), self.height * 0.26),
+                radius=[radius] * 4,
+            )
+
+            # contour
+            Color(*C["stroke"])
+            Line(
+                rounded_rectangle=(self.x, self.y, self.width, self.height, radius),
+                width=1.1,
+            )
+
+
+class GlassCard(BoxLayout):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.bind(pos=self._redraw, size=self._redraw)
+        self.padding = dp(14)
+        self.spacing = dp(10)
+
+    def _redraw(self, *_):
+        self.canvas.before.clear()
+        r = dp(24)
+        with self.canvas.before:
+            # ombre douce
+            Color(*C["shadow"])
+            RoundedRectangle(
+                pos=(self.x, self.y - dp(3)),
+                size=self.size,
+                radius=[r] * 4,
+            )
+
+            # fond principal
+            Color(*C["bg_panel"])
+            RoundedRectangle(
+                pos=self.pos,
+                size=self.size,
+                radius=[r] * 4,
+            )
+
+            # voile glass supérieur
+            Color(*C["glass_top"])
+            RoundedRectangle(
+                pos=(self.x + dp(2), self.y + self.height * 0.52),
+                size=(self.width - dp(4), self.height * 0.42),
+                radius=[r] * 4,
+            )
+
+            # contour
+            Color(*C["stroke"])
+            Line(
+                rounded_rectangle=(self.x, self.y, self.width, self.height, r),
+                width=1.0,
+            )
+
 
 class LogView(ScrollView):
     text = StringProperty("")
@@ -551,6 +726,7 @@ class LogView(ScrollView):
         super().__init__(**kwargs)
         self.do_scroll_x = False
         self.bar_width = dp(8)
+
         self.label = Label(
             text="",
             markup=False,
@@ -559,7 +735,7 @@ class LogView(ScrollView):
             halign="left",
             valign="top",
             font_size=sp(13),
-            color=(0.93, 0.95, 0.98, 1),
+            color=C["text_soft"],
         )
         self.label.bind(texture_size=self._update_label_height, width=self._update_text_width)
         self.add_widget(self.label)
@@ -573,8 +749,8 @@ class LogView(ScrollView):
     def append(self, line: str) -> None:
         lines = self.label.text.splitlines() if self.label.text else []
         lines.append(line)
-        if len(lines) > 400:
-            lines = lines[-400:]
+        if len(lines) > 450:
+            lines = lines[-450:]
         self.label.text = "\n".join(lines)
         Clock.schedule_once(lambda dt: setattr(self, "scroll_y", 0), 0.05)
 
@@ -588,20 +764,18 @@ class GalleryThumb(Button):
         self.background_down = ""
         self.background_color = (0, 0, 0, 0)
         self.size_hint_y = None
-        self.height = dp(170)
-        self.padding = dp(8)
-        self.bind(on_release=self._open_preview)
+        self.height = dp(176)
 
-        self.container = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(6))
+        self.container = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(8))
         self.add_widget(self.container)
 
-        self.thumb = Image(size_hint_y=None, height=dp(128))
+        self.thumb = Image()
         self.caption = Label(
             text=image_path.name,
             size_hint_y=None,
-            height=dp(24),
+            height=dp(26),
             font_size=sp(11),
-            color=(0.90, 0.92, 0.95, 1),
+            color=C["text_soft"],
             halign="center",
             valign="middle",
         )
@@ -610,14 +784,18 @@ class GalleryThumb(Button):
         self.container.add_widget(self.thumb)
         self.container.add_widget(self.caption)
 
-        with self.canvas.before:
-            from kivy.graphics import Color, RoundedRectangle
-            Color(0.16, 0.18, 0.22, 0.82)
-            self._bg = RoundedRectangle(radius=[dp(18)] * 4, pos=self.pos, size=self.size)
-        self.bind(pos=lambda inst, val: setattr(self._bg, "pos", val))
-        self.bind(size=lambda inst, val: setattr(self._bg, "size", val))
-
+        self.bind(on_release=self._open_preview)
+        self.bind(pos=self._redraw, size=self._redraw)
         self.load_thumbnail()
+
+    def _redraw(self, *_):
+        self.canvas.before.clear()
+        r = dp(18)
+        with self.canvas.before:
+            Color(*C["thumb_bg"])
+            RoundedRectangle(pos=self.pos, size=self.size, radius=[r] * 4)
+            Color(*C["thumb_border"])
+            Line(rounded_rectangle=(self.x, self.y, self.width, self.height, r), width=1.0)
 
     def load_thumbnail(self):
         try:
@@ -661,20 +839,20 @@ class CamouflageApp(App):
 
         self.accepted_count = 0
         self.total_attempts = 0
-        self.last_resource_poll = 0.0
+
         self.process = psutil.Process() if psutil else None
+        self.machine_intensity = 85.0
 
     def build(self):
-        Window.clearcolor = (0.05, 0.06, 0.08, 1)
-
+        Window.clearcolor = C["bg_root"]
         root = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(10))
 
-        header = self._card(BoxLayout(orientation="horizontal", spacing=dp(10), padding=dp(16)), min_h=dp(74))
+        header = GlassCard(orientation="horizontal", size_hint_y=None, height=dp(84))
         self.title_label = Label(
             text=APP_TITLE,
             font_size=sp(24),
             bold=True,
-            color=(0.97, 0.98, 1.0, 1),
+            color=C["text_main"],
             halign="left",
             valign="middle",
         )
@@ -683,7 +861,7 @@ class CamouflageApp(App):
         self.status_label = Label(
             text="Prêt",
             font_size=sp(15),
-            color=(0.76, 0.92, 0.78, 1),
+            color=C["text_muted"],
             size_hint_x=0.25,
             halign="right",
             valign="middle",
@@ -697,80 +875,87 @@ class CamouflageApp(App):
         body = BoxLayout(spacing=dp(10))
 
         # Colonne gauche
-        left = BoxLayout(orientation="vertical", size_hint_x=0.33, spacing=dp(10))
+        left = BoxLayout(orientation="vertical", size_hint_x=0.34, spacing=dp(10))
 
-        control_card = self._card(BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(14)))
-        control_card.add_widget(self._label("Nombre de camouflages à générer"))
-
+        controls = GlassCard(orientation="vertical", size_hint_y=0.48)
+        controls.add_widget(self._label("Nombre de camouflages"))
         self.count_input = TextInput(
             text=str(DEFAULT_TARGET_COUNT),
             multiline=False,
             input_filter="int",
             size_hint_y=None,
-            height=dp(46),
+            height=dp(48),
             background_normal="",
             background_active="",
-            background_color=(0.14, 0.16, 0.20, 0.9),
-            foreground_color=(1, 1, 1, 1),
-            cursor_color=(1, 1, 1, 1),
-            padding=[dp(12), dp(12), dp(12), dp(12)],
+            background_color=C["bg_input"],
+            foreground_color=C["text_main"],
+            cursor_color=C["text_main"],
+            padding=[dp(14), dp(14), dp(14), dp(14)],
         )
-        control_card.add_widget(self.count_input)
+        controls.add_widget(self.count_input)
 
-        btn_row = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(10))
+        btn_row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(10))
         self.start_btn = Button(
             text="Lancer",
             background_normal="",
             background_down="",
-            background_color=(0.18, 0.56, 0.34, 1),
-            color=(1, 1, 1, 1),
+            background_color=C["btn_launch"],
+            color=C["text_main"],
         )
         self.stop_btn = Button(
             text="Arrêter",
             background_normal="",
             background_down="",
-            background_color=(0.62, 0.20, 0.20, 1),
-            color=(1, 1, 1, 1),
+            background_color=C["btn_stop"],
+            color=C["text_main"],
         )
         self.start_btn.bind(on_release=self.start_generation)
         self.stop_btn.bind(on_release=self.stop_generation)
         btn_row.add_widget(self.start_btn)
         btn_row.add_widget(self.stop_btn)
-        control_card.add_widget(btn_row)
+        controls.add_widget(btn_row)
 
-        control_card.add_widget(self._label("Progression globale"))
-        self.progress_global = ProgressBar(max=100, value=0, size_hint_y=None, height=dp(18))
-        control_card.add_widget(self.progress_global)
+        controls.add_widget(self._label("Chargement"))
+        self.progress_bar = GlassProgressBar()
+        controls.add_widget(self.progress_bar)
 
-        self.progress_text = self._small_label("0 / 0 validé")
+        self.progress_text = self._small_label("0 / 0 validé(s)")
         self.attempt_text = self._small_label("Image 000 | essai 0000")
-        control_card.add_widget(self.progress_text)
-        control_card.add_widget(self.attempt_text)
+        controls.add_widget(self.progress_text)
+        controls.add_widget(self.attempt_text)
 
-        self.resource_title = self._label("Ressources système")
+        controls.add_widget(self._label("Intensité machine"))
+        intensity_row = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(10))
+        self.intensity_slider = Slider(min=25, max=100, value=85)
+        self.intensity_label = self._small_label("85 %", size_hint_x=0.22)
+        self.intensity_slider.bind(value=self._on_intensity_change)
+        intensity_row.add_widget(self.intensity_slider)
+        intensity_row.add_widget(self.intensity_label)
+        controls.add_widget(intensity_row)
+
+        controls.add_widget(self._label("Ressources"))
         self.resource_text = self._small_label("CPU -- | RAM -- | Disque -- | Processus --")
-        self.resource_hint = self._small_label("Régulation automatique active si la charge monte.")
-        control_card.add_widget(self.resource_title)
-        control_card.add_widget(self.resource_text)
-        control_card.add_widget(self.resource_hint)
+        self.resource_hint = self._small_label("L’interface réduit légèrement la cadence si la charge devient trop haute.")
+        controls.add_widget(self.resource_text)
+        controls.add_widget(self.resource_hint)
 
-        self.score_text = self._small_label("Score final -- | ratio -- | silhouette -- | contour --")
+        controls.add_widget(self._label("Scores et métriques"))
+        self.score_text = self._small_label("Score -- | ratio -- | silhouette -- | contour --")
         self.color_text = self._small_label("C -- | O -- | T -- | G --")
         self.extra_text = self._small_label("Olive conn. -- | centre -- | limites -- | miroir --")
-        control_card.add_widget(self.score_text)
-        control_card.add_widget(self.color_text)
-        control_card.add_widget(self.extra_text)
+        controls.add_widget(self.score_text)
+        controls.add_widget(self.color_text)
+        controls.add_widget(self.extra_text)
 
-        left.add_widget(control_card)
+        left.add_widget(controls)
 
-        gallery_card = self._card(BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(12)))
-        gallery_card.add_widget(self._label("Galerie des camouflages déjà générés"))
-
+        gallery_card = GlassCard(orientation="vertical")
+        gallery_card.add_widget(self._label("Galerie"))
         self.gallery_scroll = ScrollView(do_scroll_x=False)
         self.gallery_grid = GridLayout(
             cols=GALLERY_COLUMNS,
             spacing=dp(10),
-            padding=dp(4),
+            padding=dp(2),
             size_hint_y=None,
         )
         self.gallery_grid.bind(minimum_height=self.gallery_grid.setter("height"))
@@ -781,15 +966,16 @@ class CamouflageApp(App):
         # Colonne droite
         right = BoxLayout(orientation="vertical", spacing=dp(10))
 
-        preview_row = BoxLayout(spacing=dp(10), size_hint_y=0.58)
+        previews = BoxLayout(spacing=dp(10), size_hint_y=0.58)
+
         self.preview_img = Image()
         self.preview_silhouette = Image()
 
-        preview_row.add_widget(self._carded_view("Camouflage courant / validé", self.preview_img))
-        preview_row.add_widget(self._carded_view("Projection silhouette", self.preview_silhouette))
-        right.add_widget(preview_row)
+        previews.add_widget(self._carded_view("Camouflage courant / validé", self.preview_img))
+        previews.add_widget(self._carded_view("Projection silhouette", self.preview_silhouette))
+        right.add_widget(previews)
 
-        log_card = self._card(BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(12)))
+        log_card = GlassCard(orientation="vertical")
         log_card.add_widget(self._label("Journal"))
         self.log_view = LogView()
         log_card.add_widget(self.log_view)
@@ -797,7 +983,6 @@ class CamouflageApp(App):
 
         body.add_widget(left)
         body.add_widget(right)
-
         root.add_widget(body)
 
         self._refresh_controls_state()
@@ -815,30 +1000,17 @@ class CamouflageApp(App):
 
     # ---------------- style helpers ----------------
 
-    def _card(self, widget: Widget, min_h: Optional[float] = None) -> Widget:
-        if min_h is not None:
-            widget.size_hint_y = None
-            widget.height = min_h
-
-        with widget.canvas.before:
-            from kivy.graphics import Color, RoundedRectangle
-            Color(0.13, 0.15, 0.19, 0.86)
-            widget._bg = RoundedRectangle(radius=[dp(22)] * 4, pos=widget.pos, size=widget.size)
-        widget.bind(pos=lambda inst, val: setattr(widget._bg, "pos", val))
-        widget.bind(size=lambda inst, val: setattr(widget._bg, "size", val))
-        return widget
-
-    def _carded_view(self, title: str, view: Widget) -> Widget:
-        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(12))
+    def _carded_view(self, title: str, widget: Widget) -> Widget:
+        box = GlassCard(orientation="vertical")
         box.add_widget(self._label(title))
-        box.add_widget(view)
-        return self._card(box)
+        box.add_widget(widget)
+        return box
 
     def _label(self, text: str, **kwargs) -> Label:
         kwargs.setdefault("size_hint_y", None)
-        kwargs.setdefault("height", dp(24))
+        kwargs.setdefault("height", dp(26))
         kwargs.setdefault("font_size", sp(15))
-        kwargs.setdefault("color", (0.95, 0.97, 1.0, 1))
+        kwargs.setdefault("color", C["text_main"])
         kwargs.setdefault("halign", "left")
         kwargs.setdefault("valign", "middle")
         lbl = Label(text=text, **kwargs)
@@ -849,7 +1021,7 @@ class CamouflageApp(App):
         kwargs.setdefault("size_hint_y", None)
         kwargs.setdefault("height", dp(22))
         kwargs.setdefault("font_size", sp(13))
-        kwargs.setdefault("color", (0.83, 0.88, 0.94, 1))
+        kwargs.setdefault("color", C["text_soft"])
         kwargs.setdefault("halign", "left")
         kwargs.setdefault("valign", "middle")
         lbl = Label(text=text, **kwargs)
@@ -857,6 +1029,10 @@ class CamouflageApp(App):
         return lbl
 
     # ---------------- controls / gallery ----------------
+
+    def _on_intensity_change(self, _slider, value):
+        self.machine_intensity = float(value)
+        self.intensity_label.text = f"{int(value)} %"
 
     @mainthread
     def _refresh_controls_state(self):
@@ -887,7 +1063,9 @@ class CamouflageApp(App):
         try:
             cpu = psutil.cpu_percent(interval=None)
             ram = psutil.virtual_memory().percent
-            disk = psutil.disk_usage(str(self.current_output_dir.resolve().anchor or "C:\\")).percent
+
+            anchor = self.current_output_dir.resolve().anchor or "C:\\"
+            disk = psutil.disk_usage(anchor).percent
 
             proc_cpu = self.process.cpu_percent(interval=None) if self.process else 0.0
             proc_mem = self.process.memory_info().rss / (1024 ** 3) if self.process else 0.0
@@ -900,19 +1078,35 @@ class CamouflageApp(App):
             self.resource_text.text = "Monitoring indisponible."
 
     async def _adaptive_pause(self):
+        """
+        Régulation légère.
+        Plus l'intensité demandée est basse, plus on respire entre les tentatives.
+        """
+        base = (100.0 - self.machine_intensity) / 1000.0
+
         if psutil is None:
+            if base > 0:
+                await asyncio.sleep(base)
             return
+
         try:
             cpu = psutil.cpu_percent(interval=None)
             ram = psutil.virtual_memory().percent
+
+            extra = 0.0
             if cpu >= 95 or ram >= 92:
-                await asyncio.sleep(0.08)
+                extra = 0.09
             elif cpu >= 88 or ram >= 88:
-                await asyncio.sleep(0.04)
+                extra = 0.05
             elif cpu >= 80 or ram >= 84:
-                await asyncio.sleep(0.015)
+                extra = 0.02
+
+            pause = base + extra
+            if pause > 0:
+                await asyncio.sleep(pause)
         except Exception:
-            return
+            if base > 0:
+                await asyncio.sleep(base)
 
     # ---------------- future binding ----------------
 
@@ -960,7 +1154,7 @@ class CamouflageApp(App):
             if count <= 0:
                 raise ValueError
         except Exception:
-            self.log("Nombre d'images invalide.")
+            self.log("Nombre de camouflages invalide.")
             return
 
         self.current_output_dir = DEFAULT_OUTPUT_DIR
@@ -972,13 +1166,14 @@ class CamouflageApp(App):
         self.running = True
         self.accepted_count = 0
         self.total_attempts = 0
-        self.progress_global.max = count
-        self.progress_global.value = 0
+
+        self.progress_bar.max_value = count
+        self.progress_bar.value = 0
 
         prevent_sleep(True)
 
         self.status("Génération en cours…", ok=True)
-        self.log(f"Démarrage : {count} camouflages à produire.")
+        self.log(f"Démarrage : {count} camouflage(s) demandé(s).")
         self.log(f"Dossier : {self.current_output_dir.resolve()}")
         self._refresh_controls_state()
 
@@ -1115,7 +1310,7 @@ class CamouflageApp(App):
                     })
 
                     self.accepted_count = len(rows)
-                    self.update_progress(target_index, target_count)
+                    self.update_progress(len(rows), target_count)
                     self.log(
                         f"[img={target_index:03d}] accepté -> {filename.name} | "
                         f"SF={extra_scores['score_final']:.3f} | "
@@ -1257,7 +1452,7 @@ class CamouflageApp(App):
     @mainthread
     def status(self, text: str, ok: bool = True):
         self.status_label.text = text
-        self.status_label.color = (0.78, 0.92, 0.78, 1) if ok else (0.95, 0.68, 0.68, 1)
+        self.status_label.color = C["success"] if ok else C["danger"]
 
     @mainthread
     def log(self, line: str):
@@ -1265,8 +1460,8 @@ class CamouflageApp(App):
 
     @mainthread
     def update_progress(self, current: int, total: int):
-        self.progress_global.max = total
-        self.progress_global.value = current
+        self.progress_bar.max_value = total
+        self.progress_bar.value = current
 
     @mainthread
     def update_attempt_status(
