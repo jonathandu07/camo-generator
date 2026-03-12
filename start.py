@@ -17,14 +17,6 @@ Fonctions :
 - prévention de la mise en veille sous Windows
 - réglage léger de l'intensité machine
 - boutons Commencer / Arrêter
-
-Pré-requis :
-    pip install kivy pillow numpy psutil
-
-Arborescence :
-    .
-    ├── main.py
-    └── start.py
 """
 
 from __future__ import annotations
@@ -135,11 +127,14 @@ def hex_rgba(name: str, alpha: float = 1.0) -> Tuple[float, float, float, float]
 
 C = {
     "bg_root": hex_rgba("BFW", 1.0),
-    "bg_panel": hex_rgba("BM", 0.78),
-    "bg_panel_soft": hex_rgba("BF", 0.70),
-    "bg_input": hex_rgba("NA", 0.86),
+    "bg_panel": hex_rgba("BM", 0.82),
+    "bg_panel_soft": hex_rgba("BF", 0.78),
+    "bg_panel_inner": hex_rgba("BF", 0.92),
+    "bg_input": hex_rgba("NA", 0.90),
+    "bg_input_soft": hex_rgba("BF", 0.96),
     "stroke": hex_rgba("BA", 0.42),
-    "stroke_soft": hex_rgba("VDG", 0.22),
+    "stroke_soft": hex_rgba("VDG", 0.18),
+    "stroke_strong": hex_rgba("BL", 0.14),
     "text_main": hex_rgba("BL", 1.0),
     "text_soft": hex_rgba("GF", 1.0),
     "text_muted": hex_rgba("BA", 1.0),
@@ -147,18 +142,23 @@ C = {
     "warning": hex_rgba("JA", 1.0),
     "danger": hex_rgba("RF", 1.0),
     "accent": hex_rgba("BA", 1.0),
-    "accent_soft": hex_rgba("BA", 0.32),
-    "progress_bg": hex_rgba("NA", 0.95),
-    "progress_fill": hex_rgba("BA", 0.95),
-    "progress_glow": hex_rgba("BL", 0.16),
-    "thumb_bg": hex_rgba("BM", 0.82),
-    "thumb_border": hex_rgba("BA", 0.30),
-    "shadow": hex_rgba("GS", 0.45),
+    "accent_soft": hex_rgba("BA", 0.24),
+    "progress_bg": hex_rgba("NA", 0.96),
+    "progress_fill": hex_rgba("BA", 0.96),
+    "progress_glow": hex_rgba("BL", 0.18),
+    "thumb_bg": hex_rgba("BM", 0.90),
+    "thumb_border": hex_rgba("BA", 0.22),
+    "shadow": hex_rgba("GS", 0.42),
+    "shadow_soft": hex_rgba("GS", 0.22),
     "glass_top": hex_rgba("BL", 0.06),
+    "glass_mid": hex_rgba("BL", 0.035),
     "glass_bottom": hex_rgba("BFW", 0.10),
     "btn_launch": hex_rgba("NG", 1.0),
+    "btn_launch_down": hex_rgba("VO", 1.0),
     "btn_stop": hex_rgba("RS", 1.0),
+    "btn_stop_down": hex_rgba("RP", 1.0),
     "btn_neutral": hex_rgba("BT", 1.0),
+    "btn_disabled": hex_rgba("VG", 0.55),
 }
 
 
@@ -646,26 +646,21 @@ class GlassProgressBar(Widget):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.size_hint_y = None
-        self.height = dp(28)
-        self.bind(
-            pos=self._redraw,
-            size=self._redraw,
-            value=self._redraw,
-            max_value=self._redraw,
-        )
+        self.height = dp(26)
+        self.bind(pos=self._redraw, size=self._redraw, value=self._redraw, max_value=self._redraw)
 
     def _redraw(self, *_):
         self.canvas.before.clear()
-        radius = dp(14)
+        radius = dp(13)
         pad = dp(1.5)
 
         progress = 0.0 if self.max_value <= 0 else max(0.0, min(1.0, self.value / self.max_value))
         fill_w = max(dp(8), (self.width - pad * 2) * progress)
 
         with self.canvas.before:
-            Color(*C["shadow"])
+            Color(*C["shadow_soft"])
             RoundedRectangle(
-                pos=(self.x, self.y - dp(2)),
+                pos=(self.x, self.y - dp(1)),
                 size=self.size,
                 radius=[radius] * 4,
             )
@@ -679,8 +674,8 @@ class GlassProgressBar(Widget):
 
             Color(*C["glass_top"])
             RoundedRectangle(
-                pos=(self.x + pad, self.y + self.height * 0.52),
-                size=(self.width - pad * 2, self.height * 0.40),
+                pos=(self.x + pad, self.y + self.height * 0.54),
+                size=(self.width - pad * 2, self.height * 0.34),
                 radius=[radius] * 4,
             )
 
@@ -693,15 +688,15 @@ class GlassProgressBar(Widget):
 
             Color(*C["progress_glow"])
             RoundedRectangle(
-                pos=(self.x + pad + dp(2), self.y + self.height * 0.52),
-                size=(max(dp(4), fill_w - dp(4)), self.height * 0.26),
+                pos=(self.x + pad + dp(2), self.y + self.height * 0.56),
+                size=(max(dp(4), fill_w - dp(4)), self.height * 0.18),
                 radius=[radius] * 4,
             )
 
-            Color(*C["stroke"])
+            Color(*C["stroke_soft"])
             Line(
                 rounded_rectangle=(self.x, self.y, self.width, self.height, radius),
-                width=1.1,
+                width=1.0,
             )
 
 
@@ -709,7 +704,7 @@ class GlassCard(BoxLayout):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.bind(pos=self._redraw, size=self._redraw)
-        self.padding = dp(14)
+        self.padding = dp(16)
         self.spacing = dp(10)
 
     def _redraw(self, *_):
@@ -730,14 +725,175 @@ class GlassCard(BoxLayout):
                 radius=[r] * 4,
             )
 
+            Color(*C["glass_mid"])
+            RoundedRectangle(
+                pos=(self.x + dp(1), self.y + self.height * 0.42),
+                size=(self.width - dp(2), self.height * 0.46),
+                radius=[r] * 4,
+            )
+
             Color(*C["glass_top"])
             RoundedRectangle(
-                pos=(self.x + dp(2), self.y + self.height * 0.52),
-                size=(self.width - dp(4), self.height * 0.42),
+                pos=(self.x + dp(2), self.y + self.height * 0.62),
+                size=(self.width - dp(4), self.height * 0.22),
                 radius=[r] * 4,
             )
 
             Color(*C["stroke"])
+            Line(
+                rounded_rectangle=(self.x, self.y, self.width, self.height, r),
+                width=1.0,
+            )
+
+
+class SoftPane(BoxLayout):
+    def __init__(self, radius: float = 18, **kwargs):
+        super().__init__(**kwargs)
+        self._radius = radius
+        self.padding = dp(8)
+        self.bind(pos=self._redraw, size=self._redraw)
+
+    def _redraw(self, *_):
+        self.canvas.before.clear()
+        r = dp(self._radius)
+        with self.canvas.before:
+            Color(*C["bg_panel_inner"])
+            RoundedRectangle(
+                pos=self.pos,
+                size=self.size,
+                radius=[r] * 4,
+            )
+            Color(*C["stroke_soft"])
+            Line(
+                rounded_rectangle=(self.x, self.y, self.width, self.height, r),
+                width=1.0,
+            )
+
+
+class SoftTextInput(TextInput):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.background_normal = ""
+        self.background_active = ""
+        self.background_color = (0, 0, 0, 0)
+        self.foreground_color = C["text_main"]
+        self.cursor_color = C["text_main"]
+        self.padding = [dp(14), dp(14), dp(14), dp(14)]
+        self.bind(pos=self._redraw, size=self._redraw)
+
+    def _redraw(self, *_):
+        self.canvas.before.clear()
+        r = dp(16)
+        with self.canvas.before:
+            Color(*C["shadow_soft"])
+            RoundedRectangle(
+                pos=(self.x, self.y - dp(1)),
+                size=self.size,
+                radius=[r] * 4,
+            )
+            Color(*C["bg_input_soft"])
+            RoundedRectangle(
+                pos=self.pos,
+                size=self.size,
+                radius=[r] * 4,
+            )
+            Color(*C["glass_top"])
+            RoundedRectangle(
+                pos=(self.x + dp(2), self.y + self.height * 0.56),
+                size=(self.width - dp(4), self.height * 0.22),
+                radius=[r] * 4,
+            )
+            Color(*C["stroke_soft"])
+            Line(
+                rounded_rectangle=(self.x, self.y, self.width, self.height, r),
+                width=1.0,
+            )
+
+
+class ImageStage(Widget):
+    def __init__(self, image_widget: Image, **kwargs):
+        super().__init__(**kwargs)
+        self.image_widget = image_widget
+        self.bind(pos=self._redraw, size=self._redraw)
+
+    def _redraw(self, *_):
+        self.canvas.before.clear()
+        r = dp(18)
+        pad = dp(2)
+        with self.canvas.before:
+            Color(*C["bg_panel_inner"])
+            RoundedRectangle(
+                pos=self.pos,
+                size=self.size,
+                radius=[r] * 4,
+            )
+
+            Color(*C["glass_top"])
+            RoundedRectangle(
+                pos=(self.x + pad, self.y + self.height * 0.68),
+                size=(self.width - pad * 2, self.height * 0.18),
+                radius=[r] * 4,
+            )
+
+            Color(*C["stroke_strong"])
+            Line(
+                rounded_rectangle=(self.x, self.y, self.width, self.height, r),
+                width=1.0,
+            )
+
+
+class SoftButton(Button):
+    def __init__(self, role: str = "neutral", **kwargs):
+        super().__init__(**kwargs)
+        self.role = role
+        self.background_normal = ""
+        self.background_down = ""
+        self.background_color = (0, 0, 0, 0)
+        self.color = C["text_main"]
+        self.size_hint_y = None
+        self.height = dp(52)
+        self.bold = True
+        self.bind(pos=self._redraw, size=self._redraw, state=self._redraw, disabled=self._redraw)
+
+    def _palette(self):
+        if self.disabled:
+            return C["btn_disabled"], C["btn_disabled"]
+
+        if self.role == "launch":
+            return C["btn_launch"], C["btn_launch_down"]
+        if self.role == "stop":
+            return C["btn_stop"], C["btn_stop_down"]
+        return C["btn_neutral"], C["btn_neutral"]
+
+    def _redraw(self, *_):
+        self.canvas.before.clear()
+        r = dp(18)
+        up, down = self._palette()
+        bg = down if self.state == "down" else up
+
+        with self.canvas.before:
+            Color(*C["shadow_soft"])
+            RoundedRectangle(
+                pos=(self.x, self.y - dp(1.5)),
+                size=self.size,
+                radius=[r] * 4,
+            )
+
+            Color(*bg)
+            RoundedRectangle(
+                pos=self.pos,
+                size=self.size,
+                radius=[r] * 4,
+            )
+
+            Color(*C["glass_top"])
+            RoundedRectangle(
+                pos=(self.x + dp(2), self.y + self.height * 0.58),
+                size=(self.width - dp(4), self.height * 0.18),
+                radius=[r] * 4,
+            )
+
+            Color(*C["stroke_soft"])
             Line(
                 rounded_rectangle=(self.x, self.y, self.width, self.height, r),
                 width=1.0,
@@ -789,16 +945,19 @@ class GalleryThumb(Button):
         self.background_down = ""
         self.background_color = (0, 0, 0, 0)
         self.size_hint_y = None
-        self.height = dp(176)
+        self.height = dp(184)
 
-        self.container = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(8))
+        self.container = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
         self.add_widget(self.container)
 
+        self.stage = SoftPane(orientation="vertical", size_hint_y=1)
         self.thumb = Image(allow_stretch=True, keep_ratio=True)
+        self.stage.add_widget(self.thumb)
+
         self.caption = Label(
             text=image_path.name,
             size_hint_y=None,
-            height=dp(26),
+            height=dp(24),
             font_size=sp(11),
             color=C["text_soft"],
             halign="center",
@@ -806,17 +965,20 @@ class GalleryThumb(Button):
         )
         self.caption.bind(size=lambda *a: setattr(self.caption, "text_size", self.caption.size))
 
-        self.container.add_widget(self.thumb)
+        self.container.add_widget(self.stage)
         self.container.add_widget(self.caption)
 
         self.bind(on_release=self._open_preview)
-        self.bind(pos=self._redraw, size=self._redraw)
+        self.bind(pos=self._redraw, size=self._redraw, state=self._redraw)
         self.load_thumbnail()
 
     def _redraw(self, *_):
         self.canvas.before.clear()
-        r = dp(18)
+        r = dp(20)
+        y = self.y - dp(1.5 if self.state == "normal" else 0.5)
         with self.canvas.before:
+            Color(*C["shadow_soft"])
+            RoundedRectangle(pos=(self.x, y), size=self.size, radius=[r] * 4)
             Color(*C["thumb_bg"])
             RoundedRectangle(pos=self.pos, size=self.size, radius=[r] * 4)
             Color(*C["thumb_border"])
@@ -870,9 +1032,9 @@ class CamouflageApp(App):
 
         self.title_label: Optional[Label] = None
         self.status_label: Optional[Label] = None
-        self.count_input: Optional[TextInput] = None
-        self.start_btn: Optional[Button] = None
-        self.stop_btn: Optional[Button] = None
+        self.count_input: Optional[SoftTextInput] = None
+        self.start_btn: Optional[SoftButton] = None
+        self.stop_btn: Optional[SoftButton] = None
         self.progress_bar: Optional[GlassProgressBar] = None
         self.progress_text: Optional[Label] = None
         self.attempt_text: Optional[Label] = None
@@ -894,9 +1056,23 @@ class CamouflageApp(App):
         root = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(10))
 
         header = GlassCard(orientation="horizontal", size_hint_y=None, height=dp(84))
+
+        title_box = BoxLayout(orientation="vertical", spacing=dp(0))
+        tiny = Label(
+            text="Image 000 | essai 0000",
+            size_hint_y=None,
+            height=dp(18),
+            font_size=sp(12),
+            color=C["text_muted"],
+            halign="left",
+            valign="middle",
+        )
+        tiny.bind(size=lambda *a: setattr(tiny, "text_size", tiny.size))
+        self.attempt_text = tiny
+
         self.title_label = Label(
             text=APP_TITLE,
-            font_size=sp(24),
+            font_size=sp(21),
             bold=True,
             color=C["text_main"],
             halign="left",
@@ -904,17 +1080,20 @@ class CamouflageApp(App):
         )
         self.title_label.bind(size=lambda *a: setattr(self.title_label, "text_size", self.title_label.size))
 
+        title_box.add_widget(self.attempt_text)
+        title_box.add_widget(self.title_label)
+
         self.status_label = Label(
             text="Prêt",
             font_size=sp(15),
             color=C["text_muted"],
-            size_hint_x=0.25,
+            size_hint_x=0.18,
             halign="right",
             valign="middle",
         )
         self.status_label.bind(size=lambda *a: setattr(self.status_label, "text_size", self.status_label.size))
 
-        header.add_widget(self.title_label)
+        header.add_widget(title_box)
         header.add_widget(self.status_label)
         root.add_widget(header)
 
@@ -923,32 +1102,26 @@ class CamouflageApp(App):
         # Colonne gauche
         left = BoxLayout(orientation="vertical", size_hint_x=0.34, spacing=dp(10))
 
-        # Correction importante : hauteur fixe suffisante pour afficher les boutons
         controls = GlassCard(
             orientation="vertical",
             size_hint_y=None,
             height=dp(520),
         )
 
-        controls.add_widget(self._label("Nombre de camouflages"))
-        self.count_input = TextInput(
+        controls.add_widget(self._label("Paramètres"))
+
+        self.count_input = SoftTextInput(
             text=str(DEFAULT_TARGET_COUNT),
             multiline=False,
             input_filter="int",
             size_hint_y=None,
-            height=dp(48),
-            background_normal="",
-            background_active="",
-            background_color=C["bg_input"],
-            foreground_color=C["text_main"],
-            cursor_color=C["text_main"],
-            padding=[dp(14), dp(14), dp(14), dp(14)],
+            height=dp(50),
         )
         controls.add_widget(self.count_input)
 
         btn_row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(10))
-        self.start_btn = self._styled_button("Commencer", C["btn_launch"], self.start_generation)
-        self.stop_btn = self._styled_button("Arrêter", C["btn_stop"], self.stop_generation)
+        self.start_btn = self._styled_button("Commencer", "launch", self.start_generation)
+        self.stop_btn = self._styled_button("Arrêter", "stop", self.stop_generation)
         btn_row.add_widget(self.start_btn)
         btn_row.add_widget(self.stop_btn)
         controls.add_widget(btn_row)
@@ -958,9 +1131,7 @@ class CamouflageApp(App):
         controls.add_widget(self.progress_bar)
 
         self.progress_text = self._small_label("0 / 0 validé(s)")
-        self.attempt_text = self._small_label("Image 000 | essai 0000")
         controls.add_widget(self.progress_text)
-        controls.add_widget(self.attempt_text)
 
         controls.add_widget(self._label("Intensité machine"))
         intensity_row = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(10))
@@ -973,7 +1144,7 @@ class CamouflageApp(App):
 
         controls.add_widget(self._label("Ressources"))
         self.resource_text = self._small_label("CPU -- | RAM -- | Disque -- | Processus --")
-        self.resource_hint = self._small_label("L’interface réduit légèrement la cadence si la charge devient trop haute.")
+        self.resource_hint = self._small_label("La cadence s’adapte légèrement quand la charge monte.")
         controls.add_widget(self.resource_text)
         controls.add_widget(self.resource_hint)
 
@@ -1038,23 +1209,25 @@ class CamouflageApp(App):
 
     # ---------------- style helpers ----------------
 
-    def _styled_button(self, text: str, bg_color, on_release_callback) -> Button:
-        btn = Button(
-            text=text,
-            size_hint_y=None,
-            height=dp(52),
-            background_normal="",
-            background_down="",
-            background_color=bg_color,
-            color=C["text_main"],
-        )
+    def _styled_button(self, text: str, role: str, on_release_callback) -> SoftButton:
+        btn = SoftButton(text=text, role=role)
         btn.bind(on_release=on_release_callback)
         return btn
 
-    def _carded_view(self, title: str, widget: Widget) -> Widget:
+    def _carded_view(self, title: str, image_widget: Image) -> Widget:
         box = GlassCard(orientation="vertical")
         box.add_widget(self._label(title))
-        box.add_widget(widget)
+
+        stage_container = SoftPane(orientation="vertical")
+        stage = ImageStage(image_widget, size_hint=(1, 1))
+        wrapper = BoxLayout(orientation="vertical")
+        wrapper.add_widget(stage)
+
+        overlay = BoxLayout(orientation="vertical", padding=dp(8))
+        overlay.add_widget(image_widget)
+
+        stage_container.add_widget(overlay)
+        box.add_widget(stage_container)
         return box
 
     def _label(self, text: str, **kwargs) -> Label:
@@ -1138,10 +1311,6 @@ class CamouflageApp(App):
             self.resource_text.text = "Monitoring indisponible."
 
     async def _adaptive_pause(self):
-        """
-        Régulation légère.
-        Plus l'intensité demandée est basse, plus on respire entre les tentatives.
-        """
         base = (100.0 - self.machine_intensity) / 1000.0
 
         if psutil is None:
