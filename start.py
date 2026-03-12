@@ -1,21 +1,22 @@
 # -*- coding: utf-8 -*-
 """
 start.py
-Interface Kivy plein écran asynchrone pour piloter main.py comme module.
+Interface Kivy moderne, asynchrone, resizable, orientée production,
+pour piloter main.py comme module.
 
 Fonctions :
+- interface épurée : lancer / arrêter / nombre de camouflages
 - génération séquentielle stricte
 - orchestration asynchrone
-- progression temps réel
-- aperçu du camouflage accepté / courant
-- projection sur silhouette pseudo-humaine
-- score de rupture des contours externes
-- tri automatique des meilleurs motifs validés
-- export CSV enrichi
-- arrêt propre de la génération
+- barre de progression
+- aperçu principal + projection silhouette
+- galerie des camouflages déjà générés
+- monitoring ressources (CPU / RAM / disque / process)
+- prévention de la mise en veille pendant la génération
+- adaptation légère de cadence si la machine est trop chargée
 
 Pré-requis :
-    pip install kivy pillow numpy
+    pip install kivy pillow numpy psutil
 
 Arborescence attendue :
     .
@@ -27,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import ctypes
 import io
 import math
 import os
@@ -34,6 +36,7 @@ import platform
 import shutil
 import subprocess
 import threading
+import time
 from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,13 +46,20 @@ import numpy as np
 from PIL import Image as PILImage
 from PIL import ImageDraw
 
+try:
+    import psutil
+except Exception:
+    psutil = None
+
 # ---------------- Kivy config avant imports UI ----------------
 from kivy.config import Config
 
-Config.set("graphics", "fullscreen", "auto")
+Config.set("graphics", "fullscreen", "0")
 Config.set("graphics", "resizable", "1")
 Config.set("graphics", "minimum_width", "1200")
-Config.set("graphics", "minimum_height", "800")
+Config.set("graphics", "minimum_height", "760")
+Config.set("graphics", "width", "1600")
+Config.set("graphics", "height", "980")
 Config.set("input", "mouse", "mouse,multitouch_on_demand")
 
 from kivy.app import App
@@ -60,7 +70,6 @@ from kivy.metrics import dp, sp
 from kivy.properties import StringProperty
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
-from kivy.uix.checkbox import CheckBox
 from kivy.uix.gridlayout import GridLayout
 from kivy.uix.image import Image
 from kivy.uix.label import Label
@@ -77,23 +86,30 @@ import main as camo
 # CONSTANTES UI / EXPORT
 # ============================================================
 
-APP_TITLE = "Camouflage Armée Fédérale Europe — Générateur V3 Async"
-BEST_DIR_NAME = "best_of"
+APP_TITLE = "Camouflage Armée Fédérale Europe"
 REPORT_NAME = "rapport_camouflages_v3.csv"
+BEST_DIR_NAME = "best_of"
 DEFAULT_OUTPUT_DIR = Path("camouflages_federale_europe")
+DEFAULT_TARGET_COUNT = 100
 DEFAULT_TOP_K = 20
 
-# Score final : pondérations
 WEIGHT_RATIO = 0.28
 WEIGHT_SILHOUETTE = 0.30
 WEIGHT_CONTOUR = 0.24
 WEIGHT_MAIN_METRICS = 0.18
 
-# Seuils V3 supplémentaires
 MIN_SILHOUETTE_COLOR_DIVERSITY = 0.62
 MIN_CONTOUR_BREAK_SCORE = 0.44
 MIN_OUTLINE_BAND_DIVERSITY = 0.58
 MIN_SMALL_SCALE_STRUCTURAL_SCORE = 0.42
+
+THUMB_SIZE = (220, 140)
+GALLERY_COLUMNS = 3
+
+# Anti-veille Windows
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
+ES_DISPLAY_REQUIRED = 0x00000002
 
 
 # ============================================================
@@ -125,11 +141,6 @@ class CandidateRecord:
 # ============================================================
 
 class AsyncioThreadRunner:
-    """
-    Event loop asyncio dédié dans un thread séparé.
-    Permet de soumettre des coroutines depuis le thread Kivy.
-    """
-
     def __init__(self):
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
@@ -150,7 +161,7 @@ class AsyncioThreadRunner:
 
 
 # ============================================================
-# OUTILS GÉNÉRAUX
+# OUTILS SYSTÈME
 # ============================================================
 
 def open_folder(path: Path) -> None:
@@ -167,6 +178,20 @@ def open_folder(path: Path) -> None:
         pass
 
 
+def prevent_sleep(enable: bool) -> None:
+    if platform.system().lower() != "windows":
+        return
+    try:
+        if enable:
+            ctypes.windll.kernel32.SetThreadExecutionState(
+                ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+            )
+        else:
+            ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+    except Exception:
+        pass
+
+
 def clamp01(x: float) -> float:
     return max(0.0, min(1.0, x))
 
@@ -176,6 +201,16 @@ def pil_to_coreimage(pil_img: PILImage.Image) -> CoreImage:
     pil_img.save(bio, format="PNG")
     bio.seek(0)
     return CoreImage(bio, ext="png")
+
+
+def make_thumbnail(pil_img: PILImage.Image, size: Tuple[int, int]) -> PILImage.Image:
+    img = pil_img.copy()
+    img.thumbnail(size, PILImage.Resampling.LANCZOS)
+    canvas = PILImage.new("RGB", size, (22, 24, 28))
+    x = (size[0] - img.width) // 2
+    y = (size[1] - img.height) // 2
+    canvas.paste(img, (x, y))
+    return canvas
 
 
 def palette_map() -> Dict[Tuple[int, int, int], int]:
@@ -367,7 +402,7 @@ def silhouette_projection_image(index_canvas: np.ndarray) -> PILImage.Image:
     h, w = index_canvas.shape
     sil = build_silhouette_mask(w, h)
 
-    background = np.full((h, w, 3), 22, dtype=np.uint8)
+    background = np.full((h, w, 3), 24, dtype=np.uint8)
     rgb = camo.RGB[index_canvas]
     background[sil] = rgb[sil]
 
@@ -441,15 +476,16 @@ def ratio_score(rs: np.ndarray) -> float:
 
 
 def main_metrics_score(metrics: Dict[str, float]) -> float:
-    parts = []
-    parts.append(clamp01((metrics["largest_olive_component_ratio"] - 0.12) / 0.18))
-    parts.append(clamp01(1.0 - metrics["center_empty_ratio"] / 0.60))
-    parts.append(clamp01(1.0 - metrics["mirror_similarity"] / 0.90))
-    parts.append(clamp01((metrics["olive_multizone_share"] - 0.25) / 0.45))
-    parts.append(clamp01(1.0 - abs(metrics["boundary_density"] - 0.14) / 0.12))
-    parts.append(clamp01((metrics["vert_olive_macro_share"] - 0.45) / 0.30))
-    parts.append(clamp01((metrics["terre_de_france_transition_share"] - 0.20) / 0.30))
-    parts.append(clamp01((metrics["vert_de_gris_micro_share"] - 0.50) / 0.25))
+    parts = [
+        clamp01((metrics["largest_olive_component_ratio"] - 0.12) / 0.18),
+        clamp01(1.0 - metrics["center_empty_ratio"] / 0.60),
+        clamp01(1.0 - metrics["mirror_similarity"] / 0.90),
+        clamp01((metrics["olive_multizone_share"] - 0.25) / 0.45),
+        clamp01(1.0 - abs(metrics["boundary_density"] - 0.14) / 0.12),
+        clamp01((metrics["vert_olive_macro_share"] - 0.45) / 0.30),
+        clamp01((metrics["terre_de_france_transition_share"] - 0.20) / 0.30),
+        clamp01((metrics["vert_de_gris_micro_share"] - 0.50) / 0.25),
+    ]
     return float(np.mean(parts))
 
 
@@ -508,10 +544,6 @@ async def async_evaluate_candidate_v3(
 # WIDGETS
 # ============================================================
 
-class StatLabel(Label):
-    pass
-
-
 class LogView(ScrollView):
     text = StringProperty("")
 
@@ -527,13 +559,13 @@ class LogView(ScrollView):
             halign="left",
             valign="top",
             font_size=sp(13),
-            color=(0.93, 0.93, 0.95, 1),
+            color=(0.93, 0.95, 0.98, 1),
         )
         self.label.bind(texture_size=self._update_label_height, width=self._update_text_width)
         self.add_widget(self.label)
 
     def _update_label_height(self, *_):
-        self.label.height = self.label.texture_size[1] + dp(12)
+        self.label.height = self.label.texture_size[1] + dp(16)
 
     def _update_text_width(self, *_):
         self.label.text_size = (self.width - dp(24), None)
@@ -541,10 +573,69 @@ class LogView(ScrollView):
     def append(self, line: str) -> None:
         lines = self.label.text.splitlines() if self.label.text else []
         lines.append(line)
-        if len(lines) > 350:
-            lines = lines[-350:]
+        if len(lines) > 400:
+            lines = lines[-400:]
         self.label.text = "\n".join(lines)
         Clock.schedule_once(lambda dt: setattr(self, "scroll_y", 0), 0.05)
+
+
+class GalleryThumb(Button):
+    def __init__(self, app_ref: "CamouflageApp", image_path: Path, **kwargs):
+        super().__init__(**kwargs)
+        self.app_ref = app_ref
+        self.image_path = image_path
+        self.background_normal = ""
+        self.background_down = ""
+        self.background_color = (0, 0, 0, 0)
+        self.size_hint_y = None
+        self.height = dp(170)
+        self.padding = dp(8)
+        self.bind(on_release=self._open_preview)
+
+        self.container = BoxLayout(orientation="vertical", spacing=dp(6), padding=dp(6))
+        self.add_widget(self.container)
+
+        self.thumb = Image(size_hint_y=None, height=dp(128))
+        self.caption = Label(
+            text=image_path.name,
+            size_hint_y=None,
+            height=dp(24),
+            font_size=sp(11),
+            color=(0.90, 0.92, 0.95, 1),
+            halign="center",
+            valign="middle",
+        )
+        self.caption.bind(size=lambda *a: setattr(self.caption, "text_size", self.caption.size))
+
+        self.container.add_widget(self.thumb)
+        self.container.add_widget(self.caption)
+
+        with self.canvas.before:
+            from kivy.graphics import Color, RoundedRectangle
+            Color(0.16, 0.18, 0.22, 0.82)
+            self._bg = RoundedRectangle(radius=[dp(18)] * 4, pos=self.pos, size=self.size)
+        self.bind(pos=lambda inst, val: setattr(self._bg, "pos", val))
+        self.bind(size=lambda inst, val: setattr(self._bg, "size", val))
+
+        self.load_thumbnail()
+
+    def load_thumbnail(self):
+        try:
+            img = PILImage.open(self.image_path).convert("RGB")
+            thumb = make_thumbnail(img, THUMB_SIZE)
+            self.thumb.texture = pil_to_coreimage(thumb).texture
+        except Exception:
+            pass
+
+    def _open_preview(self, *_):
+        try:
+            pil_img = PILImage.open(self.image_path).convert("RGB")
+            idx = rgb_image_to_index_canvas(pil_img)
+            sil = silhouette_projection_image(idx)
+            self.app_ref.update_preview(pil_img, sil)
+            self.app_ref.log(f"Aperçu galerie : {self.image_path.name}")
+        except Exception as exc:
+            self.app_ref.log(f"Impossible d'ouvrir {self.image_path.name} : {exc}")
 
 
 # ============================================================
@@ -567,19 +658,23 @@ class CamouflageApp(App):
 
         self.current_preview_img: Optional[PILImage.Image] = None
         self.current_silhouette_preview: Optional[PILImage.Image] = None
-        self.use_silhouette_preview: bool = True
+
+        self.accepted_count = 0
+        self.total_attempts = 0
+        self.last_resource_poll = 0.0
+        self.process = psutil.Process() if psutil else None
 
     def build(self):
-        Window.clearcolor = (0.07, 0.08, 0.10, 1)
+        Window.clearcolor = (0.05, 0.06, 0.08, 1)
 
         root = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(10))
 
-        header = BoxLayout(size_hint_y=None, height=dp(70), spacing=dp(10))
+        header = self._card(BoxLayout(orientation="horizontal", spacing=dp(10), padding=dp(16)), min_h=dp(74))
         self.title_label = Label(
             text=APP_TITLE,
-            bold=True,
             font_size=sp(24),
-            color=(0.96, 0.96, 0.98, 1),
+            bold=True,
+            color=(0.97, 0.98, 1.0, 1),
             halign="left",
             valign="middle",
         )
@@ -587,9 +682,9 @@ class CamouflageApp(App):
 
         self.status_label = Label(
             text="Prêt",
-            font_size=sp(16),
-            color=(0.78, 0.90, 0.78, 1),
-            size_hint_x=0.28,
+            font_size=sp(15),
+            color=(0.76, 0.92, 0.78, 1),
+            size_hint_x=0.25,
             halign="right",
             valign="middle",
         )
@@ -601,148 +696,151 @@ class CamouflageApp(App):
 
         body = BoxLayout(spacing=dp(10))
 
-        left = BoxLayout(orientation="vertical", size_hint_x=0.32, spacing=dp(10))
+        # Colonne gauche
+        left = BoxLayout(orientation="vertical", size_hint_x=0.33, spacing=dp(10))
 
-        controls = GridLayout(cols=1, spacing=dp(8), size_hint_y=None, padding=dp(10))
-        controls.bind(minimum_height=controls.setter("height"))
+        control_card = self._card(BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(14)))
+        control_card.add_widget(self._label("Nombre de camouflages à générer"))
 
-        controls.add_widget(self._label("Dossier de sortie"))
-        self.output_input = TextInput(
-            text=str(DEFAULT_OUTPUT_DIR),
-            multiline=False,
-            size_hint_y=None,
-            height=dp(40),
-            background_color=(0.13, 0.14, 0.17, 1),
-            foreground_color=(1, 1, 1, 1),
-            cursor_color=(1, 1, 1, 1),
-        )
-        controls.add_widget(self.output_input)
-
-        controls.add_widget(self._label("Nombre d'images validées"))
         self.count_input = TextInput(
-            text="100",
+            text=str(DEFAULT_TARGET_COUNT),
             multiline=False,
             input_filter="int",
             size_hint_y=None,
-            height=dp(40),
-            background_color=(0.13, 0.14, 0.17, 1),
-            foreground_color=(1, 1, 1, 1),
-            cursor_color=(1, 1, 1, 1),
-        )
-        controls.add_widget(self.count_input)
-
-        controls.add_widget(self._label("Top motifs à copier dans best_of"))
-        self.topk_input = TextInput(
-            text=str(DEFAULT_TOP_K),
-            multiline=False,
-            input_filter="int",
-            size_hint_y=None,
-            height=dp(40),
-            background_color=(0.13, 0.14, 0.17, 1),
-            foreground_color=(1, 1, 1, 1),
-            cursor_color=(1, 1, 1, 1),
-        )
-        controls.add_widget(self.topk_input)
-
-        row = BoxLayout(size_hint_y=None, height=dp(36), spacing=dp(10))
-        row.add_widget(self._label("Aperçu silhouette", size_hint_x=0.7))
-        self.silhouette_checkbox = CheckBox(active=True)
-        row.add_widget(self.silhouette_checkbox)
-        controls.add_widget(row)
-
-        score_box = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(120), spacing=dp(6))
-        self.score_target_label = self._small_label("Validation V3 async : silhouette + contour + tri automatique")
-        score_box.add_widget(self.score_target_label)
-        controls.add_widget(score_box)
-
-        button_row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
-        self.start_btn = Button(
-            text="Démarrer",
+            height=dp(46),
             background_normal="",
-            background_color=(0.16, 0.48, 0.28, 1),
+            background_active="",
+            background_color=(0.14, 0.16, 0.20, 0.9),
+            foreground_color=(1, 1, 1, 1),
+            cursor_color=(1, 1, 1, 1),
+            padding=[dp(12), dp(12), dp(12), dp(12)],
+        )
+        control_card.add_widget(self.count_input)
+
+        btn_row = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(10))
+        self.start_btn = Button(
+            text="Lancer",
+            background_normal="",
+            background_down="",
+            background_color=(0.18, 0.56, 0.34, 1),
             color=(1, 1, 1, 1),
         )
-        self.start_btn.bind(on_release=self.start_generation)
-
         self.stop_btn = Button(
             text="Arrêter",
             background_normal="",
-            background_color=(0.55, 0.18, 0.18, 1),
+            background_down="",
+            background_color=(0.62, 0.20, 0.20, 1),
             color=(1, 1, 1, 1),
         )
+        self.start_btn.bind(on_release=self.start_generation)
         self.stop_btn.bind(on_release=self.stop_generation)
+        btn_row.add_widget(self.start_btn)
+        btn_row.add_widget(self.stop_btn)
+        control_card.add_widget(btn_row)
 
-        self.open_btn = Button(
-            text="Ouvrir dossier",
-            background_normal="",
-            background_color=(0.22, 0.28, 0.42, 1),
-            color=(1, 1, 1, 1),
-        )
-        self.open_btn.bind(on_release=lambda *_: open_folder(Path(self.output_input.text.strip() or ".")))
-
-        button_row.add_widget(self.start_btn)
-        button_row.add_widget(self.stop_btn)
-        button_row.add_widget(self.open_btn)
-        controls.add_widget(button_row)
-
-        controls.add_widget(self._label("Progression globale"))
+        control_card.add_widget(self._label("Progression globale"))
         self.progress_global = ProgressBar(max=100, value=0, size_hint_y=None, height=dp(18))
-        controls.add_widget(self.progress_global)
+        control_card.add_widget(self.progress_global)
 
-        controls.add_widget(self._label("Tentative en cours"))
-        self.progress_attempt_label = self._small_label("Image 000 | essai 0000")
-        controls.add_widget(self.progress_attempt_label)
+        self.progress_text = self._small_label("0 / 0 validé")
+        self.attempt_text = self._small_label("Image 000 | essai 0000")
+        control_card.add_widget(self.progress_text)
+        control_card.add_widget(self.attempt_text)
 
-        stats_box = GridLayout(cols=1, spacing=dp(4), size_hint_y=None)
-        stats_box.bind(minimum_height=stats_box.setter("height"))
+        self.resource_title = self._label("Ressources système")
+        self.resource_text = self._small_label("CPU -- | RAM -- | Disque -- | Processus --")
+        self.resource_hint = self._small_label("Régulation automatique active si la charge monte.")
+        control_card.add_widget(self.resource_title)
+        control_card.add_widget(self.resource_text)
+        control_card.add_widget(self.resource_hint)
 
-        self.stat_color = self._small_label("C=0.00 O=0.00 T=0.00 G=0.00")
-        self.stat_score = self._small_label("Score final = 0.000")
-        self.stat_main = self._small_label("Silhouette=0.000 | Contour=0.000 | Main=0.000")
-        self.stat_extra = self._small_label("Contour break=0.000 | Outline=0.000 | Small-scale=0.000")
+        self.score_text = self._small_label("Score final -- | ratio -- | silhouette -- | contour --")
+        self.color_text = self._small_label("C -- | O -- | T -- | G --")
+        self.extra_text = self._small_label("Olive conn. -- | centre -- | limites -- | miroir --")
+        control_card.add_widget(self.score_text)
+        control_card.add_widget(self.color_text)
+        control_card.add_widget(self.extra_text)
 
-        stats_box.add_widget(self.stat_color)
-        stats_box.add_widget(self.stat_score)
-        stats_box.add_widget(self.stat_main)
-        stats_box.add_widget(self.stat_extra)
-        controls.add_widget(stats_box)
+        left.add_widget(control_card)
 
-        left_scroll = ScrollView()
-        left_scroll.add_widget(controls)
-        left.add_widget(left_scroll)
+        gallery_card = self._card(BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(12)))
+        gallery_card.add_widget(self._label("Galerie des camouflages déjà générés"))
 
+        self.gallery_scroll = ScrollView(do_scroll_x=False)
+        self.gallery_grid = GridLayout(
+            cols=GALLERY_COLUMNS,
+            spacing=dp(10),
+            padding=dp(4),
+            size_hint_y=None,
+        )
+        self.gallery_grid.bind(minimum_height=self.gallery_grid.setter("height"))
+        self.gallery_scroll.add_widget(self.gallery_grid)
+        gallery_card.add_widget(self.gallery_scroll)
+        left.add_widget(gallery_card)
+
+        # Colonne droite
         right = BoxLayout(orientation="vertical", spacing=dp(10))
 
-        previews = BoxLayout(spacing=dp(10), size_hint_y=0.62)
-
+        preview_row = BoxLayout(spacing=dp(10), size_hint_y=0.58)
         self.preview_img = Image()
         self.preview_silhouette = Image()
 
-        previews.add_widget(self._framed_widget("Motif validé / courant", self.preview_img))
-        previews.add_widget(self._framed_widget("Projection silhouette", self.preview_silhouette))
+        preview_row.add_widget(self._carded_view("Camouflage courant / validé", self.preview_img))
+        preview_row.add_widget(self._carded_view("Projection silhouette", self.preview_silhouette))
+        right.add_widget(preview_row)
 
-        right.add_widget(previews)
-
+        log_card = self._card(BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(12)))
+        log_card.add_widget(self._label("Journal"))
         self.log_view = LogView()
-        right.add_widget(self._framed_widget("Journal", self.log_view))
+        log_card.add_widget(self.log_view)
+        right.add_widget(log_card)
 
         body.add_widget(left)
         body.add_widget(right)
+
         root.add_widget(body)
 
         self._refresh_controls_state()
+        self.reload_gallery()
+        Clock.schedule_interval(self._update_resource_monitor, 1.0)
+        Clock.schedule_interval(self._refresh_gallery_periodic, 3.0)
+
         return root
 
-    # ---------------- UI helpers ----------------
+    def on_start(self):
+        try:
+            Window.maximize()
+        except Exception:
+            pass
+
+    # ---------------- style helpers ----------------
+
+    def _card(self, widget: Widget, min_h: Optional[float] = None) -> Widget:
+        if min_h is not None:
+            widget.size_hint_y = None
+            widget.height = min_h
+
+        with widget.canvas.before:
+            from kivy.graphics import Color, RoundedRectangle
+            Color(0.13, 0.15, 0.19, 0.86)
+            widget._bg = RoundedRectangle(radius=[dp(22)] * 4, pos=widget.pos, size=widget.size)
+        widget.bind(pos=lambda inst, val: setattr(widget._bg, "pos", val))
+        widget.bind(size=lambda inst, val: setattr(widget._bg, "size", val))
+        return widget
+
+    def _carded_view(self, title: str, view: Widget) -> Widget:
+        box = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(12))
+        box.add_widget(self._label(title))
+        box.add_widget(view)
+        return self._card(box)
 
     def _label(self, text: str, **kwargs) -> Label:
         kwargs.setdefault("size_hint_y", None)
         kwargs.setdefault("height", dp(24))
         kwargs.setdefault("font_size", sp(15))
-        kwargs.setdefault("color", (0.94, 0.94, 0.96, 1))
+        kwargs.setdefault("color", (0.95, 0.97, 1.0, 1))
         kwargs.setdefault("halign", "left")
         kwargs.setdefault("valign", "middle")
-
         lbl = Label(text=text, **kwargs)
         lbl.bind(size=lambda *a: setattr(lbl, "text_size", lbl.size))
         return lbl
@@ -751,32 +849,72 @@ class CamouflageApp(App):
         kwargs.setdefault("size_hint_y", None)
         kwargs.setdefault("height", dp(22))
         kwargs.setdefault("font_size", sp(13))
-        kwargs.setdefault("color", (0.82, 0.86, 0.90, 1))
+        kwargs.setdefault("color", (0.83, 0.88, 0.94, 1))
         kwargs.setdefault("halign", "left")
         kwargs.setdefault("valign", "middle")
-
         lbl = Label(text=text, **kwargs)
         lbl.bind(size=lambda *a: setattr(lbl, "text_size", lbl.size))
         return lbl
 
-    def _framed_widget(self, title: str, widget: Widget) -> BoxLayout:
-        box = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
-        with box.canvas.before:
-            from kivy.graphics import Color, RoundedRectangle
-            Color(0.11, 0.12, 0.15, 1)
-            box._bg = RoundedRectangle(radius=[dp(12)] * 4, pos=box.pos, size=box.size)
-        box.bind(pos=lambda inst, val: setattr(box._bg, "pos", val))
-        box.bind(size=lambda inst, val: setattr(box._bg, "size", val))
-
-        title_lbl = self._label(title, height=dp(26))
-        box.add_widget(title_lbl)
-        box.add_widget(widget)
-        return box
+    # ---------------- controls / gallery ----------------
 
     @mainthread
     def _refresh_controls_state(self):
         self.start_btn.disabled = self.running or self.stopping
         self.stop_btn.disabled = (not self.running) and (not self.stopping)
+
+    @mainthread
+    def reload_gallery(self):
+        self.gallery_grid.clear_widgets()
+
+        if not self.current_output_dir.exists():
+            return
+
+        files = sorted(self.current_output_dir.glob("camouflage_*.png"))
+        for p in files:
+            self.gallery_grid.add_widget(GalleryThumb(self, p))
+
+    def _refresh_gallery_periodic(self, _dt):
+        self.reload_gallery()
+
+    # ---------------- monitoring ----------------
+
+    def _update_resource_monitor(self, _dt):
+        if psutil is None:
+            self.resource_text.text = "Installer psutil pour voir CPU / RAM / disque."
+            return
+
+        try:
+            cpu = psutil.cpu_percent(interval=None)
+            ram = psutil.virtual_memory().percent
+            disk = psutil.disk_usage(str(self.current_output_dir.resolve().anchor or "C:\\")).percent
+
+            proc_cpu = self.process.cpu_percent(interval=None) if self.process else 0.0
+            proc_mem = self.process.memory_info().rss / (1024 ** 3) if self.process else 0.0
+
+            self.resource_text.text = (
+                f"CPU {cpu:.0f}% | RAM {ram:.0f}% | Disque {disk:.0f}% | "
+                f"Processus {proc_cpu:.0f}% / {proc_mem:.2f} Go"
+            )
+        except Exception:
+            self.resource_text.text = "Monitoring indisponible."
+
+    async def _adaptive_pause(self):
+        if psutil is None:
+            return
+        try:
+            cpu = psutil.cpu_percent(interval=None)
+            ram = psutil.virtual_memory().percent
+            if cpu >= 95 or ram >= 92:
+                await asyncio.sleep(0.08)
+            elif cpu >= 88 or ram >= 88:
+                await asyncio.sleep(0.04)
+            elif cpu >= 80 or ram >= 84:
+                await asyncio.sleep(0.015)
+        except Exception:
+            return
+
+    # ---------------- future binding ----------------
 
     def _bind_future(self, fut: Future):
         self.current_future = fut
@@ -796,8 +934,9 @@ class CamouflageApp(App):
             self.running = False
             self.stopping = False
             self.stop_flag = False
+            prevent_sleep(False)
             self.status("Erreur", ok=False)
-            self.log(f"Erreur non capturée du futur async : {exc}")
+            self.log(f"Erreur non capturée : {exc}")
             self._refresh_controls_state()
 
     @mainthread
@@ -824,31 +963,26 @@ class CamouflageApp(App):
             self.log("Nombre d'images invalide.")
             return
 
-        try:
-            top_k = int(self.topk_input.text.strip())
-            if top_k <= 0:
-                raise ValueError
-        except Exception:
-            self.log("Nombre top_k invalide.")
-            return
-
-        self.current_output_dir = Path(self.output_input.text.strip() or DEFAULT_OUTPUT_DIR)
+        self.current_output_dir = DEFAULT_OUTPUT_DIR
         self.current_output_dir.mkdir(parents=True, exist_ok=True)
 
         self.best_records.clear()
         self.stop_flag = False
         self.stopping = False
         self.running = True
-        self.use_silhouette_preview = bool(self.silhouette_checkbox.active)
+        self.accepted_count = 0
+        self.total_attempts = 0
         self.progress_global.max = count
         self.progress_global.value = 0
 
-        self.status("Génération async en cours...", ok=True)
-        self.log(f"Démarrage async : {count} images validées à produire.")
-        self.log(f"Dossier de sortie : {self.current_output_dir.resolve()}")
+        prevent_sleep(True)
+
+        self.status("Génération en cours…", ok=True)
+        self.log(f"Démarrage : {count} camouflages à produire.")
+        self.log(f"Dossier : {self.current_output_dir.resolve()}")
         self._refresh_controls_state()
 
-        fut = self.async_runner.submit(self._async_worker_generate(count, top_k))
+        fut = self.async_runner.submit(self._async_worker_generate(count))
         self._bind_future(fut)
 
     def stop_generation(self, *_):
@@ -857,14 +991,14 @@ class CamouflageApp(App):
 
         self.stop_flag = True
         self.stopping = True
-        self.status("Arrêt demandé...", ok=False)
-        self.log("Arrêt demandé par l'utilisateur. Fin de la tentative courante puis arrêt.")
+        self.status("Arrêt demandé…", ok=False)
+        self.log("Arrêt demandé. Fin de la tentative courante puis arrêt.")
         self._refresh_controls_state()
 
     async def _async_should_stop(self) -> bool:
         return self.stop_flag
 
-    async def _async_worker_generate(self, target_count: int, top_k: int):
+    async def _async_worker_generate(self, target_count: int):
         rows: List[dict] = []
         total_attempts = 0
 
@@ -874,11 +1008,12 @@ class CamouflageApp(App):
 
                 while True:
                     if await self._async_should_stop():
-                        await self._async_finish_stopped(rows, top_k)
+                        await self._async_finish_stopped(rows)
                         return
 
                     total_attempts += 1
                     local_attempt += 1
+                    self.total_attempts = total_attempts
 
                     seed = camo.build_seed(target_index, local_attempt, base_seed=camo.DEFAULT_BASE_SEED)
                     candidate = await camo.async_generate_candidate_from_seed(seed)
@@ -891,31 +1026,30 @@ class CamouflageApp(App):
                     valid_main = await camo.async_validate_candidate_result(candidate)
                     full_valid = valid_main and valid_v3
 
-                    silhouette_img = await asyncio.to_thread(
-                        silhouette_projection_image,
-                        rgb_image_to_index_canvas(candidate.image),
-                    )
+                    idx_canvas = await asyncio.to_thread(rgb_image_to_index_canvas, candidate.image)
+                    silhouette_img = await asyncio.to_thread(silhouette_projection_image, idx_canvas)
 
-                    self.update_preview(
-                        candidate.image,
-                        silhouette_img if self.use_silhouette_preview else candidate.image,
-                    )
+                    self.update_preview(candidate.image, silhouette_img)
                     self.update_attempt_status(
-                        target_index,
-                        local_attempt,
-                        candidate.ratios,
-                        extra_scores,
+                        target_index=target_index,
+                        attempt_idx=local_attempt,
+                        target_total=target_count,
+                        accepted_count=len(rows),
+                        rs=candidate.ratios,
+                        extra_scores=extra_scores,
+                        metrics=candidate.metrics,
                     )
 
                     if not full_valid:
                         self.log(
                             f"[img={target_index:03d} essai={local_attempt:04d}] rejeté | "
+                            f"SF={extra_scores['score_final']:.3f} | "
                             f"C={candidate.ratios[camo.IDX_COYOTE]*100:.1f} "
                             f"O={candidate.ratios[camo.IDX_OLIVE]*100:.1f} "
                             f"T={candidate.ratios[camo.IDX_TERRE]*100:.1f} "
-                            f"G={candidate.ratios[camo.IDX_GRIS]*100:.1f} | "
-                            f"SF={extra_scores['score_final']:.3f}"
+                            f"G={candidate.ratios[camo.IDX_GRIS]*100:.1f}"
                         )
+                        await self._adaptive_pause()
                         await asyncio.sleep(0)
                         continue
 
@@ -980,26 +1114,29 @@ class CamouflageApp(App):
                         "angles": " ".join(map(str, candidate.profile.allowed_angles)),
                     })
 
+                    self.accepted_count = len(rows)
                     self.update_progress(target_index, target_count)
                     self.log(
                         f"[img={target_index:03d}] accepté -> {filename.name} | "
                         f"SF={extra_scores['score_final']:.3f} | "
-                        f"silhouette={extra_scores['silhouette_color_diversity']:.3f} | "
+                        f"silhouette={extra_scores['score_silhouette']:.3f} | "
                         f"contour={extra_scores['contour_break_score']:.3f}"
                     )
+                    self.reload_gallery()
 
+                    await self._adaptive_pause()
                     await asyncio.sleep(0)
                     break
 
-            await self._async_finish_success(rows, top_k)
+            await self._async_finish_success(rows)
 
         except asyncio.CancelledError:
-            await self._async_finish_stopped(rows, top_k)
+            await self._async_finish_stopped(rows)
             raise
         except Exception as e:
             await self._async_finish_error(str(e))
 
-    # ---------------- fin de traitement async ----------------
+    # ---------------- fin de traitement ----------------
 
     async def _async_write_report(self, rows: List[dict]) -> Path:
         report_path = self.current_output_dir / REPORT_NAME
@@ -1071,35 +1208,43 @@ class CamouflageApp(App):
             writer.writeheader()
             writer.writerows(rows)
 
-    async def _async_finish_success(self, rows: List[dict], top_k: int):
+    async def _async_finish_success(self, rows: List[dict]):
         report_path = await self._async_write_report(rows)
-        best_dir = await self._async_export_best_of(top_k)
+        best_dir = await self._async_export_best_of(DEFAULT_TOP_K)
+        prevent_sleep(False)
+
         self.running = False
         self.stopping = False
         self.stop_flag = False
         self.status("Terminé", ok=True)
         self.log(f"Rapport écrit : {report_path}")
         self.log(f"Best-of exporté : {best_dir}")
-        self.log("Génération async terminée avec succès.")
+        self.log("Génération terminée avec succès.")
         self._refresh_controls_state()
+        self.reload_gallery()
 
-    async def _async_finish_stopped(self, rows: List[dict], top_k: int):
+    async def _async_finish_stopped(self, rows: List[dict]):
         report_path = await self._async_write_report(rows)
         if rows:
-            best_dir = await self._async_export_best_of(min(top_k, len(rows)))
+            best_dir = await self._async_export_best_of(min(DEFAULT_TOP_K, len(rows)))
             self.log(f"Rapport partiel écrit : {report_path}")
             self.log(f"Best-of partiel exporté : {best_dir}")
         else:
             self.log(f"Rapport vide écrit : {report_path}")
 
+        prevent_sleep(False)
+
         self.running = False
         self.stopping = False
         self.stop_flag = False
         self.status("Arrêté", ok=False)
-        self.log("Génération async arrêtée proprement.")
+        self.log("Génération arrêtée proprement.")
         self._refresh_controls_state()
+        self.reload_gallery()
 
     async def _async_finish_error(self, message: str):
+        prevent_sleep(False)
+
         self.running = False
         self.stopping = False
         self.stop_flag = False
@@ -1107,12 +1252,12 @@ class CamouflageApp(App):
         self.log(f"Erreur : {message}")
         self._refresh_controls_state()
 
-    # ---------------- UI thread updates ----------------
+    # ---------------- UI updates ----------------
 
     @mainthread
     def status(self, text: str, ok: bool = True):
         self.status_label.text = text
-        self.status_label.color = (0.78, 0.90, 0.78, 1) if ok else (0.95, 0.66, 0.66, 1)
+        self.status_label.color = (0.78, 0.92, 0.78, 1) if ok else (0.95, 0.68, 0.68, 1)
 
     @mainthread
     def log(self, line: str):
@@ -1124,24 +1269,38 @@ class CamouflageApp(App):
         self.progress_global.value = current
 
     @mainthread
-    def update_attempt_status(self, image_idx: int, attempt_idx: int, rs: np.ndarray, extra_scores: Dict[str, float]):
-        self.progress_attempt_label.text = f"Image {image_idx:03d} | essai {attempt_idx:04d}"
-        self.stat_color.text = (
-            f"C={rs[camo.IDX_COYOTE]*100:.2f}%  "
-            f"O={rs[camo.IDX_OLIVE]*100:.2f}%  "
-            f"T={rs[camo.IDX_TERRE]*100:.2f}%  "
-            f"G={rs[camo.IDX_GRIS]*100:.2f}%"
+    def update_attempt_status(
+        self,
+        target_index: int,
+        attempt_idx: int,
+        target_total: int,
+        accepted_count: int,
+        rs: np.ndarray,
+        extra_scores: Dict[str, float],
+        metrics: Dict[str, float],
+    ):
+        self.progress_text.text = f"{accepted_count} / {target_total} validé(s)"
+        self.attempt_text.text = f"Image {target_index:03d} | essai {attempt_idx:04d}"
+
+        self.color_text.text = (
+            f"C {rs[camo.IDX_COYOTE]*100:.2f}% | "
+            f"O {rs[camo.IDX_OLIVE]*100:.2f}% | "
+            f"T {rs[camo.IDX_TERRE]*100:.2f}% | "
+            f"G {rs[camo.IDX_GRIS]*100:.2f}%"
         )
-        self.stat_score.text = f"Score final = {extra_scores['score_final']:.3f}"
-        self.stat_main.text = (
-            f"Silhouette={extra_scores['score_silhouette']:.3f} | "
-            f"Contour={extra_scores['score_contour']:.3f} | "
-            f"Main={extra_scores['score_main']:.3f}"
+
+        self.score_text.text = (
+            f"Score {extra_scores['score_final']:.3f} | "
+            f"ratio {extra_scores['score_ratio']:.3f} | "
+            f"silhouette {extra_scores['score_silhouette']:.3f} | "
+            f"contour {extra_scores['score_contour']:.3f}"
         )
-        self.stat_extra.text = (
-            f"Contour break={extra_scores['contour_break_score']:.3f} | "
-            f"Outline={extra_scores['outline_band_diversity']:.3f} | "
-            f"Small-scale={extra_scores['small_scale_structural_score']:.3f}"
+
+        self.extra_text.text = (
+            f"Olive conn. {metrics['largest_olive_component_ratio']:.3f} | "
+            f"centre {metrics['center_empty_ratio']:.3f} | "
+            f"limites {metrics['boundary_density']:.3f} | "
+            f"miroir {metrics['mirror_similarity']:.3f}"
         )
 
     @mainthread
@@ -1154,6 +1313,7 @@ class CamouflageApp(App):
     def on_stop(self):
         self.stop_flag = True
         self.stopping = True
+        prevent_sleep(False)
 
         fut = self.current_future
         if fut is not None and not fut.done():
