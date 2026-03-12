@@ -145,6 +145,8 @@ class AsyncioThreadRunner:
     def stop(self):
         if self.loop.is_running():
             self.loop.call_soon_threadsafe(self.loop.stop)
+        if self.thread.is_alive():
+            self.thread.join(timeout=1.0)
 
 
 # ============================================================
@@ -565,6 +567,7 @@ class CamouflageApp(App):
 
         self.current_preview_img: Optional[PILImage.Image] = None
         self.current_silhouette_preview: Optional[PILImage.Image] = None
+        self.use_silhouette_preview: bool = True
 
     def build(self):
         Window.clearcolor = (0.07, 0.08, 0.10, 1)
@@ -712,8 +715,8 @@ class CamouflageApp(App):
 
         previews = BoxLayout(spacing=dp(10), size_hint_y=0.62)
 
-        self.preview_img = Image(allow_stretch=True, keep_ratio=True)
-        self.preview_silhouette = Image(allow_stretch=True, keep_ratio=True)
+        self.preview_img = Image()
+        self.preview_silhouette = Image()
 
         previews.add_widget(self._framed_widget("Motif validé / courant", self.preview_img))
         previews.add_widget(self._framed_widget("Projection silhouette", self.preview_silhouette))
@@ -733,30 +736,26 @@ class CamouflageApp(App):
     # ---------------- UI helpers ----------------
 
     def _label(self, text: str, **kwargs) -> Label:
-        lbl = Label(
-            text=text,
-            size_hint_y=None,
-            height=dp(24),
-            font_size=sp(15),
-            color=(0.94, 0.94, 0.96, 1),
-            halign="left",
-            valign="middle",
-            **kwargs,
-        )
+        kwargs.setdefault("size_hint_y", None)
+        kwargs.setdefault("height", dp(24))
+        kwargs.setdefault("font_size", sp(15))
+        kwargs.setdefault("color", (0.94, 0.94, 0.96, 1))
+        kwargs.setdefault("halign", "left")
+        kwargs.setdefault("valign", "middle")
+
+        lbl = Label(text=text, **kwargs)
         lbl.bind(size=lambda *a: setattr(lbl, "text_size", lbl.size))
         return lbl
 
     def _small_label(self, text: str, **kwargs) -> Label:
-        lbl = Label(
-            text=text,
-            size_hint_y=None,
-            height=dp(22),
-            font_size=sp(13),
-            color=(0.82, 0.86, 0.90, 1),
-            halign="left",
-            valign="middle",
-            **kwargs,
-        )
+        kwargs.setdefault("size_hint_y", None)
+        kwargs.setdefault("height", dp(22))
+        kwargs.setdefault("font_size", sp(13))
+        kwargs.setdefault("color", (0.82, 0.86, 0.90, 1))
+        kwargs.setdefault("halign", "left")
+        kwargs.setdefault("valign", "middle")
+
+        lbl = Label(text=text, **kwargs)
         lbl.bind(size=lambda *a: setattr(lbl, "text_size", lbl.size))
         return lbl
 
@@ -769,7 +768,7 @@ class CamouflageApp(App):
         box.bind(pos=lambda inst, val: setattr(box._bg, "pos", val))
         box.bind(size=lambda inst, val: setattr(box._bg, "size", val))
 
-        title_lbl = self._label(title, size_hint_y=None, height=dp(26))
+        title_lbl = self._label(title, height=dp(26))
         box.add_widget(title_lbl)
         box.add_widget(widget)
         return box
@@ -796,6 +795,7 @@ class CamouflageApp(App):
         if self.running or self.stopping:
             self.running = False
             self.stopping = False
+            self.stop_flag = False
             self.status("Erreur", ok=False)
             self.log(f"Erreur non capturée du futur async : {exc}")
             self._refresh_controls_state()
@@ -839,6 +839,7 @@ class CamouflageApp(App):
         self.stop_flag = False
         self.stopping = False
         self.running = True
+        self.use_silhouette_preview = bool(self.silhouette_checkbox.active)
         self.progress_global.max = count
         self.progress_global.value = 0
 
@@ -897,7 +898,7 @@ class CamouflageApp(App):
 
                     self.update_preview(
                         candidate.image,
-                        silhouette_img if self.silhouette_checkbox.active else candidate.image,
+                        silhouette_img if self.use_silhouette_preview else candidate.image,
                     )
                     self.update_attempt_status(
                         target_index,
@@ -1156,13 +1157,12 @@ class CamouflageApp(App):
 
         fut = self.current_future
         if fut is not None and not fut.done():
-            # on laisse la tentative courante sortir proprement ; pas d'annulation dure ici
-            pass
-
-        try:
-            self.async_runner.stop()
-        except Exception:
-            pass
+            fut.add_done_callback(lambda _f: self.async_runner.stop())
+        else:
+            try:
+                self.async_runner.stop()
+            except Exception:
+                pass
 
 
 # ============================================================
