@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 start.py
-Interface Kivy plein écran pour piloter main.py comme module.
+Interface Kivy plein écran asynchrone pour piloter main.py comme module.
 
 Fonctions :
 - génération séquentielle stricte
+- orchestration asynchrone
 - progression temps réel
-- aperçu du camouflage accepté
+- aperçu du camouflage accepté / courant
 - projection sur silhouette pseudo-humaine
 - score de rupture des contours externes
 - tri automatique des meilleurs motifs validés
@@ -24,6 +25,7 @@ Arborescence attendue :
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import math
@@ -32,7 +34,6 @@ import platform
 import shutil
 import subprocess
 import threading
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -64,11 +65,10 @@ from kivy.uix.image import Image
 from kivy.uix.label import Label
 from kivy.uix.progressbar import ProgressBar
 from kivy.uix.scrollview import ScrollView
-from kivy.uix.slider import Slider
 from kivy.uix.textinput import TextInput
 from kivy.uix.widget import Widget
 
-# ---------------- moteur principal ----------------
+# ---------------- moteur principal async ----------------
 import main as camo
 
 
@@ -76,7 +76,7 @@ import main as camo
 # CONSTANTES UI / EXPORT
 # ============================================================
 
-APP_TITLE = "Camouflage Armée Fédérale Europe — Générateur V3"
+APP_TITLE = "Camouflage Armée Fédérale Europe — Générateur V3 Async"
 BEST_DIR_NAME = "best_of"
 REPORT_NAME = "rapport_camouflages_v3.csv"
 DEFAULT_OUTPUT_DIR = Path("camouflages_federale_europe")
@@ -117,6 +117,33 @@ class CandidateRecord:
     small_scale_structural_score: float
     rs: np.ndarray
     metrics: Dict[str, float]
+
+
+# ============================================================
+# EVENT LOOP ASYNC DÉDIÉ
+# ============================================================
+
+class AsyncioThreadRunner:
+    """
+    Event loop asyncio dédié dans un thread séparé.
+    Permet de soumettre des coroutines depuis le thread Kivy.
+    """
+
+    def __init__(self):
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self._run_loop, daemon=True)
+        self.thread.start()
+
+    def _run_loop(self):
+        asyncio.set_event_loop(self.loop)
+        self.loop.run_forever()
+
+    def submit(self, coro: asyncio.coroutines) -> "asyncio.Future":
+        return asyncio.run_coroutine_threadsafe(coro, self.loop)
+
+    def stop(self):
+        if self.loop.is_running():
+            self.loop.call_soon_threadsafe(self.loop.stop)
 
 
 # ============================================================
@@ -165,7 +192,6 @@ def rgb_image_to_index_canvas(img: PILImage.Image) -> np.ndarray:
     h, w, _ = arr.shape
     out = np.zeros((h, w), dtype=np.uint8)
 
-    # image issue directement du moteur : couleurs exactes
     for rgb, idx in PALETTE_TO_INDEX.items():
         mask = np.all(arr == np.array(rgb, dtype=np.uint8), axis=-1)
         out[mask] = idx
@@ -231,21 +257,15 @@ def largest_component_ratio(mask: np.ndarray) -> float:
 # ============================================================
 
 def build_silhouette_mask(width: int, height: int) -> np.ndarray:
-    """
-    Silhouette pseudo-humaine simplifiée :
-    tête, épaules, torse, bras, hanches, jambes.
-    """
     img = PILImage.new("L", (width, height), 0)
     draw = ImageDraw.Draw(img)
 
-    # tête
     head_w = int(width * 0.18)
     head_h = int(height * 0.12)
     head_x1 = (width - head_w) // 2
     head_y1 = int(height * 0.05)
     draw.ellipse([head_x1, head_y1, head_x1 + head_w, head_y1 + head_h], fill=255)
 
-    # torse principal
     torso_w = int(width * 0.34)
     torso_h = int(height * 0.38)
     torso_x1 = (width - torso_w) // 2
@@ -256,7 +276,6 @@ def build_silhouette_mask(width: int, height: int) -> np.ndarray:
         fill=255,
     )
 
-    # épaules
     shoulder_w = int(width * 0.58)
     shoulder_h = int(height * 0.10)
     shoulder_x1 = (width - shoulder_w) // 2
@@ -267,7 +286,6 @@ def build_silhouette_mask(width: int, height: int) -> np.ndarray:
         fill=255,
     )
 
-    # bras
     arm_w = int(width * 0.11)
     arm_h = int(height * 0.32)
     left_arm_x1 = int(width * 0.15)
@@ -276,14 +294,12 @@ def build_silhouette_mask(width: int, height: int) -> np.ndarray:
     draw.rounded_rectangle([left_arm_x1, arm_y1, left_arm_x1 + arm_w, arm_y1 + arm_h], radius=int(width * 0.02), fill=255)
     draw.rounded_rectangle([right_arm_x1, arm_y1, right_arm_x1 + arm_w, arm_y1 + arm_h], radius=int(width * 0.02), fill=255)
 
-    # bassin
     pelvis_w = int(width * 0.30)
     pelvis_h = int(height * 0.10)
     pelvis_x1 = (width - pelvis_w) // 2
     pelvis_y1 = int(height * 0.51)
     draw.rounded_rectangle([pelvis_x1, pelvis_y1, pelvis_x1 + pelvis_w, pelvis_y1 + pelvis_h], radius=int(width * 0.02), fill=255)
 
-    # jambes
     leg_w = int(width * 0.12)
     leg_h = int(height * 0.32)
     leg_gap = int(width * 0.04)
@@ -325,9 +341,6 @@ def dilate_bool(mask: np.ndarray, radius: int = 2) -> np.ndarray:
 
 
 def silhouette_projection_image(index_canvas: np.ndarray) -> PILImage.Image:
-    """
-    Crée un aperçu du camouflage projeté sur silhouette sur fond neutre.
-    """
     h, w = index_canvas.shape
     sil = build_silhouette_mask(w, h)
 
@@ -335,7 +348,6 @@ def silhouette_projection_image(index_canvas: np.ndarray) -> PILImage.Image:
     rgb = camo.RGB[index_canvas]
     background[sil] = rgb[sil]
 
-    # contour léger
     bound = silhouette_boundary(sil)
     background[bound] = np.array([230, 230, 230], dtype=np.uint8)
     return PILImage.fromarray(background, "RGB")
@@ -347,7 +359,6 @@ def silhouette_color_diversity_score(index_canvas: np.ndarray) -> float:
     if data.size == 0:
         return 0.0
     unique_count = len(np.unique(data))
-    # 4 couleurs attendues -> score max si 4 présentes, puis pondération par répartition
     hist = np.bincount(data, minlength=4).astype(float)
     hist /= hist.sum()
     entropy = -np.sum([p * math.log(p + 1e-12) for p in hist if p > 0])
@@ -356,18 +367,10 @@ def silhouette_color_diversity_score(index_canvas: np.ndarray) -> float:
 
 
 def contour_break_score(index_canvas: np.ndarray) -> Tuple[float, float]:
-    """
-    Évalue la rupture des contours externes sur une silhouette pseudo-humaine.
-
-    Retour :
-    - contour_break_score
-    - outline_band_diversity
-    """
     h, w = index_canvas.shape
     sil = build_silhouette_mask(w, h)
     bound = silhouette_boundary(sil)
 
-    # bande intérieure autour du contour
     band = dilate_bool(bound, radius=5) & sil
     vals = index_canvas[band]
     if vals.size == 0:
@@ -378,7 +381,6 @@ def contour_break_score(index_canvas: np.ndarray) -> Tuple[float, float]:
     entropy = -np.sum([p * math.log(p + 1e-12) for p in hist if p > 0])
     entropy /= math.log(4.0)
 
-    # fraction de pixels du contour dont le voisinage contient au moins 2 couleurs
     ys, xs = np.where(bound)
     varied = 0
     total = len(xs)
@@ -391,22 +393,15 @@ def contour_break_score(index_canvas: np.ndarray) -> Tuple[float, float]:
             varied += 1
 
     local_variation = varied / total if total else 0.0
-
-    # score final : rupture perçue du contour
     score = clamp01(local_variation * 0.62 + entropy * 0.38)
     return score, float(entropy)
 
 
 def small_scale_structural_score(index_canvas: np.ndarray) -> float:
-    """
-    Vérifie qu'à petite échelle il reste des masses lisibles,
-    et pas juste du bruit.
-    """
     small = downsample_nearest(index_canvas, 4)
     olive_ratio = largest_component_ratio(small == camo.IDX_OLIVE)
     bd = float(np.mean(boundary_mask(small)))
 
-    # olive connectée + frontières ni trop faibles ni trop isotropes
     s1 = clamp01((olive_ratio - 0.08) / 0.18)
     s2 = 1.0 - min(1.0, abs(bd - 0.11) / 0.12)
     return clamp01(0.58 * s1 + 0.42 * s2)
@@ -424,7 +419,6 @@ def ratio_score(rs: np.ndarray) -> float:
 
 def main_metrics_score(metrics: Dict[str, float]) -> float:
     parts = []
-
     parts.append(clamp01((metrics["largest_olive_component_ratio"] - 0.12) / 0.18))
     parts.append(clamp01(1.0 - metrics["center_empty_ratio"] / 0.60))
     parts.append(clamp01(1.0 - metrics["mirror_similarity"] / 0.90))
@@ -433,7 +427,6 @@ def main_metrics_score(metrics: Dict[str, float]) -> float:
     parts.append(clamp01((metrics["vert_olive_macro_share"] - 0.45) / 0.30))
     parts.append(clamp01((metrics["terre_de_france_transition_share"] - 0.20) / 0.30))
     parts.append(clamp01((metrics["vert_de_gris_micro_share"] - 0.50) / 0.25))
-
     return float(np.mean(parts))
 
 
@@ -474,6 +467,14 @@ def evaluate_candidate_v3(pil_img: PILImage.Image, rs: np.ndarray, metrics: Dict
         "outline_band_diversity": outline_band_div,
         "small_scale_structural_score": small_scale_score,
     }, is_valid_v3
+
+
+async def async_evaluate_candidate_v3(
+    pil_img: PILImage.Image,
+    rs: np.ndarray,
+    metrics: Dict[str, float],
+) -> Tuple[Dict[str, float], bool]:
+    return await asyncio.to_thread(evaluate_candidate_v3, pil_img, rs, metrics)
 
 
 # ============================================================
@@ -526,8 +527,11 @@ class LogView(ScrollView):
 class CamouflageApp(App):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.worker_thread: Optional[threading.Thread] = None
-        self.stop_requested = False
+
+        self.async_runner = AsyncioThreadRunner()
+        self.current_future = None
+
+        self.stop_flag = False
         self.running = False
 
         self.current_output_dir = DEFAULT_OUTPUT_DIR
@@ -541,7 +545,6 @@ class CamouflageApp(App):
 
         root = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(10))
 
-        # Header
         header = BoxLayout(size_hint_y=None, height=dp(70), spacing=dp(10))
         self.title_label = Label(
             text=APP_TITLE,
@@ -567,10 +570,8 @@ class CamouflageApp(App):
         header.add_widget(self.status_label)
         root.add_widget(header)
 
-        # Body
         body = BoxLayout(spacing=dp(10))
 
-        # Colonne gauche : commandes
         left = BoxLayout(orientation="vertical", size_hint_x=0.32, spacing=dp(10))
 
         controls = GridLayout(cols=1, spacing=dp(8), size_hint_y=None, padding=dp(10))
@@ -621,9 +622,8 @@ class CamouflageApp(App):
         controls.add_widget(row)
 
         score_box = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(120), spacing=dp(6))
-        self.score_target_label = self._small_label("Validation V3 activée : silhouette + contour + tri automatique")
+        self.score_target_label = self._small_label("Validation V3 async : silhouette + contour + tri automatique")
         score_box.add_widget(self.score_target_label)
-
         controls.add_widget(score_box)
 
         button_row = BoxLayout(size_hint_y=None, height=dp(46), spacing=dp(8))
@@ -656,7 +656,6 @@ class CamouflageApp(App):
         button_row.add_widget(self.open_btn)
         controls.add_widget(button_row)
 
-        # Progression
         controls.add_widget(self._label("Progression globale"))
         self.progress_global = ProgressBar(max=100, value=0, size_hint_y=None, height=dp(18))
         controls.add_widget(self.progress_global)
@@ -665,7 +664,6 @@ class CamouflageApp(App):
         self.progress_attempt_label = self._small_label("Image 000 | essai 0000")
         controls.add_widget(self.progress_attempt_label)
 
-        # Statistiques
         stats_box = GridLayout(cols=1, spacing=dp(4), size_hint_y=None)
         stats_box.bind(minimum_height=stats_box.setter("height"))
 
@@ -684,7 +682,6 @@ class CamouflageApp(App):
         left_scroll.add_widget(controls)
         left.add_widget(left_scroll)
 
-        # Colonne droite : aperçu + logs
         right = BoxLayout(orientation="vertical", spacing=dp(10))
 
         previews = BoxLayout(spacing=dp(10), size_hint_y=0.62)
@@ -776,30 +773,29 @@ class CamouflageApp(App):
         self.current_output_dir.mkdir(parents=True, exist_ok=True)
 
         self.best_records.clear()
-        self.stop_requested = False
+        self.stop_flag = False
         self.running = True
         self.progress_global.max = count
         self.progress_global.value = 0
-        self.status("Génération en cours...", ok=True)
-        self.log(f"Démarrage : {count} images validées à produire.")
+
+        self.status("Génération async en cours...", ok=True)
+        self.log(f"Démarrage async : {count} images validées à produire.")
         self.log(f"Dossier de sortie : {self.current_output_dir.resolve()}")
 
-        self.worker_thread = threading.Thread(
-            target=self._worker_generate,
-            args=(count, top_k),
-            daemon=True,
-        )
-        self.worker_thread.start()
+        self.current_future = self.async_runner.submit(self._async_worker_generate(count, top_k))
 
     def stop_generation(self, *_):
         if not self.running:
             return
-        self.stop_requested = True
+        self.stop_flag = True
         self.status("Arrêt demandé...", ok=False)
         self.log("Arrêt demandé par l'utilisateur.")
 
-    def _worker_generate(self, target_count: int, top_k: int):
-        rows = []
+    async def _async_should_stop(self) -> bool:
+        return self.stop_flag
+
+    async def _async_worker_generate(self, target_count: int, top_k: int):
+        rows: List[dict] = []
         total_attempts = 0
 
         try:
@@ -807,43 +803,57 @@ class CamouflageApp(App):
                 local_attempt = 0
 
                 while True:
-                    if self.stop_requested:
-                        self._finish_stopped(rows, top_k)
+                    if await self._async_should_stop():
+                        await self._async_finish_stopped(rows, top_k)
                         return
 
                     total_attempts += 1
                     local_attempt += 1
 
-                    seed = 202603120000 + target_index * 100000 + local_attempt
-                    profile = camo.make_profile(seed)
+                    seed = camo.build_seed(target_index, local_attempt, base_seed=camo.DEFAULT_BASE_SEED)
+                    candidate = await camo.async_generate_candidate_from_seed(seed)
 
-                    pil_img, rs, metrics = camo.generate_one_variant(profile)
+                    extra_scores, valid_v3 = await async_evaluate_candidate_v3(
+                        candidate.image,
+                        candidate.ratios,
+                        candidate.metrics,
+                    )
+                    valid_main = await camo.async_validate_candidate_result(candidate)
+                    full_valid = valid_main and valid_v3
 
-                    extra_scores, valid_v3 = evaluate_candidate_v3(pil_img, rs, metrics)
-                    full_valid = camo.variant_is_valid(rs, metrics) and valid_v3
+                    silhouette_img = await asyncio.to_thread(
+                        silhouette_projection_image,
+                        rgb_image_to_index_canvas(candidate.image),
+                    )
 
-                    silhouette_img = silhouette_projection_image(rgb_image_to_index_canvas(pil_img))
-
-                    self.update_preview(pil_img, silhouette_img if self.silhouette_checkbox.active else pil_img)
-                    self.update_attempt_status(target_index, local_attempt, rs, extra_scores)
+                    self.update_preview(
+                        candidate.image,
+                        silhouette_img if self.silhouette_checkbox.active else candidate.image,
+                    )
+                    self.update_attempt_status(
+                        target_index,
+                        local_attempt,
+                        candidate.ratios,
+                        extra_scores,
+                    )
 
                     if not full_valid:
                         self.log(
                             f"[img={target_index:03d} essai={local_attempt:04d}] rejeté | "
-                            f"C={rs[camo.IDX_COYOTE]*100:.1f} "
-                            f"O={rs[camo.IDX_OLIVE]*100:.1f} "
-                            f"T={rs[camo.IDX_TERRE]*100:.1f} "
-                            f"G={rs[camo.IDX_GRIS]*100:.1f} | "
+                            f"C={candidate.ratios[camo.IDX_COYOTE]*100:.1f} "
+                            f"O={candidate.ratios[camo.IDX_OLIVE]*100:.1f} "
+                            f"T={candidate.ratios[camo.IDX_TERRE]*100:.1f} "
+                            f"G={candidate.ratios[camo.IDX_GRIS]*100:.1f} | "
                             f"SF={extra_scores['score_final']:.3f}"
                         )
                         continue
 
                     filename = self.current_output_dir / f"camouflage_{target_index:03d}.png"
-                    pil_img.save(filename)
+                    await camo.async_save_candidate_image(candidate, filename)
 
                     record = CandidateRecord(
                         index=target_index,
-                        seed=profile.seed,
+                        seed=candidate.seed,
                         local_attempt=local_attempt,
                         global_attempt=total_attempts,
                         image_path=filename,
@@ -856,21 +866,21 @@ class CamouflageApp(App):
                         contour_break_score=extra_scores["contour_break_score"],
                         outline_band_diversity=extra_scores["outline_band_diversity"],
                         small_scale_structural_score=extra_scores["small_scale_structural_score"],
-                        rs=rs.copy(),
-                        metrics=dict(metrics),
+                        rs=candidate.ratios.copy(),
+                        metrics=dict(candidate.metrics),
                     )
                     self.best_records.append(record)
                     self.best_records.sort(key=lambda r: r.score_final, reverse=True)
 
                     rows.append({
                         "index": target_index,
-                        "seed": profile.seed,
+                        "seed": candidate.seed,
                         "attempts_for_this_image": local_attempt,
                         "global_attempt": total_attempts,
-                        "coyote_brown_pct": round(float(rs[camo.IDX_COYOTE] * 100), 2),
-                        "vert_olive_pct": round(float(rs[camo.IDX_OLIVE] * 100), 2),
-                        "terre_de_france_pct": round(float(rs[camo.IDX_TERRE] * 100), 2),
-                        "vert_de_gris_pct": round(float(rs[camo.IDX_GRIS] * 100), 2),
+                        "coyote_brown_pct": round(float(candidate.ratios[camo.IDX_COYOTE] * 100), 2),
+                        "vert_olive_pct": round(float(candidate.ratios[camo.IDX_OLIVE] * 100), 2),
+                        "terre_de_france_pct": round(float(candidate.ratios[camo.IDX_TERRE] * 100), 2),
+                        "vert_de_gris_pct": round(float(candidate.ratios[camo.IDX_GRIS] * 100), 2),
                         "score_final": round(extra_scores["score_final"], 5),
                         "score_ratio": round(extra_scores["score_ratio"], 5),
                         "score_silhouette": round(extra_scores["score_silhouette"], 5),
@@ -880,23 +890,23 @@ class CamouflageApp(App):
                         "contour_break_score": round(extra_scores["contour_break_score"], 5),
                         "outline_band_diversity": round(extra_scores["outline_band_diversity"], 5),
                         "small_scale_structural_score": round(extra_scores["small_scale_structural_score"], 5),
-                        "largest_olive_component_ratio": round(metrics["largest_olive_component_ratio"], 5),
-                        "largest_olive_component_ratio_small": round(metrics["largest_olive_component_ratio_small"], 5),
-                        "olive_multizone_share": round(metrics["olive_multizone_share"], 5),
-                        "center_empty_ratio": round(metrics["center_empty_ratio"], 5),
-                        "center_empty_ratio_small": round(metrics["center_empty_ratio_small"], 5),
-                        "boundary_density": round(metrics["boundary_density"], 5),
-                        "boundary_density_small": round(metrics["boundary_density_small"], 5),
-                        "boundary_density_tiny": round(metrics["boundary_density_tiny"], 5),
-                        "mirror_similarity": round(metrics["mirror_similarity"], 5),
-                        "oblique_share": round(metrics["oblique_share"], 5),
-                        "vertical_share": round(metrics["vertical_share"], 5),
-                        "angle_dominance_ratio": round(metrics["angle_dominance_ratio"], 5),
-                        "olive_macro_share": round(metrics["vert_olive_macro_share"], 5),
-                        "terre_transition_share": round(metrics["terre_de_france_transition_share"], 5),
-                        "gris_micro_share": round(metrics["vert_de_gris_micro_share"], 5),
-                        "gris_macro_share": round(metrics["vert_de_gris_macro_share"], 5),
-                        "angles": " ".join(map(str, profile.allowed_angles)),
+                        "largest_olive_component_ratio": round(candidate.metrics["largest_olive_component_ratio"], 5),
+                        "largest_olive_component_ratio_small": round(candidate.metrics["largest_olive_component_ratio_small"], 5),
+                        "olive_multizone_share": round(candidate.metrics["olive_multizone_share"], 5),
+                        "center_empty_ratio": round(candidate.metrics["center_empty_ratio"], 5),
+                        "center_empty_ratio_small": round(candidate.metrics["center_empty_ratio_small"], 5),
+                        "boundary_density": round(candidate.metrics["boundary_density"], 5),
+                        "boundary_density_small": round(candidate.metrics["boundary_density_small"], 5),
+                        "boundary_density_tiny": round(candidate.metrics["boundary_density_tiny"], 5),
+                        "mirror_similarity": round(candidate.metrics["mirror_similarity"], 5),
+                        "oblique_share": round(candidate.metrics["oblique_share"], 5),
+                        "vertical_share": round(candidate.metrics["vertical_share"], 5),
+                        "angle_dominance_ratio": round(candidate.metrics["angle_dominance_ratio"], 5),
+                        "olive_macro_share": round(candidate.metrics["vert_olive_macro_share"], 5),
+                        "terre_transition_share": round(candidate.metrics["terre_de_france_transition_share"], 5),
+                        "gris_micro_share": round(candidate.metrics["vert_de_gris_micro_share"], 5),
+                        "gris_macro_share": round(candidate.metrics["vert_de_gris_macro_share"], 5),
+                        "angles": " ".join(map(str, candidate.profile.allowed_angles)),
                     })
 
                     self.update_progress(target_index, target_count)
@@ -909,39 +919,36 @@ class CamouflageApp(App):
 
                     break
 
-            self._finish_success(rows, top_k)
+            await self._async_finish_success(rows, top_k)
 
         except Exception as e:
-            self._finish_error(str(e))
+            await self._async_finish_error(str(e))
 
-    # ---------------- fin de traitement ----------------
+    # ---------------- fin de traitement async ----------------
 
-    def _write_report(self, rows: List[dict]) -> Path:
+    async def _async_write_report(self, rows: List[dict]) -> Path:
         report_path = self.current_output_dir / REPORT_NAME
+        await asyncio.to_thread(self._write_report_sync, rows, report_path)
+        return report_path
+
+    def _write_report_sync(self, rows: List[dict], report_path: Path) -> None:
         with report_path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
             writer.writeheader()
             writer.writerows(rows)
-        return report_path
 
-    def _export_best_of(self, top_k: int) -> Path:
+    async def _async_export_best_of(self, top_k: int) -> Path:
         best_dir = self.current_output_dir / BEST_DIR_NAME
         best_dir.mkdir(parents=True, exist_ok=True)
 
-        # on vide d'abord les anciens exports png/jpg/csv
-        for child in best_dir.iterdir():
-            if child.is_file():
-                try:
-                    child.unlink()
-                except Exception:
-                    pass
+        await asyncio.to_thread(self._clear_best_dir_sync, best_dir)
 
         best_subset = self.best_records[:top_k]
-
         rows = []
+
         for rank, rec in enumerate(best_subset, start=1):
             dst = best_dir / f"best_{rank:03d}_camouflage_{rec.index:03d}.png"
-            shutil.copy2(rec.image_path, dst)
+            await asyncio.to_thread(shutil.copy2, rec.image_path, dst)
 
             rows.append({
                 "rank": rank,
@@ -965,37 +972,48 @@ class CamouflageApp(App):
             })
 
         if rows:
-            with (best_dir / "best_of.csv").open("w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-                writer.writeheader()
-                writer.writerows(rows)
+            await asyncio.to_thread(self._write_best_of_csv_sync, best_dir, rows)
 
         return best_dir
 
-    def _finish_success(self, rows: List[dict], top_k: int):
-        report_path = self._write_report(rows)
-        best_dir = self._export_best_of(top_k)
+    def _clear_best_dir_sync(self, best_dir: Path) -> None:
+        for child in best_dir.iterdir():
+            if child.is_file():
+                try:
+                    child.unlink()
+                except Exception:
+                    pass
+
+    def _write_best_of_csv_sync(self, best_dir: Path, rows: List[dict]) -> None:
+        with (best_dir / "best_of.csv").open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+
+    async def _async_finish_success(self, rows: List[dict], top_k: int):
+        report_path = await self._async_write_report(rows)
+        best_dir = await self._async_export_best_of(top_k)
         self.running = False
-        self.stop_requested = False
+        self.stop_flag = False
         self.status("Terminé", ok=True)
         self.log(f"Rapport écrit : {report_path}")
         self.log(f"Best-of exporté : {best_dir}")
-        self.log("Génération terminée avec succès.")
+        self.log("Génération async terminée avec succès.")
 
-    def _finish_stopped(self, rows: List[dict], top_k: int):
+    async def _async_finish_stopped(self, rows: List[dict], top_k: int):
         if rows:
-            report_path = self._write_report(rows)
-            best_dir = self._export_best_of(min(top_k, len(rows)))
+            report_path = await self._async_write_report(rows)
+            best_dir = await self._async_export_best_of(min(top_k, len(rows)))
             self.log(f"Rapport partiel écrit : {report_path}")
             self.log(f"Best-of partiel exporté : {best_dir}")
         self.running = False
-        self.stop_requested = False
+        self.stop_flag = False
         self.status("Arrêté", ok=False)
-        self.log("Génération arrêtée proprement.")
+        self.log("Génération async arrêtée proprement.")
 
-    def _finish_error(self, message: str):
+    async def _async_finish_error(self, message: str):
         self.running = False
-        self.stop_requested = False
+        self.stop_flag = False
         self.status("Erreur", ok=False)
         self.log(f"Erreur : {message}")
 
@@ -1042,6 +1060,13 @@ class CamouflageApp(App):
         self.current_silhouette_preview = silhouette_img
         self.preview_img.texture = pil_to_coreimage(pil_img).texture
         self.preview_silhouette.texture = pil_to_coreimage(silhouette_img).texture
+
+    def on_stop(self):
+        self.stop_flag = True
+        try:
+            self.async_runner.stop()
+        except Exception:
+            pass
 
 
 # ============================================================
