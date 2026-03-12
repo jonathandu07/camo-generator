@@ -2,31 +2,24 @@
 """
 main.py
 Camouflage Armée Fédérale Europe
-Version renforcée, corrigée et pensée pour être utilisée comme module par start.py.
+Version module-friendly + async-friendly.
 
-Fonctions principales exposées :
-- build_seed(...)
-- make_profile(...)
-- generate_one_variant(...)
-- generate_candidate_from_seed(...)
-- validate_candidate_result(...)
-- save_candidate_image(...)
-- candidate_row(...)
-- write_report(...)
-- generate_all(...)
-
-Dépendances :
-    pip install pillow numpy
+Points clés :
+- API synchrone conservée
+- API asynchrone ajoutée
+- génération séquentielle stricte
+- aucun passage à l'image suivante tant que la précédente n'est pas validée
 """
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -83,17 +76,15 @@ BASE_ANGLES = [-35, -30, -25, -20, -15, 0, 15, 20, 25, 30, 35]
 
 # Zones de densité asymétrique
 DENSITY_ZONES = [
-    # x1, x2, y1, y2, poids
-    (0.02, 0.26, 0.02, 0.18, 1.80),  # épaule gauche
-    (0.74, 0.98, 0.02, 0.18, 1.80),  # épaule droite
-    (0.00, 0.22, 0.18, 0.72, 1.60),  # flanc gauche
-    (0.78, 1.00, 0.18, 0.72, 1.60),  # flanc droit
-    (0.20, 0.42, 0.62, 0.96, 1.55),  # cuisse gauche
-    (0.58, 0.80, 0.62, 0.96, 1.55),  # cuisse droite
-    (0.30, 0.70, 0.18, 0.62, 0.60),  # centre calme
+    (0.02, 0.26, 0.02, 0.18, 1.80),
+    (0.74, 0.98, 0.02, 0.18, 1.80),
+    (0.00, 0.22, 0.18, 0.72, 1.60),
+    (0.78, 1.00, 0.18, 0.72, 1.60),
+    (0.20, 0.42, 0.62, 0.96, 1.55),
+    (0.58, 0.80, 0.62, 0.96, 1.55),
+    (0.30, 0.70, 0.18, 0.62, 0.60),
 ]
 
-# Échelles dimensionnelles
 MACRO_LENGTH_CM = (40, 90)
 MACRO_WIDTH_CM = (15, 35)
 
@@ -102,7 +93,6 @@ TRANSITION_WIDTH_CM = (5, 15)
 
 MICRO_SIZE_CM = (2, 8)
 
-# Budgets visibles cibles par niveau
 VISIBLE_MACRO_OLIVE_TARGET = 0.215
 VISIBLE_MACRO_TERRE_TARGET = 0.075
 VISIBLE_MACRO_GRIS_TARGET = 0.015
@@ -111,7 +101,6 @@ VISIBLE_TOTAL_OLIVE_TARGET = TARGET[IDX_OLIVE]
 VISIBLE_TOTAL_TERRE_TARGET = TARGET[IDX_TERRE]
 VISIBLE_TOTAL_GRIS_TARGET = TARGET[IDX_GRIS]
 
-# Validation opérationnelle
 MIN_OLIVE_CONNECTED_COMPONENT_RATIO = 0.17
 MIN_OLIVE_MULTIZONE_SHARE = 0.42
 MAX_COYOTE_CENTER_EMPTY_RATIO = 0.50
@@ -129,17 +118,14 @@ MIN_VISIBLE_TERRE_TRANS_SHARE = 0.36
 MIN_VISIBLE_GRIS_MICRO_SHARE = 0.70
 MAX_VISIBLE_GRIS_MACRO_SHARE = 0.18
 
-# Orientation
 MIN_OBLIQUE_SHARE = 0.58
 MIN_VERTICAL_SHARE = 0.08
 MAX_VERTICAL_SHARE = 0.34
 MAX_ANGLE_DOMINANCE_RATIO = 0.34
 
-# Ajustement final
 BOUNDARY_NUDGE_PASSES = 10
 BOUNDARY_NUDGE_SAMPLE_RATIO = 0.0035
 
-# Contrôles structurels
 MIN_TRANSITION_TOUCH_PIXELS = 22
 MIN_MICRO_BOUNDARY_COVERAGE = 0.24
 MAX_LOCAL_MASS_RATIO_TRANSITION = 0.72
@@ -152,17 +138,13 @@ MAX_LOCAL_MASS_RATIO_TRANSITION = 0.72
 @dataclass
 class VariantProfile:
     seed: int
-
     allowed_angles: List[int]
-
     micro_cluster_min: int
     micro_cluster_max: int
-
     macro_width_variation: float
     macro_lateral_jitter: float
     macro_tip_taper: float
     macro_edge_break: float
-
     micro_width_variation: float
     micro_lateral_jitter: float
     micro_tip_taper: float
@@ -193,33 +175,24 @@ class CandidateResult:
 # ============================================================
 
 def build_seed(target_index: int, local_attempt: int, base_seed: int = DEFAULT_BASE_SEED) -> int:
-    """
-    Construit un seed unique et stable par image + tentative.
-    """
     return int(base_seed + target_index * 100000 + local_attempt)
 
 
 def make_profile(seed: int) -> VariantProfile:
     rng = random.Random(seed)
-
     angles = BASE_ANGLES[:]
     rng.shuffle(angles)
-
-    # toujours verticale + une bonne diversité oblique
     allowed = sorted(set([0] + angles[:rng.randint(8, len(BASE_ANGLES))]))
 
     return VariantProfile(
         seed=seed,
         allowed_angles=allowed,
-
         micro_cluster_min=2,
         micro_cluster_max=rng.randint(4, 5),
-
         macro_width_variation=rng.uniform(0.22, 0.30),
         macro_lateral_jitter=rng.uniform(0.14, 0.21),
         macro_tip_taper=rng.uniform(0.34, 0.43),
         macro_edge_break=rng.uniform(0.10, 0.15),
-
         micro_width_variation=rng.uniform(0.18, 0.25),
         micro_lateral_jitter=rng.uniform(0.12, 0.18),
         micro_tip_taper=rng.uniform(0.42, 0.52),
@@ -278,7 +251,6 @@ def compute_boundary_mask(canvas: np.ndarray) -> np.ndarray:
 def dilate_mask(mask: np.ndarray, radius: int = 1) -> np.ndarray:
     out = np.zeros_like(mask, dtype=bool)
     h, w = mask.shape
-
     for dy in range(-radius, radius + 1):
         for dx in range(-radius, radius + 1):
             y1 = max(0, dy)
@@ -292,7 +264,6 @@ def dilate_mask(mask: np.ndarray, radius: int = 1) -> np.ndarray:
             sx2 = min(w, w - dx)
 
             out[y1:y2, x1:x2] |= mask[sy1:sy2, sx1:sx2]
-
     return out
 
 
@@ -315,7 +286,6 @@ def mirror_similarity_score(canvas: np.ndarray) -> float:
     left = canvas[:, :mid]
     right = canvas[:, canvas.shape[1] - mid:]
     right_flipped = np.fliplr(right)
-
     h = min(left.shape[0], right_flipped.shape[0])
     w = min(left.shape[1], right_flipped.shape[1])
     return float(np.mean(left[:h, :w] == right_flipped[:h, :w]))
@@ -329,10 +299,6 @@ def infer_origin_from_neighbors(
     chosen_color: int,
     fallback_origin: int,
 ) -> int:
-    """
-    Choisit une origine cohérente pour un pixel retouché pendant le nudge.
-    On récupère l'origine majoritaire des voisins portant déjà la couleur choisie.
-    """
     y1, y2 = max(0, y - 2), min(canvas.shape[0], y + 3)
     x1, x2 = max(0, x - 2), min(canvas.shape[1], x + 3)
 
@@ -494,9 +460,6 @@ def jagged_spine_poly(
     tip_taper: float,
     edge_break: float,
 ) -> List[Tuple[float, float]]:
-    """
-    Forme anguleuse, allongée, irrégulière, non circulaire.
-    """
     half_len = length_px / 2.0
     half_w = width_px / 2.0
     ys = np.linspace(-half_len, half_len, segments)
@@ -573,9 +536,6 @@ def local_parallel_conflict(
     dist_threshold_px: int = 260,
     angle_threshold_deg: int = 8,
 ) -> bool:
-    """
-    Évite les séries locales trop parallèles.
-    """
     cx, cy = center
     nearby_same = 0
 
@@ -641,7 +601,6 @@ def add_macros(
     target_macro_terre_pixels = int(VISIBLE_MACRO_TERRE_TARGET * canvas.size)
     target_macro_gris_pixels = int(VISIBLE_MACRO_GRIS_TARGET * canvas.size)
 
-    # ---------- Olive macro ----------
     while int(np.sum((canvas == IDX_OLIVE) & (origin_map == ORIGIN_MACRO))) < target_macro_olive_pixels:
         cx, cy = choose_biased_center(rng)
         angle = rng.choice(profile.allowed_angles)
@@ -676,7 +635,6 @@ def add_macros(
         apply_mask(canvas, origin_map, mask, IDX_OLIVE, ORIGIN_MACRO)
         macros.append(MacroRecord(IDX_OLIVE, poly, angle, (cx, cy), mask, zc))
 
-    # ---------- Terre macro ----------
     while int(np.sum((canvas == IDX_TERRE) & (origin_map == ORIGIN_MACRO))) < target_macro_terre_pixels:
         cx, cy = choose_biased_center(rng)
         angle = rng.choice(profile.allowed_angles)
@@ -709,7 +667,6 @@ def add_macros(
         apply_mask(canvas, origin_map, mask, IDX_TERRE, ORIGIN_MACRO)
         macros.append(MacroRecord(IDX_TERRE, poly, angle, (cx, cy), mask, zc))
 
-    # ---------- Gris macro (rare) ----------
     while int(np.sum((canvas == IDX_GRIS) & (origin_map == ORIGIN_MACRO))) < target_macro_gris_pixels:
         cx, cy = choose_biased_center(rng)
         angle = rng.choice(profile.allowed_angles)
@@ -748,9 +705,6 @@ def add_transitions(
     macros: Sequence[MacroRecord],
     rng: random.Random,
 ) -> None:
-    """
-    Transitions attachées, guidées par déficit visible.
-    """
     while True:
         rs = compute_ratios(canvas)
         visible = visible_origin_shares(canvas, origin_map)
@@ -813,9 +767,6 @@ def add_micro_clusters(
     profile: VariantProfile,
     rng: random.Random,
 ) -> None:
-    """
-    Micro-formes uniquement sur frontières.
-    """
     while True:
         rs = compute_ratios(canvas)
         visible = visible_origin_shares(canvas, origin_map)
@@ -888,11 +839,6 @@ def add_micro_clusters(
 
 
 def nudge_proportions(canvas: np.ndarray, origin_map: np.ndarray, rng: random.Random) -> None:
-    """
-    Ajustement doux sur frontières.
-    Correction importante :
-    l'origine visible du pixel est réassignée de manière cohérente.
-    """
     for _ in range(BOUNDARY_NUDGE_PASSES):
         rs = compute_ratios(canvas)
         deficits = TARGET - rs
@@ -1006,9 +952,6 @@ def generate_one_variant(profile: VariantProfile) -> Tuple[Image.Image, np.ndarr
 
 
 def generate_candidate_from_seed(seed: int) -> CandidateResult:
-    """
-    API module-friendly pour start.py.
-    """
     profile = make_profile(seed)
     image, ratios, metrics = generate_one_variant(profile)
     return CandidateResult(
@@ -1020,20 +963,26 @@ def generate_candidate_from_seed(seed: int) -> CandidateResult:
     )
 
 
+async def async_generate_candidate_from_seed(seed: int) -> CandidateResult:
+    """
+    Version asynchrone correcte pour travail CPU-bound :
+    exécution dans un thread.
+    """
+    return await asyncio.to_thread(generate_candidate_from_seed, seed)
+
+
 # ============================================================
-# VALIDATION RIGOUREUSE
+# VALIDATION
 # ============================================================
 
 def variant_is_valid(rs: np.ndarray, metrics: Dict[str, float]) -> bool:
     abs_err = np.abs(rs - TARGET)
 
-    # 1) proportions
     if np.any(abs_err > MAX_ABS_ERROR_PER_COLOR):
         return False
     if float(np.mean(abs_err)) > MAX_MEAN_ABS_ERROR:
         return False
 
-    # 2) bornes colorimétriques opérationnelles
     if rs[IDX_COYOTE] < 0.27 or rs[IDX_COYOTE] > 0.37:
         return False
     if rs[IDX_OLIVE] < 0.24 or rs[IDX_OLIVE] > 0.33:
@@ -1043,7 +992,6 @@ def variant_is_valid(rs: np.ndarray, metrics: Dict[str, float]) -> bool:
     if rs[IDX_GRIS] < 0.14 or rs[IDX_GRIS] > 0.21:
         return False
 
-    # 3) cohérence perceptive
     if metrics["largest_olive_component_ratio"] < MIN_OLIVE_CONNECTED_COMPONENT_RATIO:
         return False
     if metrics["largest_olive_component_ratio_small"] < 0.12:
@@ -1067,11 +1015,9 @@ def variant_is_valid(rs: np.ndarray, metrics: Dict[str, float]) -> bool:
     if metrics["boundary_density_small"] > MAX_BOUNDARY_DENSITY_SMALL:
         return False
 
-    # 4) anti-symétrie
     if metrics["mirror_similarity"] > MAX_MIRROR_SIMILARITY:
         return False
 
-    # 5) orientation non isotrope
     if metrics["oblique_share"] < MIN_OBLIQUE_SHARE:
         return False
     if metrics["vertical_share"] < MIN_VERTICAL_SHARE or metrics["vertical_share"] > MAX_VERTICAL_SHARE:
@@ -1079,7 +1025,6 @@ def variant_is_valid(rs: np.ndarray, metrics: Dict[str, float]) -> bool:
     if metrics["angle_dominance_ratio"] > MAX_ANGLE_DOMINANCE_RATIO:
         return False
 
-    # 6) hiérarchie visible par niveau
     if metrics["vert_olive_macro_share"] < MIN_VISIBLE_OLIVE_MACRO_SHARE:
         return False
     if metrics["terre_de_france_transition_share"] < MIN_VISIBLE_TERRE_TRANS_SHARE:
@@ -1096,14 +1041,22 @@ def validate_candidate_result(candidate: CandidateResult) -> bool:
     return variant_is_valid(candidate.ratios, candidate.metrics)
 
 
+async def async_validate_candidate_result(candidate: CandidateResult) -> bool:
+    return await asyncio.to_thread(validate_candidate_result, candidate)
+
+
 # ============================================================
-# EXPORT / MODULE API
+# EXPORT / API
 # ============================================================
 
 def save_candidate_image(candidate: CandidateResult, path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     candidate.image.save(path)
     return path
+
+
+async def async_save_candidate_image(candidate: CandidateResult, path: Path) -> Path:
+    return await asyncio.to_thread(save_candidate_image, candidate, path)
 
 
 def candidate_row(
@@ -1158,8 +1111,12 @@ def write_report(rows: List[Dict[str, object]], output_dir: Path, filename: str 
     return csv_path
 
 
+async def async_write_report(rows: List[Dict[str, object]], output_dir: Path, filename: str = "rapport_camouflages.csv") -> Path:
+    return await asyncio.to_thread(write_report, rows, output_dir, filename)
+
+
 # ============================================================
-# GÉNÉRATION STRICTEMENT SÉQUENTIELLE
+# GÉNÉRATION SÉQUENTIELLE SYNCHRONE
 # ============================================================
 
 def generate_all(
@@ -1171,22 +1128,6 @@ def generate_all(
     ] = None,
     stop_requested: Optional[Callable[[], bool]] = None,
 ) -> List[Dict[str, object]]:
-    """
-    Génération séquentielle stricte.
-
-    Paramètres :
-    - target_count : nombre d'images validées à produire
-    - output_dir : dossier de sortie
-    - base_seed : seed de base
-    - progress_callback :
-        appelé à chaque tentative avec :
-        (target_index, local_attempt, global_attempt, target_count, candidate, accepted)
-    - stop_requested :
-        callable sans argument ; si True => arrêt propre
-
-    Retour :
-    - liste des lignes du rapport CSV
-    """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1218,15 +1159,6 @@ def generate_all(
                 )
 
             if not accepted:
-                print(
-                    f"[global={total_attempts:06d}] "
-                    f"[image={target_index:03d}] "
-                    f"[essai={local_attempt:04d}] rejeté | "
-                    f"C={candidate.ratios[IDX_COYOTE]*100:.1f} "
-                    f"O={candidate.ratios[IDX_OLIVE]*100:.1f} "
-                    f"T={candidate.ratios[IDX_TERRE]*100:.1f} "
-                    f"G={candidate.ratios[IDX_GRIS]*100:.1f}"
-                )
                 continue
 
             filename = output_dir / f"camouflage_{target_index:03d}.png"
@@ -1240,26 +1172,82 @@ def generate_all(
                     candidate=candidate,
                 )
             )
-
-            print(
-                f"[global={total_attempts:06d}] "
-                f"[image={target_index:03d}] "
-                f"[essai={local_attempt:04d}] accepté -> {filename.name} | "
-                f"C={candidate.ratios[IDX_COYOTE]*100:.1f} "
-                f"O={candidate.ratios[IDX_OLIVE]*100:.1f} "
-                f"T={candidate.ratios[IDX_TERRE]*100:.1f} "
-                f"G={candidate.ratios[IDX_GRIS]*100:.1f} | "
-                f"olive_conn={candidate.metrics['largest_olive_component_ratio']:.3f} "
-                f"multizone={candidate.metrics['olive_multizone_share']:.3f} "
-                f"center={candidate.metrics['center_empty_ratio']:.3f} "
-                f"bd={candidate.metrics['boundary_density']:.3f} "
-                f"mirror={candidate.metrics['mirror_similarity']:.3f}"
-            )
-
-            # NE PAS PASSER AU SUIVANT tant que le précédent n'est pas validé
             break
 
     write_report(rows, output_dir)
+    return rows
+
+
+# ============================================================
+# GÉNÉRATION SÉQUENTIELLE ASYNCHRONE
+# ============================================================
+
+AsyncProgressCallback = Callable[[int, int, int, int, CandidateResult, bool], Awaitable[None]]
+AsyncStopCallable = Callable[[], Awaitable[bool]]
+
+
+async def async_generate_all(
+    target_count: int = N_VARIANTS_REQUIRED,
+    output_dir: Path = OUTPUT_DIR,
+    base_seed: int = DEFAULT_BASE_SEED,
+    progress_callback: Optional[AsyncProgressCallback] = None,
+    stop_requested: Optional[AsyncStopCallable] = None,
+) -> List[Dict[str, object]]:
+    """
+    Version asynchrone séquentielle stricte.
+
+    Important :
+    - l'image N+1 ne commence jamais tant que N n'est pas validée ;
+    - chaque tentative CPU-bound est déportée avec asyncio.to_thread(...).
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    rows: List[Dict[str, object]] = []
+    total_attempts = 0
+
+    for target_index in range(1, target_count + 1):
+        local_attempt = 0
+
+        while True:
+            if stop_requested is not None:
+                if await stop_requested():
+                    return rows
+
+            total_attempts += 1
+            local_attempt += 1
+
+            seed = build_seed(target_index, local_attempt, base_seed=base_seed)
+            candidate = await async_generate_candidate_from_seed(seed)
+            accepted = await async_validate_candidate_result(candidate)
+
+            if progress_callback is not None:
+                await progress_callback(
+                    target_index,
+                    local_attempt,
+                    total_attempts,
+                    target_count,
+                    candidate,
+                    accepted,
+                )
+
+            if not accepted:
+                continue
+
+            filename = output_dir / f"camouflage_{target_index:03d}.png"
+            await async_save_candidate_image(candidate, filename)
+
+            rows.append(
+                candidate_row(
+                    target_index=target_index,
+                    local_attempt=local_attempt,
+                    global_attempt=total_attempts,
+                    candidate=candidate,
+                )
+            )
+            break
+
+    await async_write_report(rows, output_dir)
     return rows
 
 
