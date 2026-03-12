@@ -171,6 +171,16 @@ class CandidateResult:
 
 
 # ============================================================
+# OUTILS SYSTÈME
+# ============================================================
+
+def ensure_output_dir(output_dir: Path) -> Path:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
+# ============================================================
 # PROFIL
 # ============================================================
 
@@ -1050,6 +1060,7 @@ async def async_validate_candidate_result(candidate: CandidateResult) -> bool:
 # ============================================================
 
 def save_candidate_image(candidate: CandidateResult, path: Path) -> Path:
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     candidate.image.save(path)
     return path
@@ -1098,7 +1109,7 @@ def candidate_row(
 
 
 def write_report(rows: List[Dict[str, object]], output_dir: Path, filename: str = "rapport_camouflages.csv") -> Path:
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = ensure_output_dir(output_dir)
     csv_path = output_dir / filename
     if not rows:
         return csv_path
@@ -1128,8 +1139,7 @@ def generate_all(
     ] = None,
     stop_requested: Optional[Callable[[], bool]] = None,
 ) -> List[Dict[str, object]]:
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = ensure_output_dir(output_dir)
 
     rows: List[Dict[str, object]] = []
     total_attempts = 0
@@ -1139,6 +1149,7 @@ def generate_all(
 
         while True:
             if stop_requested is not None and stop_requested():
+                write_report(rows, output_dir)
                 return rows
 
             total_attempts += 1
@@ -1200,8 +1211,7 @@ async def async_generate_all(
     - l'image N+1 ne commence jamais tant que N n'est pas validée ;
     - chaque tentative CPU-bound est déportée avec asyncio.to_thread(...).
     """
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = ensure_output_dir(output_dir)
 
     rows: List[Dict[str, object]] = []
     total_attempts = 0
@@ -1212,6 +1222,7 @@ async def async_generate_all(
         while True:
             if stop_requested is not None:
                 if await stop_requested():
+                    await async_write_report(rows, output_dir)
                     return rows
 
             total_attempts += 1
@@ -1262,7 +1273,7 @@ if __name__ == "__main__":
         base_seed=DEFAULT_BASE_SEED,
     )
 
-    csv_path = write_report(rows, OUTPUT_DIR)
+    csv_path = OUTPUT_DIR / "rapport_camouflages.csv"
 
     print("\nTerminé.")
     print(f"Images validées : {len(rows)}/{N_VARIANTS_REQUIRED}")

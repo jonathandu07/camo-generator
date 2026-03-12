@@ -34,9 +34,10 @@ import platform
 import shutil
 import subprocess
 import threading
+from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Coroutine, Dict, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image as PILImage
@@ -138,7 +139,7 @@ class AsyncioThreadRunner:
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
 
-    def submit(self, coro: asyncio.coroutines) -> "asyncio.Future":
+    def submit(self, coro: Coroutine[Any, Any, Any]) -> Future:
         return asyncio.run_coroutine_threadsafe(coro, self.loop)
 
     def stop(self):
@@ -291,14 +292,26 @@ def build_silhouette_mask(width: int, height: int) -> np.ndarray:
     left_arm_x1 = int(width * 0.15)
     right_arm_x1 = width - left_arm_x1 - arm_w
     arm_y1 = int(height * 0.20)
-    draw.rounded_rectangle([left_arm_x1, arm_y1, left_arm_x1 + arm_w, arm_y1 + arm_h], radius=int(width * 0.02), fill=255)
-    draw.rounded_rectangle([right_arm_x1, arm_y1, right_arm_x1 + arm_w, arm_y1 + arm_h], radius=int(width * 0.02), fill=255)
+    draw.rounded_rectangle(
+        [left_arm_x1, arm_y1, left_arm_x1 + arm_w, arm_y1 + arm_h],
+        radius=int(width * 0.02),
+        fill=255,
+    )
+    draw.rounded_rectangle(
+        [right_arm_x1, arm_y1, right_arm_x1 + arm_w, arm_y1 + arm_h],
+        radius=int(width * 0.02),
+        fill=255,
+    )
 
     pelvis_w = int(width * 0.30)
     pelvis_h = int(height * 0.10)
     pelvis_x1 = (width - pelvis_w) // 2
     pelvis_y1 = int(height * 0.51)
-    draw.rounded_rectangle([pelvis_x1, pelvis_y1, pelvis_x1 + pelvis_w, pelvis_y1 + pelvis_h], radius=int(width * 0.02), fill=255)
+    draw.rounded_rectangle(
+        [pelvis_x1, pelvis_y1, pelvis_x1 + pelvis_w, pelvis_y1 + pelvis_h],
+        radius=int(width * 0.02),
+        fill=255,
+    )
 
     leg_w = int(width * 0.12)
     leg_h = int(height * 0.32)
@@ -306,8 +319,16 @@ def build_silhouette_mask(width: int, height: int) -> np.ndarray:
     left_leg_x1 = (width // 2) - leg_gap // 2 - leg_w
     right_leg_x1 = (width // 2) + leg_gap // 2
     leg_y1 = int(height * 0.58)
-    draw.rounded_rectangle([left_leg_x1, leg_y1, left_leg_x1 + leg_w, leg_y1 + leg_h], radius=int(width * 0.018), fill=255)
-    draw.rounded_rectangle([right_leg_x1, leg_y1, right_leg_x1 + leg_w, leg_y1 + leg_h], radius=int(width * 0.018), fill=255)
+    draw.rounded_rectangle(
+        [left_leg_x1, leg_y1, left_leg_x1 + leg_w, leg_y1 + leg_h],
+        radius=int(width * 0.018),
+        fill=255,
+    )
+    draw.rounded_rectangle(
+        [right_leg_x1, leg_y1, right_leg_x1 + leg_w, leg_y1 + leg_h],
+        radius=int(width * 0.018),
+        fill=255,
+    )
 
     return np.array(img, dtype=np.uint8) > 0
 
@@ -430,7 +451,11 @@ def main_metrics_score(metrics: Dict[str, float]) -> float:
     return float(np.mean(parts))
 
 
-def evaluate_candidate_v3(pil_img: PILImage.Image, rs: np.ndarray, metrics: Dict[str, float]) -> Tuple[Dict[str, float], bool]:
+def evaluate_candidate_v3(
+    pil_img: PILImage.Image,
+    rs: np.ndarray,
+    metrics: Dict[str, float],
+) -> Tuple[Dict[str, float], bool]:
     index_canvas = rgb_image_to_index_canvas(pil_img)
 
     sil_div = silhouette_color_diversity_score(index_canvas)
@@ -529,10 +554,11 @@ class CamouflageApp(App):
         super().__init__(**kwargs)
 
         self.async_runner = AsyncioThreadRunner()
-        self.current_future = None
+        self.current_future: Optional[Future] = None
 
         self.stop_flag = False
         self.running = False
+        self.stopping = False
 
         self.current_output_dir = DEFAULT_OUTPUT_DIR
         self.best_records: List[CandidateRecord] = []
@@ -701,6 +727,7 @@ class CamouflageApp(App):
         body.add_widget(right)
         root.add_widget(body)
 
+        self._refresh_controls_state()
         return root
 
     # ---------------- UI helpers ----------------
@@ -747,10 +774,46 @@ class CamouflageApp(App):
         box.add_widget(widget)
         return box
 
+    @mainthread
+    def _refresh_controls_state(self):
+        self.start_btn.disabled = self.running or self.stopping
+        self.stop_btn.disabled = (not self.running) and (not self.stopping)
+
+    def _bind_future(self, fut: Future):
+        self.current_future = fut
+        fut.add_done_callback(self._on_future_done)
+
+    def _on_future_done(self, fut: Future):
+        try:
+            _ = fut.result()
+        except Exception as exc:
+            self._handle_future_exception(exc)
+        finally:
+            self._clear_current_future_if_same(fut)
+
+    @mainthread
+    def _handle_future_exception(self, exc: BaseException):
+        if self.running or self.stopping:
+            self.running = False
+            self.stopping = False
+            self.status("Erreur", ok=False)
+            self.log(f"Erreur non capturée du futur async : {exc}")
+            self._refresh_controls_state()
+
+    @mainthread
+    def _clear_current_future_if_same(self, fut: Future):
+        if self.current_future is fut:
+            self.current_future = None
+        self._refresh_controls_state()
+
     # ---------------- génération ----------------
 
     def start_generation(self, *_):
-        if self.running:
+        if self.running or self.stopping:
+            return
+
+        if self.current_future is not None and not self.current_future.done():
+            self.log("Une génération est déjà en cours.")
             return
 
         try:
@@ -774,6 +837,7 @@ class CamouflageApp(App):
 
         self.best_records.clear()
         self.stop_flag = False
+        self.stopping = False
         self.running = True
         self.progress_global.max = count
         self.progress_global.value = 0
@@ -781,15 +845,20 @@ class CamouflageApp(App):
         self.status("Génération async en cours...", ok=True)
         self.log(f"Démarrage async : {count} images validées à produire.")
         self.log(f"Dossier de sortie : {self.current_output_dir.resolve()}")
+        self._refresh_controls_state()
 
-        self.current_future = self.async_runner.submit(self._async_worker_generate(count, top_k))
+        fut = self.async_runner.submit(self._async_worker_generate(count, top_k))
+        self._bind_future(fut)
 
     def stop_generation(self, *_):
-        if not self.running:
+        if not self.running or self.stopping:
             return
+
         self.stop_flag = True
+        self.stopping = True
         self.status("Arrêt demandé...", ok=False)
-        self.log("Arrêt demandé par l'utilisateur.")
+        self.log("Arrêt demandé par l'utilisateur. Fin de la tentative courante puis arrêt.")
+        self._refresh_controls_state()
 
     async def _async_should_stop(self) -> bool:
         return self.stop_flag
@@ -846,6 +915,7 @@ class CamouflageApp(App):
                             f"G={candidate.ratios[camo.IDX_GRIS]*100:.1f} | "
                             f"SF={extra_scores['score_final']:.3f}"
                         )
+                        await asyncio.sleep(0)
                         continue
 
                     filename = self.current_output_dir / f"camouflage_{target_index:03d}.png"
@@ -912,15 +982,19 @@ class CamouflageApp(App):
                     self.update_progress(target_index, target_count)
                     self.log(
                         f"[img={target_index:03d}] accepté -> {filename.name} | "
-                        f"SF={extra_scores['score_final']:.3f} "
-                        f"| silhouette={extra_scores['silhouette_color_diversity']:.3f} "
-                        f"| contour={extra_scores['contour_break_score']:.3f}"
+                        f"SF={extra_scores['score_final']:.3f} | "
+                        f"silhouette={extra_scores['silhouette_color_diversity']:.3f} | "
+                        f"contour={extra_scores['contour_break_score']:.3f}"
                     )
 
+                    await asyncio.sleep(0)
                     break
 
             await self._async_finish_success(rows, top_k)
 
+        except asyncio.CancelledError:
+            await self._async_finish_stopped(rows, top_k)
+            raise
         except Exception as e:
             await self._async_finish_error(str(e))
 
@@ -932,6 +1006,12 @@ class CamouflageApp(App):
         return report_path
 
     def _write_report_sync(self, rows: List[dict], report_path: Path) -> None:
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if not rows:
+            report_path.write_text("", encoding="utf-8")
+            return
+
         with report_path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
             writer.writeheader()
@@ -994,28 +1074,37 @@ class CamouflageApp(App):
         report_path = await self._async_write_report(rows)
         best_dir = await self._async_export_best_of(top_k)
         self.running = False
+        self.stopping = False
         self.stop_flag = False
         self.status("Terminé", ok=True)
         self.log(f"Rapport écrit : {report_path}")
         self.log(f"Best-of exporté : {best_dir}")
         self.log("Génération async terminée avec succès.")
+        self._refresh_controls_state()
 
     async def _async_finish_stopped(self, rows: List[dict], top_k: int):
+        report_path = await self._async_write_report(rows)
         if rows:
-            report_path = await self._async_write_report(rows)
             best_dir = await self._async_export_best_of(min(top_k, len(rows)))
             self.log(f"Rapport partiel écrit : {report_path}")
             self.log(f"Best-of partiel exporté : {best_dir}")
+        else:
+            self.log(f"Rapport vide écrit : {report_path}")
+
         self.running = False
+        self.stopping = False
         self.stop_flag = False
         self.status("Arrêté", ok=False)
         self.log("Génération async arrêtée proprement.")
+        self._refresh_controls_state()
 
     async def _async_finish_error(self, message: str):
         self.running = False
+        self.stopping = False
         self.stop_flag = False
         self.status("Erreur", ok=False)
         self.log(f"Erreur : {message}")
+        self._refresh_controls_state()
 
     # ---------------- UI thread updates ----------------
 
@@ -1063,6 +1152,13 @@ class CamouflageApp(App):
 
     def on_stop(self):
         self.stop_flag = True
+        self.stopping = True
+
+        fut = self.current_future
+        if fut is not None and not fut.done():
+            # on laisse la tentative courante sortir proprement ; pas d'annulation dure ici
+            pass
+
         try:
             self.async_runner.stop()
         except Exception:
