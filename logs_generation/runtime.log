@@ -166,3 +166,5 @@
 2026-03-13 18:01:26 | INFO     | camo_log | [start] Arrêt de l'interface Kivy
 2026-03-13 18:01:26 | INFO     | camo_log | [start_worker] Génération démarrée | payload={"output_dir": "C:\\Users\\alpha\\Documents\\GitHub\\camo-generator\\camouflages_federale_europe", "run_mode": "blocking", "target_count": 2}
 2026-03-13 18:01:26 | WARNING  | camo_log | [start_worker] Arrêt demandé | payload={"accepted_count": 0, "total_attempts": 0}
+2026-03-13 18:01:58 | INFO     | camo_log | [tests] Début préflight synchrone | payload={"modules": ["test_main", "test_start"], "parallel": false, "timeout_s": null}
+2026-03-13 18:01:58 | INFO     | camo_log | [tests] Lancement module de test | payload={"command": ["C:\\Python312\\python.exe", "-m", "unittest", "-v", "test_main"], "mode": "sync-subprocess", "module": "test_main", "timeout_s": null}
