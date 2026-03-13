@@ -27,7 +27,6 @@ from __future__ import annotations
 import asyncio
 import csv
 import ctypes
-import importlib
 import io
 import math
 import os
@@ -36,7 +35,6 @@ import shutil
 import subprocess
 import sys
 import threading
-import unittest
 from collections import Counter
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -965,7 +963,7 @@ class GalleryThumb(Button):
         self.add_widget(self.container)
 
         self.stage = SoftPane(orientation="vertical", size_hint_y=1)
-        self.thumb = Image(allow_stretch=True, keep_ratio=True)
+        self.thumb = Image()
         self.stage.add_widget(self.thumb)
 
         self.caption = Label(
@@ -1027,6 +1025,7 @@ class CamouflageApp(App):
 
         self.async_runner = AsyncioThreadRunner()
         self.current_future: Optional[Future] = None
+        self.preflight_future: Optional[Future] = None
 
         self.stop_flag = False
         self.running = False
@@ -1050,7 +1049,6 @@ class CamouflageApp(App):
 
         self.preflight_running = False
         self.preflight_pending_start = False
-        self.preflight_thread: Optional[threading.Thread] = None
 
         self.title_label: Optional[Label] = None
         self.status_label: Optional[Label] = None
@@ -1235,8 +1233,8 @@ class CamouflageApp(App):
 
         previews = BoxLayout(spacing=dp(10), size_hint_y=0.46)
 
-        self.preview_img = Image(allow_stretch=True, keep_ratio=True)
-        self.preview_silhouette = Image(allow_stretch=True, keep_ratio=True)
+        self.preview_img = Image()
+        self.preview_silhouette = Image()
 
         previews.add_widget(self._carded_view("Camouflage courant / validé", self.preview_img))
         previews.add_widget(self._carded_view("Projection silhouette", self.preview_silhouette))
@@ -1332,36 +1330,30 @@ class CamouflageApp(App):
         else:
             self.tests_label.color = C["text_soft"]
 
-    def _run_preflight_tests_once(self) -> Tuple[bool, str]:
+    async def _async_run_preflight_via_log(self) -> Tuple[bool, str]:
+        if camo_log is None:
+            return False, "log.py indisponible : impossible de lancer le préflight."
+
         try:
-            importlib.invalidate_caches()
+            summary = await camo_log.async_run_preflight_tests(output_dir=Path("logs_generation"))
 
-            suite = unittest.TestSuite()
-            loader = unittest.defaultTestLoader
+            if hasattr(summary, "short_text"):
+                text = str(summary.short_text())
+                ok = bool(getattr(summary, "ok", False))
+                return ok, text
 
-            module_names = ("test_main", "test_start")
-            for module_name in module_names:
-                module = importlib.import_module(module_name)
-                module = importlib.reload(module)
-                suite.addTests(loader.loadTestsFromModule(module))
+            if isinstance(summary, dict):
+                ok = bool(summary.get("ok", False))
+                total = int(summary.get("total", 0))
+                failures = int(summary.get("failures", 0))
+                errors = int(summary.get("errors", 0))
+                if ok:
+                    return True, f"{total} tests OK"
+                return False, f"{total} tests exécutés | {failures} échec(s) | {errors} erreur(s)"
 
-            result = unittest.TestResult()
-            suite.run(result)
-
-            total = result.testsRun
-            failures = len(result.failures)
-            errors = len(result.errors)
-            ok = result.wasSuccessful()
-
-            if ok:
-                summary = f"{total} tests OK"
-            else:
-                summary = f"{total} tests exécutés | {failures} échec(s) | {errors} erreur(s)"
-
-            return ok, summary
-
-        except BaseException as exc:
-            return False, f"Impossible d'exécuter les tests : {type(exc).__name__}: {exc}"
+            return False, "Préflight : format de réponse inattendu."
+        except Exception as exc:
+            return False, f"Impossible d'exécuter les tests via log.py : {type(exc).__name__}: {exc}"
 
     def _ensure_preflight_tests(self) -> bool:
         if self.tests_ran and self.tests_ok:
@@ -1374,26 +1366,28 @@ class CamouflageApp(App):
         self.preflight_running = True
         self.preflight_pending_start = True
         self.status("Préflight en cours…", ok=True)
-        self.log("Lancement des tests de préflight…")
-        self.diag_log("Préflight lancé en arrière-plan.")
+        self.log("Lancement des tests de préflight via log.py…")
+        self.diag_log("Préflight lancé via log.py.")
         self._update_preflight_label("Préflight en cours…", ok=None)
         self._refresh_controls_state()
 
-        def worker():
-            ok, summary = self._run_preflight_tests_once()
-            Clock.schedule_once(lambda dt: self._on_preflight_finished(ok, summary), 0)
-
-        self.preflight_thread = threading.Thread(
-            target=worker,
-            daemon=True,
-            name="preflight-tests",
-        )
-        self.preflight_thread.start()
+        fut = self.async_runner.submit(self._async_run_preflight_via_log())
+        self.preflight_future = fut
+        fut.add_done_callback(self._on_preflight_future_done)
         return False
+
+    def _on_preflight_future_done(self, fut: Future):
+        try:
+            ok, summary = fut.result()
+        except Exception as exc:
+            ok, summary = False, f"Préflight interrompu : {type(exc).__name__}: {exc}"
+
+        Clock.schedule_once(lambda dt: self._on_preflight_finished(ok, summary), 0)
 
     @mainthread
     def _on_preflight_finished(self, ok: bool, summary: str):
         self.preflight_running = False
+        self.preflight_future = None
         self.tests_ran = True
         self.tests_ok = ok
         self.tests_summary = summary
