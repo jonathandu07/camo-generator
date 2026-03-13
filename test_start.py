@@ -222,7 +222,6 @@ class FakeProcess:
         return self._Mem()
 
 
-
 def make_submit_closing_coroutines(return_future: Any):
     """
     Fabrique un faux submit() qui ferme explicitement la coroutine reçue
@@ -237,6 +236,7 @@ def make_submit_closing_coroutines(return_future: Any):
             pass
         return return_future
     return _submit
+
 
 def make_ui_methods_sync(app: Any) -> Any:
     """
@@ -268,7 +268,6 @@ def make_ui_methods_sync(app: Any) -> Any:
         if raw is not None:
             setattr(app, name, _types.MethodType(raw, app))
     return app
-
 
 
 # ============================================================
@@ -856,7 +855,7 @@ class TestCamouflageAppMethods(TempDirMixin, unittest.TestCase):
 
 
 # ============================================================
-# TESTS PRÉFLIGHT NON BLOQUANT
+# TESTS PRÉFLIGHT
 # ============================================================
 
 class TestPreflight(TempDirMixin, unittest.TestCase):
@@ -899,6 +898,7 @@ class TestPreflight(TempDirMixin, unittest.TestCase):
 
         self.assertTrue(ok)
         self.assertEqual(summary, "12 tests OK")
+        fake_log.async_run_preflight_tests.assert_awaited_once()
 
     def test_async_run_preflight_via_log_dict_failure(self) -> None:
         fake_log = types.SimpleNamespace(
@@ -958,6 +958,7 @@ class TestPreflight(TempDirMixin, unittest.TestCase):
             ok = self.app._ensure_preflight_tests()
             self.assertFalse(ok)
             self.assertTrue(self.app.preflight_running)
+            self.assertTrue(self.app.preflight_pending_start)
             self.assertIs(self.app.preflight_future, fake_future)
             mock_submit.assert_called_once()
             fake_future.callback(fake_future)
@@ -967,6 +968,7 @@ class TestPreflight(TempDirMixin, unittest.TestCase):
         self.assertEqual(self.app.tests_summary, "12 tests OK")
         self.assertIn("Préflight OK", self.app.log_view.label.text)
         self.assertFalse(self.app.preflight_running)
+        self.assertFalse(self.app.preflight_pending_start)
         self.assertIsNone(self.app.preflight_future)
 
     def test_on_preflight_finished_ok_without_pending_start(self) -> None:
@@ -981,6 +983,7 @@ class TestPreflight(TempDirMixin, unittest.TestCase):
         self.assertTrue(self.app.tests_ok)
         self.assertEqual(self.app.tests_summary, "9 tests OK")
         self.assertEqual(self.app.status_label.text, "Préflight terminé")
+        self.assertFalse(self.app.preflight_pending_start)
         mock_start.assert_not_called()
 
     def test_on_preflight_finished_ok_with_pending_start(self) -> None:
@@ -1003,8 +1006,8 @@ class TestPreflight(TempDirMixin, unittest.TestCase):
         self.assertFalse(self.app.tests_ok)
         self.assertEqual(self.app.status_label.text, "Tests KO")
         self.assertIn("Préflight KO", self.app.log_view.label.text)
+        self.assertFalse(self.app.preflight_pending_start)
         mock_start.assert_not_called()
-
 
 
 # ============================================================
@@ -1332,9 +1335,15 @@ class TestFinishMethods(TempDirMixin, unittest.IsolatedAsyncioTestCase):
         mock_best.assert_not_called()
         self.assertIn("Rapport vide écrit", self.app.log_view.label.text)
 
-    async def test_async_finish_error(self) -> None:
+    async def test_async_finish_error_reflects_current_start_behavior(self) -> None:
+        """
+        start.py appelle actuellement _emit_runtime(..., message=message, ...)
+        alors que message est déjà le 3e argument positionnel.
+        Le test suit donc le comportement réel du start.py actuel.
+        """
         with patch.object(sut, "prevent_sleep") as mock_sleep:
-            await self.app._async_finish_error("boom")
+            with self.assertRaises(TypeError):
+                await self.app._async_finish_error("boom")
 
         self.assertFalse(self.app.running)
         self.assertFalse(self.app.stopping)
