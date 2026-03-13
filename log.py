@@ -18,19 +18,21 @@ Usage simple :
 
 Usage avancé :
     python log.py --count 500 --output logs_generation
+    python log.py --count 500 --output logs_generation --async
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
 import csv
 import json
 import statistics
 import time
 from collections import Counter, defaultdict
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Any
 
 import numpy as np
 
@@ -112,10 +114,6 @@ def ensure_dir(path: Path) -> Path:
     return path
 
 
-def safe_float(x: Any) -> float:
-    return float(x)
-
-
 def rule_fail_min(name: str, actual: float, min_value: float) -> RuleFailure | None:
     if actual >= min_value:
         return None
@@ -191,7 +189,6 @@ def analyze_candidate(candidate: camo.CandidateResult, target_index: int, local_
     abs_err = np.abs(rs - camo.TARGET)
     mean_abs_err = float(np.mean(abs_err))
 
-    # erreurs absolues par couleur
     per_color_rules = [
         ("abs_err_coyote", float(rs[camo.IDX_COYOTE]), float(camo.TARGET[camo.IDX_COYOTE]), float(camo.MAX_ABS_ERROR_PER_COLOR[camo.IDX_COYOTE])),
         ("abs_err_olive", float(rs[camo.IDX_OLIVE]), float(camo.TARGET[camo.IDX_OLIVE]), float(camo.MAX_ABS_ERROR_PER_COLOR[camo.IDX_OLIVE])),
@@ -207,7 +204,6 @@ def analyze_candidate(candidate: camo.CandidateResult, target_index: int, local_
     if fail is not None:
         failures.append(fail)
 
-    # ratios globaux
     ratio_checks = [
         ("ratio_coyote", float(rs[camo.IDX_COYOTE]), 0.27, 0.37),
         ("ratio_olive", float(rs[camo.IDX_OLIVE]), 0.24, 0.33),
@@ -219,7 +215,6 @@ def analyze_candidate(candidate: camo.CandidateResult, target_index: int, local_
         if fail is not None:
             failures.append(fail)
 
-    # métriques strictes
     metric_min_checks = [
         ("largest_olive_component_ratio", m["largest_olive_component_ratio"], camo.MIN_OLIVE_CONNECTED_COMPONENT_RATIO),
         ("largest_olive_component_ratio_small", m["largest_olive_component_ratio_small"], 0.12),
@@ -286,6 +281,10 @@ def analyze_candidate(candidate: camo.CandidateResult, target_index: int, local_
     )
 
 
+async def async_analyze_candidate(candidate: camo.CandidateResult, target_index: int, local_attempt: int) -> CandidateDiagnostic:
+    return await asyncio.to_thread(analyze_candidate, candidate, target_index, local_attempt)
+
+
 # ============================================================
 # GÉNÉRATION DE DIAGNOSTIC
 # ============================================================
@@ -300,6 +299,21 @@ def generate_diagnostics(
         seed = camo.build_seed(target_index=1, local_attempt=i, base_seed=base_seed)
         candidate = camo.generate_candidate_from_seed(seed)
         diagnostic = analyze_candidate(candidate, target_index=1, local_attempt=i)
+        diagnostics.append(diagnostic)
+
+    return diagnostics
+
+
+async def async_generate_diagnostics(
+    count: int,
+    base_seed: int = camo.DEFAULT_BASE_SEED,
+) -> List[CandidateDiagnostic]:
+    diagnostics: List[CandidateDiagnostic] = []
+
+    for i in range(1, count + 1):
+        seed = camo.build_seed(target_index=1, local_attempt=i, base_seed=base_seed)
+        candidate = await camo.async_generate_candidate_from_seed(seed)
+        diagnostic = await async_analyze_candidate(candidate, target_index=1, local_attempt=i)
         diagnostics.append(diagnostic)
 
     return diagnostics
@@ -410,10 +424,18 @@ def write_candidates_csv(diagnostics: List[CandidateDiagnostic], output_dir: Pat
     return path
 
 
+async def async_write_candidates_csv(diagnostics: List[CandidateDiagnostic], output_dir: Path) -> Path:
+    return await asyncio.to_thread(write_candidates_csv, diagnostics, output_dir)
+
+
 def write_summary_json(summary: Dict[str, Any], output_dir: Path) -> Path:
     path = output_dir / "diagnostic_summary.json"
     path.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     return path
+
+
+async def async_write_summary_json(summary: Dict[str, Any], output_dir: Path) -> Path:
+    return await asyncio.to_thread(write_summary_json, summary, output_dir)
 
 
 def write_summary_txt(summary: Dict[str, Any], output_dir: Path) -> Path:
@@ -448,6 +470,10 @@ def write_summary_txt(summary: Dict[str, Any], output_dir: Path) -> Path:
     return path
 
 
+async def async_write_summary_txt(summary: Dict[str, Any], output_dir: Path) -> Path:
+    return await asyncio.to_thread(write_summary_txt, summary, output_dir)
+
+
 # ============================================================
 # CLI
 # ============================================================
@@ -457,6 +483,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--count", type=int, default=DEFAULT_ANALYSIS_COUNT, help="Nombre de candidats à analyser.")
     parser.add_argument("--output", type=str, default=str(DEFAULT_OUTPUT_DIR), help="Dossier de sortie des logs.")
     parser.add_argument("--base-seed", type=int, default=camo.DEFAULT_BASE_SEED, help="Seed de base.")
+    parser.add_argument("--async", dest="use_async", action="store_true", help="Utiliser la version asynchrone.")
     return parser.parse_args()
 
 
@@ -487,5 +514,36 @@ def main() -> None:
     print(f"Durée              : {dt:.2f} s")
 
 
+async def async_main() -> None:
+    args = parse_args()
+    output_dir = ensure_dir(Path(args.output))
+
+    t0 = time.perf_counter()
+    diagnostics = await async_generate_diagnostics(
+        count=int(args.count),
+        base_seed=int(args.base_seed),
+    )
+    summary = build_summary(diagnostics)
+
+    csv_path = await async_write_candidates_csv(diagnostics, output_dir)
+    json_path = await async_write_summary_json(summary, output_dir)
+    txt_path = await async_write_summary_txt(summary, output_dir)
+    dt = time.perf_counter() - t0
+
+    print("\nDiagnostic terminé.")
+    print(f"Candidats analysés : {summary['total_candidates']}")
+    print(f"Acceptés           : {summary['accepted']}")
+    print(f"Rejetés            : {summary['rejected']}")
+    print(f"Taux acceptation   : {summary['acceptance_rate']:.4%}")
+    print(f"CSV                : {csv_path.resolve()}")
+    print(f"JSON               : {json_path.resolve()}")
+    print(f"TXT                : {txt_path.resolve()}")
+    print(f"Durée              : {dt:.2f} s")
+
+
 if __name__ == "__main__":
-    main()
+    parsed = parse_args()
+    if parsed.use_async:
+        asyncio.run(async_main())
+    else:
+        main()
