@@ -1,12 +1,12 @@
 {
   "ok": false,
-  "total": 88,
+  "total": 89,
   "failures": 0,
   "errors": 1,
   "skipped": 0,
   "expected_failures": 0,
   "unexpected_successes": 0,
-  "duration_s": 180.1051468000005,
+  "duration_s": 180.08626479999657,
   "modules": [
     "test_main"
   ],
@@ -27,7 +27,7 @@
       "module": "test_main",
       "ok": false,
       "returncode": -9,
-      "duration_s": 180.05477209999663,
+      "duration_s": 180.0540409000023,
       "command": [
         "C:\\Python312\\python.exe",
         "-m",
