@@ -1,0 +1,53 @@
+{
+  "ok": false,
+  "total": 88,
+  "failures": 0,
+  "errors": 1,
+  "skipped": 0,
+  "expected_failures": 0,
+  "unexpected_successes": 0,
+  "duration_s": 180.1051468000005,
+  "modules": [
+    "test_main"
+  ],
+  "log_files": {
+    "test_main": "C:\\Users\\alpha\\Documents\\GitHub\\camo-generator\\logs_tests\\test_main.log"
+  },
+  "details": {
+    "failures": [],
+    "errors": [
+      {
+        "test": "test_main::timeout",
+        "trace": "STDERR:\ntest_generate_candidate_from_seed_returns_candidate_result (test_main.TestCandidateGeneration.test_generate_candidate_from_seed_returns_candidate_result) ..."
+      }
+    ]
+  },
+  "per_module": [
+    {
+      "module": "test_main",
+      "ok": false,
+      "returncode": -9,
+      "duration_s": 180.05477209999663,
+      "command": [
+        "C:\\Python312\\python.exe",
+        "-m",
+        "unittest",
+        "-v",
+        "test_main"
+      ],
+      "stdout": "",
+      "stderr": "test_generate_candidate_from_seed_returns_candidate_result (test_main.TestCandidateGeneration.test_generate_candidate_from_seed_returns_candidate_result) ... ",
+      "log_file": "C:\\Users\\alpha\\Documents\\GitHub\\camo-generator\\logs_tests\\test_main.log",
+      "completed": false,
+      "timed_out": true,
+      "timeout_s": 180.0,
+      "exception_message": "TimeoutExpired(180.0)"
+    }
+  ],
+  "parallel": false,
+  "completed": false,
+  "timed_out": true,
+  "timed_out_modules": [
+    "test_main"
+  ]
+}

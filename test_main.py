@@ -157,6 +157,40 @@ def valid_metrics() -> Dict[str, float]:
     }
 
 
+def valid_metrics_fixed() -> Dict[str, float]:
+    """
+    Valeurs métier fixes, non dérivées des constantes.
+    Sert à éviter qu'un changement involontaire de seuil dans main.py
+    fasse passer les tests "par suivisme".
+    """
+    return {
+        "largest_olive_component_ratio": 0.24,
+        "largest_olive_component_ratio_small": 0.20,
+        "olive_multizone_share": 0.60,
+        "center_empty_ratio": 0.31,
+        "center_empty_ratio_small": 0.34,
+        "boundary_density": 0.145,
+        "boundary_density_small": 0.110,
+        "boundary_density_tiny": 0.12,
+        "mirror_similarity": 0.44,
+        "oblique_share": 0.72,
+        "vertical_share": 0.15,
+        "angle_dominance_ratio": 0.20,
+        "coyote_brown_macro_share": 0.00,
+        "coyote_brown_transition_share": 0.05,
+        "coyote_brown_micro_share": 0.00,
+        "vert_olive_macro_share": 0.75,
+        "vert_olive_transition_share": 0.10,
+        "vert_olive_micro_share": 0.05,
+        "terre_de_france_macro_share": 0.20,
+        "terre_de_france_transition_share": 0.55,
+        "terre_de_france_micro_share": 0.05,
+        "vert_de_gris_macro_share": 0.07,
+        "vert_de_gris_transition_share": 0.05,
+        "vert_de_gris_micro_share": 0.83,
+    }
+
+
 def valid_ratios() -> np.ndarray:
     return np.array([0.32, 0.28, 0.22, 0.18], dtype=float)
 
@@ -710,6 +744,11 @@ class TestValidationAndExport(TempDirMixin, TestAssertionsMixin, unittest.TestCa
         LOGGER.info("variant_is_valid(valid) -> %s", ok)
         self.assertTrue(ok)
 
+    def test_variant_is_valid_accepts_fixed_business_case(self) -> None:
+        ok = mut.variant_is_valid(valid_ratios(), valid_metrics_fixed())
+        LOGGER.info("variant_is_valid(fixed business case) -> %s", ok)
+        self.assertTrue(ok)
+
     def test_variant_is_valid_rejects_bad_ratios(self) -> None:
         ok = mut.variant_is_valid(invalid_ratios_far(), valid_metrics())
         self.assertFalse(ok)
@@ -765,7 +804,10 @@ class TestValidationAndExport(TempDirMixin, TestAssertionsMixin, unittest.TestCa
             "largest_olive_component_ratio_small",
             "olive_multizone_share",
             "center_empty_ratio",
+            "center_empty_ratio_small",
             "boundary_density",
+            "boundary_density_small",
+            "boundary_density_tiny",
             "mirror_similarity",
             "oblique_share",
             "vertical_share",

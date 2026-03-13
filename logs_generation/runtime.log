@@ -1,2 +1,6 @@
 2026-03-13 12:45:28 | INFO     | camo_log | [tests] Début préflight asynchrone | payload={"modules": ["test_main"], "parallel": true}
 2026-03-13 12:45:28 | INFO     | camo_log | [tests] Lancement module de test | payload={"command": ["C:\\Python312\\python.exe", "-m", "unittest", "-v", "test_main"], "module": "test_main"}
+2026-03-13 13:57:15 | INFO     | camo_log | [tests] Début préflight synchrone | payload={"modules": ["test_main"], "parallel": false, "timeout_s": 180.0}
+2026-03-13 13:57:15 | INFO     | camo_log | [tests] Lancement module de test | payload={"command": ["C:\\Python312\\python.exe", "-m", "unittest", "-v", "test_main"], "mode": "sync-subprocess", "module": "test_main", "timeout_s": 180.0}
+2026-03-13 14:00:15 | ERROR    | camo_log | [tests] Fin module de test | payload={"completed": false, "duration_s": 180.054772, "module": "test_main", "ok": false, "returncode": -9, "timed_out": true}
+2026-03-13 14:00:15 | ERROR    | camo_log | [tests] Fin préflight synchrone | payload={"completed": false, "duration_s": 180.105147, "errors": 1, "failures": 0, "ok": false, "parallel": false, "timed_out": true, "timed_out_modules": ["test_main"], "total": 88}
