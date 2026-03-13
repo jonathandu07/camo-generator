@@ -236,7 +236,7 @@ class CandidateRecord:
 class AsyncioThreadRunner:
     def __init__(self):
         self.loop = asyncio.new_event_loop()
-        self.thread = threading.Thread(target=self._run_loop, daemon=True)
+        self.thread = threading.Thread(target=self._run_loop, daemon=True, name="kivy-async-loop")
         self.thread.start()
 
     def _run_loop(self):
@@ -1048,6 +1048,10 @@ class CamouflageApp(App):
         self.tests_ok = False
         self.tests_summary = "Tests non lancés."
 
+        self.preflight_running = False
+        self.preflight_pending_start = False
+        self.preflight_thread: Optional[threading.Thread] = None
+
         self.title_label: Optional[Label] = None
         self.status_label: Optional[Label] = None
         self.count_input: Optional[SoftTextInput] = None
@@ -1329,7 +1333,7 @@ class CamouflageApp(App):
             self.tests_label.color = C["text_soft"]
 
     def _run_preflight_tests_once(self) -> Tuple[bool, str]:
-        def _worker() -> Tuple[bool, str]:
+        try:
             importlib.invalidate_caches()
 
             suite = unittest.TestSuite()
@@ -1356,29 +1360,6 @@ class CamouflageApp(App):
 
             return ok, summary
 
-        try:
-            box: Dict[str, Tuple[bool, str]] = {}
-            err: Dict[str, BaseException] = {}
-
-            def runner() -> None:
-                try:
-                    box["value"] = _worker()
-                except BaseException as exc:
-                    err["value"] = exc
-
-            th = threading.Thread(
-                target=runner,
-                daemon=True,
-                name="preflight-tests",
-            )
-            th.start()
-            th.join()
-
-            if "value" in err:
-                raise err["value"]
-
-            return box.get("value", (False, "Préflight sans résultat."))
-
         except BaseException as exc:
             return False, f"Impossible d'exécuter les tests : {type(exc).__name__}: {exc}"
 
@@ -1386,7 +1367,33 @@ class CamouflageApp(App):
         if self.tests_ran and self.tests_ok:
             return True
 
-        ok, summary = self._run_preflight_tests_once()
+        if self.preflight_running:
+            self.log("Préflight déjà en cours…")
+            return False
+
+        self.preflight_running = True
+        self.preflight_pending_start = True
+        self.status("Préflight en cours…", ok=True)
+        self.log("Lancement des tests de préflight…")
+        self.diag_log("Préflight lancé en arrière-plan.")
+        self._update_preflight_label("Préflight en cours…", ok=None)
+        self._refresh_controls_state()
+
+        def worker():
+            ok, summary = self._run_preflight_tests_once()
+            Clock.schedule_once(lambda dt: self._on_preflight_finished(ok, summary), 0)
+
+        self.preflight_thread = threading.Thread(
+            target=worker,
+            daemon=True,
+            name="preflight-tests",
+        )
+        self.preflight_thread.start()
+        return False
+
+    @mainthread
+    def _on_preflight_finished(self, ok: bool, summary: str):
+        self.preflight_running = False
         self.tests_ran = True
         self.tests_ok = ok
         self.tests_summary = summary
@@ -1396,12 +1403,19 @@ class CamouflageApp(App):
         if ok:
             self.log(f"Préflight OK : {summary}")
             self.diag_log(f"Préflight OK : {summary}")
-            return True
+            self.status("Préflight terminé", ok=True)
+        else:
+            self.status("Tests KO", ok=False)
+            self.log(f"Préflight KO : {summary}")
+            self.diag_log(f"Préflight KO : {summary}")
 
-        self.status("Tests KO", ok=False)
-        self.log(f"Préflight KO : {summary}")
-        self.diag_log(f"Préflight KO : {summary}")
-        return False
+        self._refresh_controls_state()
+
+        if ok and self.preflight_pending_start:
+            self.preflight_pending_start = False
+            self._start_generation_after_preflight()
+        else:
+            self.preflight_pending_start = False
 
     # ---------------- diagnostic live ----------------
 
@@ -1525,9 +1539,9 @@ class CamouflageApp(App):
     @mainthread
     def _refresh_controls_state(self):
         if self.start_btn is not None:
-            self.start_btn.disabled = self.running or self.stopping
+            self.start_btn.disabled = self.running or self.stopping or self.preflight_running
         if self.stop_btn is not None:
-            self.stop_btn.disabled = (not self.running) and (not self.stopping)
+            self.stop_btn.disabled = (not self.running) and (not self.stopping) and (not self.preflight_running)
 
     @mainthread
     def reload_gallery(self):
@@ -1635,7 +1649,7 @@ class CamouflageApp(App):
     # ---------------- génération ----------------
 
     def start_generation(self, *_):
-        if self.running or self.stopping:
+        if self.running or self.stopping or self.preflight_running:
             return
 
         if self.current_future is not None and not self.current_future.done():
@@ -1646,7 +1660,22 @@ class CamouflageApp(App):
             self.log("Interface incomplète.")
             return
 
-        if not self._ensure_preflight_tests():
+        if self.tests_ran and self.tests_ok:
+            self._start_generation_after_preflight()
+            return
+
+        self._ensure_preflight_tests()
+
+    def _start_generation_after_preflight(self):
+        if self.running or self.stopping or self.preflight_running:
+            return
+
+        if self.current_future is not None and not self.current_future.done():
+            self.log("Une génération est déjà en cours.")
+            return
+
+        if self.count_input is None or self.progress_bar is None:
+            self.log("Interface incomplète.")
             return
 
         try:
@@ -1683,6 +1712,14 @@ class CamouflageApp(App):
         self._bind_future(fut)
 
     def stop_generation(self, *_):
+        if self.preflight_running:
+            self.preflight_pending_start = False
+            self.status("Préflight en cours…", ok=False)
+            self.log("Arrêt demandé pendant le préflight. La génération ne démarrera pas.")
+            self.diag_log("Démarrage annulé pendant le préflight.")
+            self._refresh_controls_state()
+            return
+
         if not self.running or self.stopping:
             return
 
@@ -2037,6 +2074,7 @@ class CamouflageApp(App):
     def on_stop(self):
         self.stop_flag = True
         self.stopping = True
+        self.preflight_pending_start = False
         prevent_sleep(False)
 
         fut = self.current_future
