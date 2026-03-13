@@ -221,6 +221,38 @@ class FakeProcess:
     def memory_info(self) -> "_Mem":
         return self._Mem()
 
+def make_ui_methods_sync(app: Any) -> Any:
+    """
+    Remplace, pour les tests, les méthodes décorées avec @mainthread
+    par leur fonction sous-jacente afin que les effets soient immédiats.
+    """
+    import types as _types
+
+    method_names = [
+        "_update_preflight_label",
+        "_on_preflight_finished",
+        "_refresh_live_diag_labels",
+        "diag_log",
+        "_refresh_controls_state",
+        "reload_gallery",
+        "_handle_future_exception",
+        "_clear_current_future_if_same",
+        "status",
+        "log",
+        "update_progress",
+        "update_attempt_status",
+        "update_preview",
+    ]
+
+    cls = type(app)
+    for name in method_names:
+        fn = getattr(cls, name, None)
+        raw = getattr(fn, "__wrapped__", None)
+        if raw is not None:
+            setattr(app, name, _types.MethodType(raw, app))
+    return app
+
+
 
 # ============================================================
 # TESTS PALETTE / CONSTANTES
@@ -555,6 +587,7 @@ class TestCamouflageAppMethods(TempDirMixin, unittest.TestCase):
         self.tmpdir = Path(self._tmpdir_obj.name)
 
         self.app = sut.CamouflageApp()
+        make_ui_methods_sync(self.app)
         self.app.current_output_dir = self.tmpdir
         self.app.best_records = []
 
@@ -815,6 +848,7 @@ class TestPreflight(TempDirMixin, unittest.TestCase):
         self.tmpdir = Path(self._tmpdir_obj.name)
 
         self.app = sut.CamouflageApp()
+        make_ui_methods_sync(self.app)
         self.app.tests_label = make_fake_label()
         self.app.status_label = make_fake_label()
         self.app.log_view = make_fake_log_view()
@@ -834,49 +868,40 @@ class TestPreflight(TempDirMixin, unittest.TestCase):
             pass
         self._tmpdir_obj.cleanup()
 
-    def test_run_preflight_tests_once_success(self) -> None:
-        def suite_run(result: unittest.TestResult) -> None:
-            result.testsRun = 4
+    def test_async_run_preflight_via_log_summary_object(self) -> None:
+        class Summary:
+            ok = True
 
-        fake_suite = MagicMock()
-        fake_suite.run.side_effect = suite_run
-        fake_module = types.ModuleType("dummy")
+            def short_text(self) -> str:
+                return "12 tests OK"
 
-        with patch.object(sut.importlib, "invalidate_caches"), \
-             patch.object(sut.importlib, "import_module", return_value=fake_module), \
-             patch.object(sut.importlib, "reload", return_value=fake_module), \
-             patch.object(sut.unittest, "TestSuite", return_value=fake_suite), \
-             patch.object(sut.unittest.defaultTestLoader, "loadTestsFromModule", return_value=[]):
+        fake_log = types.SimpleNamespace(async_run_preflight_tests=AsyncMock(return_value=Summary()))
 
-            ok, summary = self.app._run_preflight_tests_once()
+        with patch.object(sut, "camo_log", fake_log):
+            ok, summary = sut.asyncio.run(self.app._async_run_preflight_via_log())
 
         self.assertTrue(ok)
-        self.assertIn("4 tests OK", summary)
+        self.assertEqual(summary, "12 tests OK")
 
-    def test_run_preflight_tests_once_failure(self) -> None:
-        def suite_run(result: unittest.TestResult) -> None:
-            result.testsRun = 5
-            result.failures.append(("t1", "trace"))
-            result.errors.append(("t2", "trace"))
+    def test_async_run_preflight_via_log_dict_failure(self) -> None:
+        fake_log = types.SimpleNamespace(
+            async_run_preflight_tests=AsyncMock(
+                return_value={"ok": False, "total": 5, "failures": 2, "errors": 1}
+            )
+        )
 
-        fake_suite = MagicMock()
-        fake_suite.run.side_effect = suite_run
-        fake_module = types.ModuleType("dummy")
-
-        with patch.object(sut.importlib, "invalidate_caches"), \
-             patch.object(sut.importlib, "import_module", return_value=fake_module), \
-             patch.object(sut.importlib, "reload", return_value=fake_module), \
-             patch.object(sut.unittest, "TestSuite", return_value=fake_suite), \
-             patch.object(sut.unittest.defaultTestLoader, "loadTestsFromModule", return_value=[]):
-
-            ok, summary = self.app._run_preflight_tests_once()
+        with patch.object(sut, "camo_log", fake_log):
+            ok, summary = sut.asyncio.run(self.app._async_run_preflight_via_log())
 
         self.assertFalse(ok)
         self.assertIn("5 tests exécutés", summary)
 
-    def test_run_preflight_tests_once_exception(self) -> None:
-        with patch.object(sut.importlib, "invalidate_caches", side_effect=RuntimeError("boom")):
-            ok, summary = self.app._run_preflight_tests_once()
+    def test_async_run_preflight_via_log_exception(self) -> None:
+        fake_log = types.SimpleNamespace(async_run_preflight_tests=AsyncMock(side_effect=RuntimeError("boom")))
+
+        with patch.object(sut, "camo_log", fake_log):
+            ok, summary = sut.asyncio.run(self.app._async_run_preflight_via_log())
+
         self.assertFalse(ok)
         self.assertIn("RuntimeError", summary)
 
@@ -884,11 +909,11 @@ class TestPreflight(TempDirMixin, unittest.TestCase):
         self.app.tests_ran = True
         self.app.tests_ok = True
 
-        with patch.object(self.app, "_run_preflight_tests_once") as mock_run:
+        with patch.object(self.app.async_runner, "submit") as mock_submit:
             ok = self.app._ensure_preflight_tests()
 
         self.assertTrue(ok)
-        mock_run.assert_not_called()
+        mock_submit.assert_not_called()
 
     def test_ensure_preflight_tests_already_running(self) -> None:
         self.app.preflight_running = True
@@ -897,17 +922,33 @@ class TestPreflight(TempDirMixin, unittest.TestCase):
         self.assertIn("Préflight déjà en cours", self.app.log_view.label.text)
 
     def test_ensure_preflight_tests_starts_background_worker(self) -> None:
-        with patch.object(sut.Clock, "schedule_once", side_effect=lambda cb, dt=0: cb(0)):
-            with patch.object(self.app, "_run_preflight_tests_once", return_value=(True, "12 tests OK")):
-                ok = self.app._ensure_preflight_tests()
-                if self.app.preflight_thread is not None:
-                    self.app.preflight_thread.join(timeout=1.0)
+        class FakeFuture:
+            def __init__(self, result):
+                self._result = result
+                self.callback = None
 
-        self.assertFalse(ok)
+            def add_done_callback(self, cb):
+                self.callback = cb
+
+            def result(self):
+                return self._result
+
+        fake_future = FakeFuture((True, "12 tests OK"))
+
+        with patch.object(sut.Clock, "schedule_once", side_effect=lambda cb, dt=0: cb(0)),              patch.object(self.app.async_runner, "submit", return_value=fake_future) as mock_submit:
+            ok = self.app._ensure_preflight_tests()
+            self.assertFalse(ok)
+            self.assertTrue(self.app.preflight_running)
+            self.assertIs(self.app.preflight_future, fake_future)
+            mock_submit.assert_called_once()
+            fake_future.callback(fake_future)
+
         self.assertTrue(self.app.tests_ran)
         self.assertTrue(self.app.tests_ok)
         self.assertEqual(self.app.tests_summary, "12 tests OK")
         self.assertIn("Préflight OK", self.app.log_view.label.text)
+        self.assertFalse(self.app.preflight_running)
+        self.assertIsNone(self.app.preflight_future)
 
     def test_on_preflight_finished_ok_without_pending_start(self) -> None:
         self.app.preflight_running = True
@@ -946,6 +987,7 @@ class TestPreflight(TempDirMixin, unittest.TestCase):
         mock_start.assert_not_called()
 
 
+
 # ============================================================
 # TESTS DIAGNOSTIC LIVE
 # ============================================================
@@ -953,6 +995,7 @@ class TestPreflight(TempDirMixin, unittest.TestCase):
 class TestLiveDiagnostics(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.app = sut.CamouflageApp()
+        make_ui_methods_sync(self.app)
         self.app.diag_summary_label = make_fake_label()
         self.app.diag_top_rules_label = make_fake_label()
         self.app.diag_last_fail_label = make_fake_label()
@@ -1024,6 +1067,7 @@ class TestStartStopWorkflow(TempDirMixin, unittest.TestCase):
         self.tmpdir = Path(self._tmpdir_obj.name)
 
         self.app = sut.CamouflageApp()
+        make_ui_methods_sync(self.app)
         self.app.current_output_dir = self.tmpdir
         self.app.tests_label = make_fake_label()
         self.app.status_label = make_fake_label()
@@ -1205,6 +1249,7 @@ class TestAdaptivePause(unittest.IsolatedAsyncioTestCase):
 class TestFinishMethods(TempDirMixin, unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.app = sut.CamouflageApp()
+        make_ui_methods_sync(self.app)
         self.app.current_output_dir = self.tmpdir
         self.app.status_label = make_fake_label()
         self.app.log_view = make_fake_log_view()
@@ -1285,6 +1330,7 @@ class TestFinishMethods(TempDirMixin, unittest.IsolatedAsyncioTestCase):
 class TestAsyncWorkerGenerate(TempDirMixin, unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.app = sut.CamouflageApp()
+        make_ui_methods_sync(self.app)
         self.app.current_output_dir = self.tmpdir
         self.app.status_label = make_fake_label()
         self.app.log_view = make_fake_log_view()
