@@ -2232,7 +2232,14 @@ class CamouflageApp(App):
         self.status("Erreur", ok=False)
         self.log(f"Erreur : {message}")
         self.diag_log(f"Erreur diagnostic : {message}")
-        self._emit_runtime("ERROR", "start_worker", "Erreur de génération", message=message, accepted_count=self.accepted_count, total_attempts=self.total_attempts)
+        self._emit_runtime(
+            "ERROR",
+            "start_worker",
+            "Erreur de génération",
+            error_message=message,
+            accepted_count=self.accepted_count,
+            total_attempts=self.total_attempts,
+        )
         self._refresh_controls_state()
 
     # ---------------- UI updates ----------------
