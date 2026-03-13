@@ -2,13 +2,15 @@
 """
 main.py
 Camouflage Armée Fédérale Europe
-Version module-friendly + async-friendly.
+Version module-friendly + async-friendly + accélération contrôlée.
 
 Points clés :
 - API synchrone conservée
 - API asynchrone ajoutée
-- génération séquentielle stricte
+- génération séquentielle stricte par image conservée
 - aucun passage à l'image suivante tant que la précédente n'est pas validée
+- accélération par lots de tentatives parallèles pour une même image
+- critères de validation inchangés
 """
 
 from __future__ import annotations
@@ -16,7 +18,9 @@ from __future__ import annotations
 import asyncio
 import csv
 import math
+import os
 import random
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
@@ -130,6 +134,10 @@ MIN_TRANSITION_TOUCH_PIXELS = 22
 MIN_MICRO_BOUNDARY_COVERAGE = 0.24
 MAX_LOCAL_MASS_RATIO_TRANSITION = 0.72
 
+# Accélération contrôlée
+DEFAULT_MAX_WORKERS = max(1, min(6, (os.cpu_count() or 4) - 1 if (os.cpu_count() or 4) > 1 else 1))
+DEFAULT_ATTEMPT_BATCH_SIZE = max(1, min(4, DEFAULT_MAX_WORKERS))
+
 
 # ============================================================
 # STRUCTURES
@@ -174,18 +182,31 @@ class CandidateResult:
 # OUTILS SYSTÈME
 # ============================================================
 
+_PROCESS_POOL: Optional[ProcessPoolExecutor] = None
+
+
 def ensure_output_dir(output_dir: Path) -> Path:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
 
 
+def get_process_pool(max_workers: Optional[int] = None) -> ProcessPoolExecutor:
+    global _PROCESS_POOL
+    wanted = max(1, int(max_workers or DEFAULT_MAX_WORKERS))
+    if _PROCESS_POOL is None:
+        _PROCESS_POOL = ProcessPoolExecutor(max_workers=wanted)
+    return _PROCESS_POOL
+
+
 # ============================================================
 # PROFIL
 # ============================================================
 
+
 def build_seed(target_index: int, local_attempt: int, base_seed: int = DEFAULT_BASE_SEED) -> int:
     return int(base_seed + target_index * 100000 + local_attempt)
+
 
 
 def make_profile(seed: int) -> VariantProfile:
@@ -214,8 +235,10 @@ def make_profile(seed: int) -> VariantProfile:
 # OUTILS GÉNÉRAUX
 # ============================================================
 
+
 def cm_to_px(cm: float) -> int:
     return max(1, int(round(cm * PX_PER_CM)))
+
 
 
 def compute_ratios(canvas: np.ndarray) -> np.ndarray:
@@ -223,14 +246,17 @@ def compute_ratios(canvas: np.ndarray) -> np.ndarray:
     return counts / canvas.size
 
 
+
 def render_canvas(canvas: np.ndarray) -> Image.Image:
     return Image.fromarray(RGB[canvas], "RGB")
+
 
 
 def rotate(x: float, y: float, deg: float) -> Tuple[float, float]:
     a = math.radians(deg)
     c, s = math.cos(a), math.sin(a)
     return x * c - y * s, x * s + y * c
+
 
 
 def choose_biased_center(rng: random.Random) -> Tuple[int, int]:
@@ -243,10 +269,30 @@ def choose_biased_center(rng: random.Random) -> Tuple[int, int]:
     return x, y
 
 
+
 def polygon_mask(poly: Sequence[Tuple[float, float]]) -> np.ndarray:
-    img = Image.new("L", (WIDTH, HEIGHT), 0)
-    ImageDraw.Draw(img).polygon(poly, fill=255)
-    return np.array(img, dtype=np.uint8) > 0
+    xs = [p[0] for p in poly]
+    ys = [p[1] for p in poly]
+    min_x = max(0, int(math.floor(min(xs))) - 2)
+    max_x = min(WIDTH - 1, int(math.ceil(max(xs))) + 2)
+    min_y = max(0, int(math.floor(min(ys))) - 2)
+    max_y = min(HEIGHT - 1, int(math.ceil(max(ys))) + 2)
+
+    if min_x > max_x or min_y > max_y:
+        return np.zeros((HEIGHT, WIDTH), dtype=bool)
+
+    local_w = max_x - min_x + 1
+    local_h = max_y - min_y + 1
+    local_poly = [(x - min_x, y - min_y) for x, y in poly]
+
+    img = Image.new("L", (local_w, local_h), 0)
+    ImageDraw.Draw(img).polygon(local_poly, fill=255)
+    local_mask = np.array(img, dtype=np.uint8) > 0
+
+    full = np.zeros((HEIGHT, WIDTH), dtype=bool)
+    full[min_y : max_y + 1, min_x : max_x + 1] = local_mask
+    return full
+
 
 
 def compute_boundary_mask(canvas: np.ndarray) -> np.ndarray:
@@ -257,6 +303,7 @@ def compute_boundary_mask(canvas: np.ndarray) -> np.ndarray:
     diff[:, 1:] |= (canvas[:, 1:] != canvas[:, :-1])
     diff[:, :-1] |= (canvas[:, :-1] != canvas[:, 1:])
     return diff
+
 
 
 def dilate_mask(mask: np.ndarray, radius: int = 1) -> np.ndarray:
@@ -278,6 +325,7 @@ def dilate_mask(mask: np.ndarray, radius: int = 1) -> np.ndarray:
     return out
 
 
+
 def local_color_variety(canvas: np.ndarray, x: int, y: int, radius: int = 2) -> int:
     h, w = canvas.shape
     y1, y2 = max(0, y - radius), min(h, y + radius + 1)
@@ -285,12 +333,15 @@ def local_color_variety(canvas: np.ndarray, x: int, y: int, radius: int = 2) -> 
     return len(np.unique(canvas[y1:y2, x1:x2]))
 
 
+
 def downsample_nearest(canvas: np.ndarray, factor: int) -> np.ndarray:
     return canvas[::factor, ::factor]
 
 
+
 def boundary_density(canvas: np.ndarray) -> float:
     return float(np.mean(compute_boundary_mask(canvas)))
+
 
 
 def mirror_similarity_score(canvas: np.ndarray) -> float:
@@ -301,6 +352,7 @@ def mirror_similarity_score(canvas: np.ndarray) -> float:
     h = min(left.shape[0], right_flipped.shape[0])
     w = min(left.shape[1], right_flipped.shape[1])
     return float(np.mean(left[:h, :w] == right_flipped[:h, :w]))
+
 
 
 def infer_origin_from_neighbors(
@@ -334,6 +386,7 @@ def infer_origin_from_neighbors(
 # ZONES ANATOMIQUES
 # ============================================================
 
+
 def anatomy_zone_masks() -> Dict[str, np.ndarray]:
     zones = {}
     zones["left_shoulder"] = rect_mask(0.02, 0.26, 0.02, 0.18)
@@ -344,6 +397,7 @@ def anatomy_zone_masks() -> Dict[str, np.ndarray]:
     zones["right_thigh"] = rect_mask(0.58, 0.80, 0.62, 0.96)
     zones["center_torso"] = rect_mask(0.30, 0.70, 0.18, 0.62)
     return zones
+
 
 
 def rect_mask(x1: float, x2: float, y1: float, y2: float) -> np.ndarray:
@@ -357,15 +411,18 @@ def rect_mask(x1: float, x2: float, y1: float, y2: float) -> np.ndarray:
 
 
 ANATOMY_ZONES = anatomy_zone_masks()
+ANATOMY_ZONE_VALUES = tuple(ANATOMY_ZONES.values())
+
 
 
 def macro_zone_count(mask: np.ndarray) -> int:
     count = 0
-    for zone_mask in ANATOMY_ZONES.values():
+    for zone_mask in ANATOMY_ZONE_VALUES:
         overlap = int((mask & zone_mask).sum())
         if overlap >= 600:
             count += 1
     return count
+
 
 
 def center_empty_ratio(canvas: np.ndarray) -> float:
@@ -377,6 +434,7 @@ def center_empty_ratio(canvas: np.ndarray) -> float:
 # ANALYSE MORPHOLOGIQUE
 # ============================================================
 
+
 def largest_component_ratio(mask: np.ndarray) -> float:
     h, w = mask.shape
     total = int(mask.sum())
@@ -387,8 +445,10 @@ def largest_component_ratio(mask: np.ndarray) -> float:
     best = 0
 
     for y in range(h):
+        row = mask[y]
+        row_visited = visited[y]
         for x in range(w):
-            if not mask[y, x] or visited[y, x]:
+            if not row[x] or row_visited[x]:
                 continue
 
             stack = [(y, x)]
@@ -418,6 +478,7 @@ def largest_component_ratio(mask: np.ndarray) -> float:
     return best / total
 
 
+
 def orientation_score(macro_records: Sequence[MacroRecord]) -> Dict[str, float]:
     if not macro_records:
         return {"oblique_share": 0.0, "vertical_share": 0.0, "dominance_ratio": 1.0}
@@ -436,6 +497,7 @@ def orientation_score(macro_records: Sequence[MacroRecord]) -> Dict[str, float]:
         "vertical_share": vertical_share,
         "dominance_ratio": dominance_ratio,
     }
+
 
 
 def visible_origin_shares(canvas: np.ndarray, origin_map: np.ndarray) -> Dict[str, float]:
@@ -459,6 +521,7 @@ def visible_origin_shares(canvas: np.ndarray, origin_map: np.ndarray) -> Dict[st
 # ============================================================
 # FORMES
 # ============================================================
+
 
 def jagged_spine_poly(
     rng: random.Random,
@@ -494,6 +557,7 @@ def jagged_spine_poly(
     poly = left + right[::-1]
     rot = [rotate(x, y, angle_from_vertical_deg - 90) for x, y in poly]
     return [(cx + x, cy + y) for x, y in rot]
+
 
 
 def attached_transition(
@@ -538,8 +602,10 @@ def attached_transition(
 # CONTRÔLES STRUCTURELS
 # ============================================================
 
+
 def angle_distance_deg(a: int, b: int) -> int:
     return abs(a - b)
+
 
 
 def local_parallel_conflict(
@@ -564,9 +630,11 @@ def local_parallel_conflict(
     return nearby_same >= 2
 
 
+
 def transition_is_attached(parent_mask: np.ndarray, transition_mask: np.ndarray, min_touch_pixels: int = MIN_TRANSITION_TOUCH_PIXELS) -> bool:
     contact = dilate_mask(parent_mask, radius=1) & transition_mask
     return int(contact.sum()) >= min_touch_pixels
+
 
 
 def micro_is_on_boundary(boundary: np.ndarray, micro_mask: np.ndarray, min_boundary_coverage: float = MIN_MICRO_BOUNDARY_COVERAGE) -> bool:
@@ -575,6 +643,7 @@ def micro_is_on_boundary(boundary: np.ndarray, micro_mask: np.ndarray, min_bound
         return False
     cov = float(np.mean(boundary[micro_mask]))
     return cov >= min_boundary_coverage
+
 
 
 def creates_new_mass(
@@ -604,9 +673,11 @@ def creates_new_mass(
 # COUCHES
 # ============================================================
 
+
 def apply_mask(canvas: np.ndarray, origin_map: np.ndarray, mask: np.ndarray, color_idx: int, origin_code: int) -> None:
     canvas[mask] = color_idx
     origin_map[mask] = origin_code
+
 
 
 def add_macros(
@@ -719,6 +790,7 @@ def add_macros(
     return macros
 
 
+
 def add_transitions(
     canvas: np.ndarray,
     origin_map: np.ndarray,
@@ -779,6 +851,7 @@ def add_transitions(
             continue
 
         apply_mask(canvas, origin_map, mask, color, ORIGIN_TRANSITION)
+
 
 
 def add_micro_clusters(
@@ -858,6 +931,7 @@ def add_micro_clusters(
             break
 
 
+
 def nudge_proportions(canvas: np.ndarray, origin_map: np.ndarray, rng: random.Random) -> None:
     h, w = canvas.shape
 
@@ -914,6 +988,7 @@ def nudge_proportions(canvas: np.ndarray, origin_map: np.ndarray, rng: random.Ra
 # MÉTRIQUES MULTI-ÉCHELLE
 # ============================================================
 
+
 def multiscale_metrics(canvas: np.ndarray) -> Dict[str, float]:
     small = downsample_nearest(canvas, 4)
     tiny = downsample_nearest(canvas, 8)
@@ -924,6 +999,7 @@ def multiscale_metrics(canvas: np.ndarray) -> Dict[str, float]:
         "center_empty_ratio_small": center_empty_ratio_upscaled_proxy(small),
         "largest_olive_component_ratio_small": largest_component_ratio(small == IDX_OLIVE),
     }
+
 
 
 def center_empty_ratio_upscaled_proxy(canvas_small: np.ndarray) -> float:
@@ -939,6 +1015,7 @@ def center_empty_ratio_upscaled_proxy(canvas_small: np.ndarray) -> float:
 # ============================================================
 # GÉNÉRATION D'UNE VARIANTE
 # ============================================================
+
 
 def generate_one_variant(profile: VariantProfile) -> Tuple[Image.Image, np.ndarray, Dict[str, float]]:
     rng = random.Random(profile.seed)
@@ -977,6 +1054,7 @@ def generate_one_variant(profile: VariantProfile) -> Tuple[Image.Image, np.ndarr
     return render_canvas(canvas), rs, metrics
 
 
+
 def generate_candidate_from_seed(seed: int) -> CandidateResult:
     profile = make_profile(seed)
     image, ratios, metrics = generate_one_variant(profile)
@@ -996,6 +1074,7 @@ async def async_generate_candidate_from_seed(seed: int) -> CandidateResult:
 # ============================================================
 # VALIDATION
 # ============================================================
+
 
 def variant_is_valid(rs: np.ndarray, metrics: Dict[str, float]) -> bool:
     abs_err = np.abs(rs - TARGET)
@@ -1059,6 +1138,7 @@ def variant_is_valid(rs: np.ndarray, metrics: Dict[str, float]) -> bool:
     return True
 
 
+
 def validate_candidate_result(candidate: CandidateResult) -> bool:
     return variant_is_valid(candidate.ratios, candidate.metrics)
 
@@ -1071,6 +1151,7 @@ async def async_validate_candidate_result(candidate: CandidateResult) -> bool:
 # EXPORT / API
 # ============================================================
 
+
 def save_candidate_image(candidate: CandidateResult, path: Path) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1080,6 +1161,7 @@ def save_candidate_image(candidate: CandidateResult, path: Path) -> Path:
 
 async def async_save_candidate_image(candidate: CandidateResult, path: Path) -> Path:
     return await asyncio.to_thread(save_candidate_image, candidate, path)
+
 
 
 def candidate_row(
@@ -1120,6 +1202,7 @@ def candidate_row(
     }
 
 
+
 def write_report(rows: List[Dict[str, object]], output_dir: Path, filename: str = "rapport_camouflages.csv") -> Path:
     output_dir = ensure_output_dir(output_dir)
     csv_path = output_dir / filename
@@ -1141,8 +1224,28 @@ async def async_write_report(rows: List[Dict[str, object]], output_dir: Path, fi
 
 
 # ============================================================
+# AIDES PARALLÉLISATION DES TENTATIVES
+# ============================================================
+
+
+def generate_and_validate_from_seed(seed: int) -> Tuple[CandidateResult, bool]:
+    candidate = generate_candidate_from_seed(seed)
+    accepted = validate_candidate_result(candidate)
+    return candidate, accepted
+
+
+
+def _batch_attempt_seeds(target_index: int, start_attempt: int, batch_size: int, base_seed: int) -> List[Tuple[int, int]]:
+    return [
+        (local_attempt, build_seed(target_index, local_attempt, base_seed=base_seed))
+        for local_attempt in range(start_attempt, start_attempt + batch_size)
+    ]
+
+
+# ============================================================
 # GÉNÉRATION SÉQUENTIELLE SYNCHRONE
 # ============================================================
+
 
 def generate_all(
     target_count: int = N_VARIANTS_REQUIRED,
@@ -1152,49 +1255,81 @@ def generate_all(
         Callable[[int, int, int, int, CandidateResult, bool], None]
     ] = None,
     stop_requested: Optional[Callable[[], bool]] = None,
+    max_workers: int = DEFAULT_MAX_WORKERS,
+    attempt_batch_size: int = DEFAULT_ATTEMPT_BATCH_SIZE,
+    parallel_attempts: bool = True,
 ) -> List[Dict[str, object]]:
     output_dir = ensure_output_dir(output_dir)
 
     rows: List[Dict[str, object]] = []
     total_attempts = 0
+    max_workers = max(1, int(max_workers))
+    attempt_batch_size = max(1, int(attempt_batch_size))
+    use_parallel = parallel_attempts and max_workers > 1 and attempt_batch_size > 1
+    pool = get_process_pool(max_workers) if use_parallel else None
 
     for target_index in range(1, target_count + 1):
-        local_attempt = 0
+        local_attempt = 1
 
         while True:
             if stop_requested is not None and stop_requested():
                 write_report(rows, output_dir)
                 return rows
 
-            total_attempts += 1
-            local_attempt += 1
+            if use_parallel and pool is not None:
+                batch = _batch_attempt_seeds(target_index, local_attempt, attempt_batch_size, base_seed)
+                futures = [pool.submit(generate_and_validate_from_seed, seed) for _, seed in batch]
+                batch_results: List[Tuple[int, CandidateResult, bool]] = []
+                for (attempt_no, _seed), fut in zip(batch, futures):
+                    candidate, accepted = fut.result()
+                    total_attempts += 1
+                    batch_results.append((attempt_no, candidate, accepted))
+                    if progress_callback is not None:
+                        progress_callback(
+                            target_index,
+                            attempt_no,
+                            total_attempts,
+                            target_count,
+                            candidate,
+                            accepted,
+                        )
 
-            seed = build_seed(target_index, local_attempt, base_seed=base_seed)
-            candidate = generate_candidate_from_seed(seed)
-            accepted = validate_candidate_result(candidate)
+                accepted_result = next(((a, c) for a, c, ok in batch_results if ok), None)
+                if accepted_result is None:
+                    local_attempt += attempt_batch_size
+                    continue
 
-            if progress_callback is not None:
-                progress_callback(
-                    target_index,
-                    local_attempt,
-                    total_attempts,
-                    target_count,
-                    candidate,
-                    accepted,
-                )
+                accepted_attempt, accepted_candidate = accepted_result
+            else:
+                seed = build_seed(target_index, local_attempt, base_seed=base_seed)
+                accepted_candidate = generate_candidate_from_seed(seed)
+                accepted = validate_candidate_result(accepted_candidate)
+                total_attempts += 1
 
-            if not accepted:
-                continue
+                if progress_callback is not None:
+                    progress_callback(
+                        target_index,
+                        local_attempt,
+                        total_attempts,
+                        target_count,
+                        accepted_candidate,
+                        accepted,
+                    )
+
+                if not accepted:
+                    local_attempt += 1
+                    continue
+                accepted_attempt = local_attempt
 
             filename = output_dir / f"camouflage_{target_index:03d}.png"
-            save_candidate_image(candidate, filename)
+            save_candidate_image(accepted_candidate, filename)
 
             rows.append(
                 candidate_row(
                     target_index=target_index,
-                    local_attempt=local_attempt,
+                    local_attempt=accepted_attempt,
                     global_attempt=total_attempts,
-                    candidate=candidate,
+                    candidate=accepted_candidate,
                 )
             )
             break
@@ -1217,57 +1352,94 @@ async def async_generate_all(
     base_seed: int = DEFAULT_BASE_SEED,
     progress_callback: Optional[AsyncProgressCallback] = None,
     stop_requested: Optional[AsyncStopCallable] = None,
+    max_workers: int = DEFAULT_MAX_WORKERS,
+    attempt_batch_size: int = DEFAULT_ATTEMPT_BATCH_SIZE,
+    parallel_attempts: bool = True,
 ) -> List[Dict[str, object]]:
     """
     Version asynchrone séquentielle stricte.
 
     Important :
     - l'image N+1 ne commence jamais tant que N n'est pas validée ;
-    - chaque tentative CPU-bound est déportée avec asyncio.to_thread(...).
+    - chaque image courante peut toutefois tester plusieurs seeds en parallèle ;
+    - la première tentative valide dans l'ordre logique est conservée.
     """
     output_dir = ensure_output_dir(output_dir)
 
     rows: List[Dict[str, object]] = []
     total_attempts = 0
+    max_workers = max(1, int(max_workers))
+    attempt_batch_size = max(1, int(attempt_batch_size))
+    use_parallel = parallel_attempts and max_workers > 1 and attempt_batch_size > 1
+    loop = asyncio.get_running_loop()
+    pool = get_process_pool(max_workers) if use_parallel else None
 
     for target_index in range(1, target_count + 1):
-        local_attempt = 0
+        local_attempt = 1
 
         while True:
-            if stop_requested is not None:
-                if await stop_requested():
-                    await async_write_report(rows, output_dir)
-                    return rows
+            if stop_requested is not None and await stop_requested():
+                await async_write_report(rows, output_dir)
+                return rows
 
-            total_attempts += 1
-            local_attempt += 1
+            if use_parallel and pool is not None:
+                batch = _batch_attempt_seeds(target_index, local_attempt, attempt_batch_size, base_seed)
+                tasks = [
+                    loop.run_in_executor(pool, generate_and_validate_from_seed, seed)
+                    for _, seed in batch
+                ]
+                raw_results = await asyncio.gather(*tasks)
 
-            seed = build_seed(target_index, local_attempt, base_seed=base_seed)
-            candidate = await async_generate_candidate_from_seed(seed)
-            accepted = await async_validate_candidate_result(candidate)
+                batch_results: List[Tuple[int, CandidateResult, bool]] = []
+                for (attempt_no, _seed), (candidate, accepted) in zip(batch, raw_results):
+                    total_attempts += 1
+                    batch_results.append((attempt_no, candidate, accepted))
+                    if progress_callback is not None:
+                        await progress_callback(
+                            target_index,
+                            attempt_no,
+                            total_attempts,
+                            target_count,
+                            candidate,
+                            accepted,
+                        )
 
-            if progress_callback is not None:
-                await progress_callback(
-                    target_index,
-                    local_attempt,
-                    total_attempts,
-                    target_count,
-                    candidate,
-                    accepted,
-                )
+                accepted_result = next(((a, c) for a, c, ok in batch_results if ok), None)
+                if accepted_result is None:
+                    local_attempt += attempt_batch_size
+                    continue
 
-            if not accepted:
-                continue
+                accepted_attempt, accepted_candidate = accepted_result
+            else:
+                seed = build_seed(target_index, local_attempt, base_seed=base_seed)
+                accepted_candidate = await async_generate_candidate_from_seed(seed)
+                accepted = await async_validate_candidate_result(accepted_candidate)
+                total_attempts += 1
+
+                if progress_callback is not None:
+                    await progress_callback(
+                        target_index,
+                        local_attempt,
+                        total_attempts,
+                        target_count,
+                        accepted_candidate,
+                        accepted,
+                    )
+
+                if not accepted:
+                    local_attempt += 1
+                    continue
+                accepted_attempt = local_attempt
 
             filename = output_dir / f"camouflage_{target_index:03d}.png"
-            await async_save_candidate_image(candidate, filename)
+            await async_save_candidate_image(accepted_candidate, filename)
 
             rows.append(
                 candidate_row(
                     target_index=target_index,
-                    local_attempt=local_attempt,
+                    local_attempt=accepted_attempt,
                     global_attempt=total_attempts,
-                    candidate=candidate,
+                    candidate=accepted_candidate,
                 )
             )
             break
