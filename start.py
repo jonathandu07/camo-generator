@@ -1087,7 +1087,6 @@ class CamouflageApp(App):
         Window.clearcolor = C["bg_root"]
         root = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(10))
 
-        # Header
         header = GlassCard(orientation="horizontal", size_hint_y=None, height=dp(132))
 
         title_box = BoxLayout(orientation="vertical", spacing=dp(2))
@@ -1132,9 +1131,6 @@ class CamouflageApp(App):
 
         body = BoxLayout(spacing=dp(10))
 
-        # --------------------------------------------------
-        # Colonne gauche scrollable
-        # --------------------------------------------------
         left = BoxLayout(orientation="vertical", size_hint_x=0.34, spacing=dp(10))
 
         left_scroll = ScrollView(do_scroll_x=False, bar_width=dp(8))
@@ -1231,9 +1227,6 @@ class CamouflageApp(App):
         left_scroll.add_widget(left_content)
         left.add_widget(left_scroll)
 
-        # --------------------------------------------------
-        # Colonne droite
-        # --------------------------------------------------
         right = BoxLayout(orientation="vertical", spacing=dp(10))
 
         previews = BoxLayout(spacing=dp(10), size_hint_y=0.46)
@@ -1336,7 +1329,7 @@ class CamouflageApp(App):
             self.tests_label.color = C["text_soft"]
 
     def _run_preflight_tests_once(self) -> Tuple[bool, str]:
-        try:
+        def _worker() -> Tuple[bool, str]:
             importlib.invalidate_caches()
 
             suite = unittest.TestSuite()
@@ -1363,8 +1356,31 @@ class CamouflageApp(App):
 
             return ok, summary
 
-        except Exception as exc:
-            return False, f"Impossible d'exécuter les tests : {exc}"
+        try:
+            box: Dict[str, Tuple[bool, str]] = {}
+            err: Dict[str, BaseException] = {}
+
+            def runner() -> None:
+                try:
+                    box["value"] = _worker()
+                except BaseException as exc:
+                    err["value"] = exc
+
+            th = threading.Thread(
+                target=runner,
+                daemon=True,
+                name="preflight-tests",
+            )
+            th.start()
+            th.join()
+
+            if "value" in err:
+                raise err["value"]
+
+            return box.get("value", (False, "Préflight sans résultat."))
+
+        except BaseException as exc:
+            return False, f"Impossible d'exécuter les tests : {type(exc).__name__}: {exc}"
 
     def _ensure_preflight_tests(self) -> bool:
         if self.tests_ran and self.tests_ok:
