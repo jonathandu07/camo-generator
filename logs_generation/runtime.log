@@ -1,0 +1,2 @@
+2026-03-13 12:45:28 | INFO     | camo_log | [tests] Début préflight asynchrone | payload={"modules": ["test_main"], "parallel": true}
+2026-03-13 12:45:28 | INFO     | camo_log | [tests] Lancement module de test | payload={"command": ["C:\\Python312\\python.exe", "-m", "unittest", "-v", "test_main"], "module": "test_main"}
