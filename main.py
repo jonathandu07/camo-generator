@@ -250,7 +250,8 @@ def polygon_mask(poly: Sequence[Tuple[float, float]]) -> np.ndarray:
 
 
 def compute_boundary_mask(canvas: np.ndarray) -> np.ndarray:
-    diff = np.zeros((HEIGHT, WIDTH), dtype=bool)
+    h, w = canvas.shape
+    diff = np.zeros((h, w), dtype=bool)
     diff[1:, :] |= (canvas[1:, :] != canvas[:-1, :])
     diff[:-1, :] |= (canvas[:-1, :] != canvas[1:, :])
     diff[:, 1:] |= (canvas[:, 1:] != canvas[:, :-1])
@@ -259,8 +260,8 @@ def compute_boundary_mask(canvas: np.ndarray) -> np.ndarray:
 
 
 def dilate_mask(mask: np.ndarray, radius: int = 1) -> np.ndarray:
-    out = np.zeros_like(mask, dtype=bool)
     h, w = mask.shape
+    out = np.zeros_like(mask, dtype=bool)
     for dy in range(-radius, radius + 1):
         for dx in range(-radius, radius + 1):
             y1 = max(0, dy)
@@ -278,8 +279,9 @@ def dilate_mask(mask: np.ndarray, radius: int = 1) -> np.ndarray:
 
 
 def local_color_variety(canvas: np.ndarray, x: int, y: int, radius: int = 2) -> int:
-    y1, y2 = max(0, y - radius), min(HEIGHT, y + radius + 1)
-    x1, x2 = max(0, x - radius), min(WIDTH, x + radius + 1)
+    h, w = canvas.shape
+    y1, y2 = max(0, y - radius), min(h, y + radius + 1)
+    x1, x2 = max(0, x - radius), min(w, x + radius + 1)
     return len(np.unique(canvas[y1:y2, x1:x2]))
 
 
@@ -309,8 +311,9 @@ def infer_origin_from_neighbors(
     chosen_color: int,
     fallback_origin: int,
 ) -> int:
-    y1, y2 = max(0, y - 2), min(canvas.shape[0], y + 3)
-    x1, x2 = max(0, x - 2), min(canvas.shape[1], x + 3)
+    h, w = canvas.shape
+    y1, y2 = max(0, y - 2), min(h, y + 3)
+    x1, x2 = max(0, x - 2), min(w, x + 3)
 
     neigh_colors = canvas[y1:y2, x1:x2]
     neigh_origins = origin_map[y1:y2, x1:x2]
@@ -574,15 +577,22 @@ def micro_is_on_boundary(boundary: np.ndarray, micro_mask: np.ndarray, min_bound
     return cov >= min_boundary_coverage
 
 
-def creates_new_mass(canvas: np.ndarray, new_mask: np.ndarray, color_idx: int, local_radius: int = 45, max_local_area_ratio: float = MAX_LOCAL_MASS_RATIO_TRANSITION) -> bool:
+def creates_new_mass(
+    canvas: np.ndarray,
+    new_mask: np.ndarray,
+    color_idx: int,
+    local_radius: int = 45,
+    max_local_area_ratio: float = MAX_LOCAL_MASS_RATIO_TRANSITION,
+) -> bool:
+    h, w = canvas.shape
     ys, xs = np.where(new_mask)
     if len(xs) == 0:
         return False
 
     x1 = max(0, int(xs.min()) - local_radius)
-    x2 = min(WIDTH, int(xs.max()) + local_radius + 1)
+    x2 = min(w, int(xs.max()) + local_radius + 1)
     y1 = max(0, int(ys.min()) - local_radius)
-    y2 = min(HEIGHT, int(ys.max()) + local_radius + 1)
+    y2 = min(h, int(ys.max()) + local_radius + 1)
 
     local_existing = canvas[y1:y2, x1:x2]
     local_new = new_mask[y1:y2, x1:x2]
@@ -849,6 +859,8 @@ def add_micro_clusters(
 
 
 def nudge_proportions(canvas: np.ndarray, origin_map: np.ndarray, rng: random.Random) -> None:
+    h, w = canvas.shape
+
     for _ in range(BOUNDARY_NUDGE_PASSES):
         rs = compute_ratios(canvas)
         deficits = TARGET - rs
@@ -861,7 +873,11 @@ def nudge_proportions(canvas: np.ndarray, origin_map: np.ndarray, rng: random.Ra
         if len(xs) == 0:
             break
 
-        picks = np.random.permutation(len(xs))[: min(len(xs), int(canvas.size * BOUNDARY_NUDGE_SAMPLE_RATIO))]
+        sample_count = min(len(xs), int(canvas.size * BOUNDARY_NUDGE_SAMPLE_RATIO))
+        if sample_count <= 0:
+            break
+
+        picks = np.random.permutation(len(xs))[:sample_count]
 
         for j in picks:
             x = int(xs[j])
@@ -877,8 +893,8 @@ def nudge_proportions(canvas: np.ndarray, origin_map: np.ndarray, rng: random.Ra
 
             chosen = int(wanted[np.argmax(deficits[wanted])])
 
-            y1, y2 = max(0, y - 2), min(HEIGHT, y + 3)
-            x1, x2 = max(0, x - 2), min(WIDTH, x + 3)
+            y1, y2 = max(0, y - 2), min(h, y + 3)
+            x1, x2 = max(0, x - 2), min(w, x + 3)
             neigh = canvas[y1:y2, x1:x2]
 
             if chosen not in neigh and rng.random() < 0.72:
@@ -974,10 +990,6 @@ def generate_candidate_from_seed(seed: int) -> CandidateResult:
 
 
 async def async_generate_candidate_from_seed(seed: int) -> CandidateResult:
-    """
-    Version asynchrone correcte pour travail CPU-bound :
-    exécution dans un thread.
-    """
     return await asyncio.to_thread(generate_candidate_from_seed, seed)
 
 
@@ -1111,7 +1123,9 @@ def candidate_row(
 def write_report(rows: List[Dict[str, object]], output_dir: Path, filename: str = "rapport_camouflages.csv") -> Path:
     output_dir = ensure_output_dir(output_dir)
     csv_path = output_dir / filename
+
     if not rows:
+        csv_path.write_text("", encoding="utf-8")
         return csv_path
 
     with csv_path.open("w", newline="", encoding="utf-8") as f:
