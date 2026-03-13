@@ -9,7 +9,8 @@ Rôles principaux :
 - exposer une API sync/async stable pour start.py ;
 - lancer les préflight tests unitaires (test_main.py, test_start.py) ;
 - agréger des logs runtime continus dans des fichiers dédiés ;
-- exporter des diagnostics exploitables pour main.py et start.py.
+- exporter des diagnostics exploitables pour main.py et start.py ;
+- permettre un suivi console en direct des tests et des diagnostics.
 
 Sorties principales :
 - logs_generation/diagnostic_candidates.csv
@@ -17,9 +18,13 @@ Sorties principales :
 - logs_generation/diagnostic_summary.txt
 - logs_generation/runtime.log
 - logs_generation/tests_summary.json
+- logs_generation/runtime_snapshot.json
 """
 
 from __future__ import annotations
+
+import os
+os.environ.setdefault("KIVY_NO_ARGS", "1")
 
 import argparse
 import asyncio
@@ -27,7 +32,6 @@ import csv
 import importlib
 import json
 import logging
-import os
 import statistics
 import subprocess
 import sys
@@ -38,7 +42,7 @@ from collections import Counter, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Deque, Dict, List, Optional, Sequence
+from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
 
@@ -57,6 +61,8 @@ DEFAULT_TEST_SUMMARY_FILE = "tests_summary.json"
 DEFAULT_HISTORY_LIMIT = 5000
 DEFAULT_MAX_CONCURRENCY = max(1, min(4, (os.cpu_count() or 4)))
 DEFAULT_TEST_TIMEOUT_S = 180.0
+DEFAULT_LIVE_CONSOLE = True
+DEFAULT_CONSOLE_LEVEL = "INFO"
 
 LOGGER_NAME = "camo_log"
 
@@ -175,6 +181,10 @@ class TestModuleSummary:
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "TestModuleSummary":
+        return cls(**data)
+
 
 @dataclass
 class TestRunSummary:
@@ -209,6 +219,15 @@ class TestRunSummary:
         data = asdict(self)
         data["per_module"] = [m.to_dict() for m in self.per_module]
         return data
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "TestRunSummary":
+        copied = dict(data)
+        copied["per_module"] = [
+            item if isinstance(item, TestModuleSummary) else TestModuleSummary.from_dict(item)
+            for item in copied.get("per_module", [])
+        ]
+        return cls(**copied)
 
 
 # ============================================================
@@ -261,6 +280,20 @@ def _normalize_module_names(module_names: Sequence[str] | None) -> List[str]:
 
 def _should_block_on_tests(summary: TestRunSummary) -> bool:
     return (not summary.ok) or (not summary.completed) or summary.timed_out
+
+
+def _subprocess_env() -> Dict[str, str]:
+    env = os.environ.copy()
+    env["KIVY_NO_ARGS"] = "1"
+    return env
+
+
+def _coerce_test_run_summary(value: Any) -> TestRunSummary:
+    if isinstance(value, TestRunSummary):
+        return value
+    if isinstance(value, dict):
+        return TestRunSummary.from_dict(value)
+    raise TypeError(f"Impossible de convertir en TestRunSummary: {type(value)!r}")
 
 
 # ============================================================
@@ -375,6 +408,21 @@ def get_recent_runtime_lines(n: int = 50) -> List[str]:
 
 def get_runtime_snapshot(n: int = 200) -> List[Dict[str, Any]]:
     return LOG_MANAGER.snapshot(n)
+
+
+def attach_live_console_printer(min_level: str = DEFAULT_CONSOLE_LEVEL) -> Callable[[RuntimeEvent], None]:
+    min_value = getattr(logging, str(min_level).upper(), logging.INFO)
+    print_lock = threading.Lock()
+
+    def _printer(event: RuntimeEvent) -> None:
+        level_value = getattr(logging, str(event.level).upper(), logging.INFO)
+        if level_value < min_value:
+            return
+        with print_lock:
+            print(event.format_line(), flush=True)
+
+    LOG_MANAGER.subscribe(_printer)
+    return _printer
 
 
 # ============================================================
@@ -599,8 +647,27 @@ async def async_analyze_candidate(
 
 def _generate_one_diagnostic(i: int, base_seed: int) -> CandidateDiagnostic:
     seed = camo.build_seed(target_index=1, local_attempt=i, base_seed=base_seed)
+    t0 = time.perf_counter()
+    log_event("INFO", "generate_diagnostics", "Début génération candidat", index=i, seed=seed)
     candidate = camo.generate_candidate_from_seed(seed)
-    return analyze_candidate(candidate, target_index=1, local_attempt=i)
+    log_event(
+        "INFO",
+        "generate_diagnostics",
+        "Fin génération candidat",
+        index=i,
+        seed=seed,
+        duration_s=round(time.perf_counter() - t0, 6),
+    )
+    diagnostic = analyze_candidate(candidate, target_index=1, local_attempt=i)
+    log_event(
+        "INFO",
+        "generate_diagnostics",
+        "Diagnostic candidat terminé",
+        index=i,
+        seed=seed,
+        accepted=diagnostic.accepted,
+    )
+    return diagnostic
 
 
 def generate_diagnostics(
@@ -630,6 +697,13 @@ def generate_diagnostics(
     if not parallel or count == 1:
         for i in range(1, count + 1):
             diagnostics.append(_generate_one_diagnostic(i, base_seed))
+            log_event(
+                "INFO",
+                "generate_diagnostics",
+                "Progression diagnostics",
+                completed=len(diagnostics),
+                total=count,
+            )
     else:
         ordered: Dict[int, CandidateDiagnostic] = {}
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="diag") as executor:
@@ -637,6 +711,14 @@ def generate_diagnostics(
             for future in as_completed(futures):
                 idx = futures[future]
                 ordered[idx] = future.result()
+                log_event(
+                    "INFO",
+                    "generate_diagnostics",
+                    "Progression diagnostics parallèles",
+                    completed=len(ordered),
+                    total=count,
+                    last_index=idx,
+                )
         diagnostics = [ordered[i] for i in range(1, count + 1)]
 
     log_event(
@@ -672,14 +754,41 @@ async def async_generate_diagnostics(
         await async_log_event("INFO", "async_generate_diagnostics", "Fin diagnostic asynchrone", count=0)
         return []
 
+    async def _one_logged(i: int) -> CandidateDiagnostic:
+        seed = camo.build_seed(target_index=1, local_attempt=i, base_seed=base_seed)
+        t0 = time.perf_counter()
+        await async_log_event("INFO", "async_generate_diagnostics", "Début génération candidat", index=i, seed=seed)
+        candidate = await camo.async_generate_candidate_from_seed(seed)
+        await async_log_event(
+            "INFO",
+            "async_generate_diagnostics",
+            "Fin génération candidat",
+            index=i,
+            seed=seed,
+            duration_s=round(time.perf_counter() - t0, 6),
+        )
+        diagnostic = await async_analyze_candidate(candidate, target_index=1, local_attempt=i)
+        await async_log_event(
+            "INFO",
+            "async_generate_diagnostics",
+            "Diagnostic candidat terminé",
+            index=i,
+            seed=seed,
+            accepted=diagnostic.accepted,
+        )
+        return diagnostic
+
     if not parallel or count == 1:
         diagnostics: List[CandidateDiagnostic] = []
         for i in range(1, count + 1):
-            seed = camo.build_seed(target_index=1, local_attempt=i, base_seed=base_seed)
-            candidate = await camo.async_generate_candidate_from_seed(seed)
-            diagnostic = await async_analyze_candidate(candidate, target_index=1, local_attempt=i)
-            diagnostics.append(diagnostic)
-
+            diagnostics.append(await _one_logged(i))
+            await async_log_event(
+                "INFO",
+                "async_generate_diagnostics",
+                "Progression diagnostics",
+                completed=len(diagnostics),
+                total=count,
+            )
         await async_log_event(
             "INFO",
             "async_generate_diagnostics",
@@ -692,10 +801,16 @@ async def async_generate_diagnostics(
     sem = asyncio.Semaphore(max_concurrency)
 
     async def one(i: int) -> tuple[int, CandidateDiagnostic]:
-        seed = camo.build_seed(target_index=1, local_attempt=i, base_seed=base_seed)
         async with sem:
-            candidate = await camo.async_generate_candidate_from_seed(seed)
-            diagnostic = await async_analyze_candidate(candidate, target_index=1, local_attempt=i)
+            diagnostic = await _one_logged(i)
+            await async_log_event(
+                "INFO",
+                "async_generate_diagnostics",
+                "Progression diagnostics parallèles",
+                completed=i,
+                total=count,
+                last_index=i,
+            )
             return i, diagnostic
 
     results = await asyncio.gather(*(one(i) for i in range(1, count + 1)))
@@ -994,7 +1109,7 @@ def _run_test_module_subprocess(module_name: str, timeout_s: float | None = None
             text=True,
             encoding="utf-8",
             errors="replace",
-            env=os.environ.copy(),
+            env=_subprocess_env(),
             timeout=None if timeout_s is None or timeout_s <= 0 else float(timeout_s),
         )
         dt = time.perf_counter() - t0
@@ -1089,7 +1204,7 @@ async def _async_run_test_module_subprocess(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=os.environ.copy(),
+            env=_subprocess_env(),
         )
 
         if timeout_s is None or timeout_s <= 0:
@@ -1323,10 +1438,6 @@ async def async_run_preflight_tests(
     output_dir: Path = DEFAULT_OUTPUT_DIR,
     timeout_s: float | None = DEFAULT_TEST_TIMEOUT_S,
 ) -> TestRunSummary:
-    """
-    Lance les modules de tests en parallèle dans des sous-processus distincts.
-    C'est le mode à privilégier pour tester plusieurs modules lourds simultanément.
-    """
     ensure_dir(Path(output_dir))
     module_names = tuple(_normalize_module_names(module_names))
 
@@ -1517,7 +1628,7 @@ async def async_run_full_diagnostic(
 # CLI
 # ============================================================
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Diagnostic des rejets, logs continus et orchestration de tests pour la génération camouflage."
     )
@@ -1565,7 +1676,32 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_TEST_TIMEOUT_S,
         help="Timeout par module de tests en secondes. <= 0 désactive le timeout.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--live-console",
+        dest="live_console",
+        action="store_true",
+        default=DEFAULT_LIVE_CONSOLE,
+        help="Affiche les événements runtime en direct dans la console.",
+    )
+    parser.add_argument(
+        "--no-live-console",
+        dest="live_console",
+        action="store_false",
+        help="Désactive l'affichage runtime en direct dans la console.",
+    )
+    parser.add_argument(
+        "--console-level",
+        type=str,
+        default=DEFAULT_CONSOLE_LEVEL,
+        help="Niveau minimum affiché en direct dans la console (DEBUG, INFO, WARNING, ERROR).",
+    )
+    parser.add_argument(
+        "--tail-runtime",
+        type=int,
+        default=0,
+        help="Affiche les N dernières lignes du runtime log puis quitte.",
+    )
+    return parser.parse_args(argv)
 
 
 def _print_test_summary(summary: TestRunSummary) -> None:
@@ -1611,113 +1747,143 @@ def _apply_fast_mode(args: argparse.Namespace) -> None:
         args.max_concurrency = 2
 
 
-def main() -> None:
-    args = parse_args()
+def _handle_tail_runtime(args: argparse.Namespace) -> bool:
+    if int(args.tail_runtime) <= 0:
+        return False
+    for line in get_recent_runtime_lines(int(args.tail_runtime)):
+        print(line)
+    return True
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    args = parse_args(argv)
     _apply_fast_mode(args)
 
-    output_dir = ensure_dir(Path(args.output))
-    test_modules = _normalize_module_names(args.test_modules)
-
-    if args.tests_only:
-        summary = run_preflight_tests(
-            module_names=test_modules,
-            output_dir=output_dir,
-            timeout_s=float(args.test_timeout) if args.test_timeout is not None else None,
-        )
-        _print_test_summary(summary)
+    if _handle_tail_runtime(args):
         return
 
-    t0 = time.perf_counter()
-    result = run_full_diagnostic(
-        count=int(args.count),
-        output_dir=output_dir,
-        base_seed=int(args.base_seed),
-        run_tests_first=not bool(args.skip_tests),
-        test_modules=test_modules,
-        parallel_diagnostics=bool(args.parallel_diagnostics),
-        max_concurrency=int(args.max_concurrency),
-        tests_non_blocking=bool(args.tests_non_blocking),
-        test_timeout_s=float(args.test_timeout) if args.test_timeout is not None else None,
-    )
-    dt = time.perf_counter() - t0
+    subscriber = None
+    if args.live_console:
+        subscriber = attach_live_console_printer(args.console_level)
 
-    tests_summary = result.get("tests_summary")
-    if tests_summary is not None:
-        _print_test_summary(TestRunSummary(**tests_summary))
+    try:
+        output_dir = ensure_dir(Path(args.output))
+        test_modules = _normalize_module_names(args.test_modules)
 
-    summary = result["summary"]
-    paths = result["paths"]
-
-    print("\nDiagnostic terminé.")
-    print(f"Candidats analysés : {summary['total_candidates']}")
-    print(f"Acceptés           : {summary['accepted']}")
-    print(f"Rejetés            : {summary['rejected']}")
-    print(f"Taux acceptation   : {summary['acceptance_rate']:.4%}")
-    print(f"CSV                : {paths['csv']}")
-    print(f"JSON               : {paths['json']}")
-    print(f"TXT                : {paths['txt']}")
-    print(f"Runtime log        : {paths['runtime_log']}")
-    print(f"Snapshot runtime   : {paths['runtime_snapshot']}")
-    print(f"Durée totale       : {dt:.2f} s")
-
-
-async def async_main() -> None:
-    args = parse_args()
-    _apply_fast_mode(args)
-
-    output_dir = ensure_dir(Path(args.output))
-    test_modules = _normalize_module_names(args.test_modules)
-
-    if args.tests_only:
-        if args.parallel_tests:
-            summary = await async_run_preflight_tests(
+        if args.tests_only:
+            summary = run_preflight_tests(
                 module_names=test_modules,
                 output_dir=output_dir,
                 timeout_s=float(args.test_timeout) if args.test_timeout is not None else None,
             )
-        else:
-            summary = await asyncio.to_thread(
-                run_preflight_tests,
-                tuple(test_modules),
-                output_dir,
-                float(args.test_timeout) if args.test_timeout is not None else None,
-            )
-        _print_test_summary(summary)
+            _print_test_summary(summary)
+            return
+
+        t0 = time.perf_counter()
+        result = run_full_diagnostic(
+            count=int(args.count),
+            output_dir=output_dir,
+            base_seed=int(args.base_seed),
+            run_tests_first=not bool(args.skip_tests),
+            test_modules=test_modules,
+            parallel_diagnostics=bool(args.parallel_diagnostics),
+            max_concurrency=int(args.max_concurrency),
+            tests_non_blocking=bool(args.tests_non_blocking),
+            test_timeout_s=float(args.test_timeout) if args.test_timeout is not None else None,
+        )
+        dt = time.perf_counter() - t0
+
+        tests_summary = result.get("tests_summary")
+        if tests_summary is not None:
+            _print_test_summary(_coerce_test_run_summary(tests_summary))
+
+        summary = result["summary"]
+        paths = result["paths"]
+
+        print("\nDiagnostic terminé.")
+        print(f"Candidats analysés : {summary['total_candidates']}")
+        print(f"Acceptés           : {summary['accepted']}")
+        print(f"Rejetés            : {summary['rejected']}")
+        print(f"Taux acceptation   : {summary['acceptance_rate']:.4%}")
+        print(f"CSV                : {paths['csv']}")
+        print(f"JSON               : {paths['json']}")
+        print(f"TXT                : {paths['txt']}")
+        print(f"Runtime log        : {paths['runtime_log']}")
+        print(f"Snapshot runtime   : {paths['runtime_snapshot']}")
+        print(f"Durée totale       : {dt:.2f} s")
+    finally:
+        if subscriber is not None:
+            LOG_MANAGER.unsubscribe(subscriber)
+
+
+async def async_main(argv: Sequence[str] | None = None) -> None:
+    args = parse_args(argv)
+    _apply_fast_mode(args)
+
+    if _handle_tail_runtime(args):
         return
 
-    t0 = time.perf_counter()
-    result = await async_run_full_diagnostic(
-        count=int(args.count),
-        output_dir=output_dir,
-        base_seed=int(args.base_seed),
-        run_tests_first=not bool(args.skip_tests),
-        test_modules=test_modules,
-        parallel_tests=bool(args.parallel_tests),
-        parallel_diagnostics=bool(args.parallel_diagnostics),
-        max_concurrency=int(args.max_concurrency),
-        tests_non_blocking=bool(args.tests_non_blocking),
-        test_timeout_s=float(args.test_timeout) if args.test_timeout is not None else None,
-    )
-    dt = time.perf_counter() - t0
+    subscriber = None
+    if args.live_console:
+        subscriber = attach_live_console_printer(args.console_level)
 
-    tests_summary = result.get("tests_summary")
-    if tests_summary is not None:
-        _print_test_summary(TestRunSummary(**tests_summary))
+    try:
+        output_dir = ensure_dir(Path(args.output))
+        test_modules = _normalize_module_names(args.test_modules)
 
-    summary = result["summary"]
-    paths = result["paths"]
+        if args.tests_only:
+            if args.parallel_tests:
+                summary = await async_run_preflight_tests(
+                    module_names=test_modules,
+                    output_dir=output_dir,
+                    timeout_s=float(args.test_timeout) if args.test_timeout is not None else None,
+                )
+            else:
+                summary = await asyncio.to_thread(
+                    run_preflight_tests,
+                    tuple(test_modules),
+                    output_dir,
+                    float(args.test_timeout) if args.test_timeout is not None else None,
+                )
+            _print_test_summary(summary)
+            return
 
-    print("\nDiagnostic terminé.")
-    print(f"Candidats analysés : {summary['total_candidates']}")
-    print(f"Acceptés           : {summary['accepted']}")
-    print(f"Rejetés            : {summary['rejected']}")
-    print(f"Taux acceptation   : {summary['acceptance_rate']:.4%}")
-    print(f"CSV                : {paths['csv']}")
-    print(f"JSON               : {paths['json']}")
-    print(f"TXT                : {paths['txt']}")
-    print(f"Runtime log        : {paths['runtime_log']}")
-    print(f"Snapshot runtime   : {paths['runtime_snapshot']}")
-    print(f"Durée totale       : {dt:.2f} s")
+        t0 = time.perf_counter()
+        result = await async_run_full_diagnostic(
+            count=int(args.count),
+            output_dir=output_dir,
+            base_seed=int(args.base_seed),
+            run_tests_first=not bool(args.skip_tests),
+            test_modules=test_modules,
+            parallel_tests=bool(args.parallel_tests),
+            parallel_diagnostics=bool(args.parallel_diagnostics),
+            max_concurrency=int(args.max_concurrency),
+            tests_non_blocking=bool(args.tests_non_blocking),
+            test_timeout_s=float(args.test_timeout) if args.test_timeout is not None else None,
+        )
+        dt = time.perf_counter() - t0
+
+        tests_summary = result.get("tests_summary")
+        if tests_summary is not None:
+            _print_test_summary(_coerce_test_run_summary(tests_summary))
+
+        summary = result["summary"]
+        paths = result["paths"]
+
+        print("\nDiagnostic terminé.")
+        print(f"Candidats analysés : {summary['total_candidates']}")
+        print(f"Acceptés           : {summary['accepted']}")
+        print(f"Rejetés            : {summary['rejected']}")
+        print(f"Taux acceptation   : {summary['acceptance_rate']:.4%}")
+        print(f"CSV                : {paths['csv']}")
+        print(f"JSON               : {paths['json']}")
+        print(f"TXT                : {paths['txt']}")
+        print(f"Runtime log        : {paths['runtime_log']}")
+        print(f"Snapshot runtime   : {paths['runtime_snapshot']}")
+        print(f"Durée totale       : {dt:.2f} s")
+    finally:
+        if subscriber is not None:
+            LOG_MANAGER.unsubscribe(subscriber)
 
 
 if __name__ == "__main__":
