@@ -20,9 +20,6 @@ Fonctions :
 - réglage léger de l'intensité machine
 - boutons Commencer / Arrêter
 - préflight tests automatiques sur test_main.py et test_start.py
-- choix utilisateur :
-  * préflight bloquant ou non bloquant
-  * timeout des tests configurable
 """
 
 from __future__ import annotations
@@ -53,6 +50,8 @@ try:
 except Exception:
     psutil = None
 
+os.environ.setdefault("KIVY_NO_ARGS", "1")
+
 try:
     import log as camo_log
 except Exception:
@@ -80,7 +79,6 @@ from kivy.metrics import dp, sp
 from kivy.properties import NumericProperty, StringProperty
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
-from kivy.uix.checkbox import CheckBox
 from kivy.uix.gridlayout import GridLayout
 from kivy.uix.image import Image
 from kivy.uix.label import Label
@@ -188,7 +186,6 @@ REPORT_NAME = "rapport_camouflages_v3.csv"
 DEFAULT_OUTPUT_DIR = Path("camouflages_federale_europe")
 DEFAULT_TARGET_COUNT = 100
 DEFAULT_TOP_K = 20
-DEFAULT_PREFLIGHT_TIMEOUT_S = 180.0
 
 WEIGHT_RATIO = 0.28
 WEIGHT_SILHOUETTE = 0.30
@@ -827,6 +824,38 @@ class SoftTextInput(TextInput):
             )
 
 
+class ImageStage(Widget):
+    def __init__(self, image_widget: Image, **kwargs):
+        super().__init__(**kwargs)
+        self.image_widget = image_widget
+        self.bind(pos=self._redraw, size=self._redraw)
+
+    def _redraw(self, *_):
+        self.canvas.before.clear()
+        r = dp(18)
+        pad = dp(2)
+        with self.canvas.before:
+            Color(*C["bg_panel_inner"])
+            RoundedRectangle(
+                pos=self.pos,
+                size=self.size,
+                radius=[r] * 4,
+            )
+
+            Color(*C["glass_top"])
+            RoundedRectangle(
+                pos=(self.x + pad, self.y + self.height * 0.68),
+                size=(self.width - pad * 2, self.height * 0.18),
+                radius=[r] * 4,
+            )
+
+            Color(*C["stroke_strong"])
+            Line(
+                rounded_rectangle=(self.x, self.y, self.width, self.height, r),
+                width=1.0,
+            )
+
+
 class SoftButton(Button):
     def __init__(self, role: str = "neutral", **kwargs):
         super().__init__(**kwargs)
@@ -1019,8 +1048,6 @@ class CamouflageApp(App):
         self.tests_ran = False
         self.tests_ok = False
         self.tests_summary = "Tests non lancés."
-        self.last_preflight_completed = True
-        self.last_preflight_timed_out = False
 
         self.preflight_running = False
         self.preflight_pending_start = False
@@ -1047,11 +1074,11 @@ class CamouflageApp(App):
         self.log_view: Optional[LogView] = None
 
         self.tests_label: Optional[Label] = None
-        self.preflight_non_blocking_checkbox: Optional[CheckBox] = None
-        self.preflight_non_blocking_text_label: Optional[Label] = None
-        self.preflight_mode_status_label: Optional[Label] = None
-        self.preflight_timeout_input: Optional[SoftTextInput] = None
-        self.preflight_timeout_hint: Optional[Label] = None
+        self.runtime_enabled_label: Optional[Label] = None
+        self.runtime_last_label: Optional[Label] = None
+        self._runtime_subscription_active = False
+        self._runtime_subscriber_callback = None
+        self._runtime_buffer_limit = 800
 
         self.diag_enabled_label: Optional[Label] = None
         self.diag_summary_label: Optional[Label] = None
@@ -1144,39 +1171,17 @@ class CamouflageApp(App):
         controls.add_widget(btn_row)
 
         controls.add_widget(self._label("Préflight tests"))
-
-        preflight_mode_row = BoxLayout(size_hint_y=None, height=dp(34), spacing=dp(10))
-        self.preflight_non_blocking_checkbox = CheckBox(active=False, size_hint_x=None, width=dp(34))
-        self.preflight_non_blocking_text_label = self._small_label(
-            "Continuer même si les tests échouent ou expirent",
-            size_hint_x=1,
-        )
-        preflight_mode_row.add_widget(self.preflight_non_blocking_checkbox)
-        preflight_mode_row.add_widget(self.preflight_non_blocking_text_label)
-        controls.add_widget(preflight_mode_row)
-
-        self.preflight_mode_status_label = self._small_label("Mode actuel : bloquant")
-        controls.add_widget(self.preflight_mode_status_label)
-
-        timeout_row = BoxLayout(size_hint_y=None, height=dp(50), spacing=dp(10))
-        timeout_label = self._small_label("Timeout tests (s)", size_hint_x=0.42)
-        self.preflight_timeout_input = SoftTextInput(
-            text=str(int(DEFAULT_PREFLIGHT_TIMEOUT_S)),
-            multiline=False,
-            size_hint_x=0.58,
-        )
-        timeout_row.add_widget(timeout_label)
-        timeout_row.add_widget(self.preflight_timeout_input)
-        controls.add_widget(timeout_row)
-
-        self.preflight_timeout_hint = self._small_label(
-            "Mettre 0 pour désactiver le timeout.",
-            color=C["text_muted"],
-        )
-        controls.add_widget(self.preflight_timeout_hint)
-
         self.tests_label = self._small_label("Tests non lancés.")
         controls.add_widget(self.tests_label)
+
+        controls.add_widget(self._label("Runtime live"))
+        self.runtime_enabled_label = self._small_label(
+            "Flux runtime : actif" if camo_log is not None else "Flux runtime : indisponible",
+            color=C["success"] if camo_log is not None else C["warning"],
+        )
+        self.runtime_last_label = self._small_label("Dernier runtime : --", color=C["text_muted"])
+        controls.add_widget(self.runtime_enabled_label)
+        controls.add_widget(self.runtime_last_label)
 
         controls.add_widget(self._label("Chargement"))
         self.progress_bar = GlassProgressBar()
@@ -1272,17 +1277,10 @@ class CamouflageApp(App):
         body.add_widget(right)
         root.add_widget(body)
 
-        if self.preflight_non_blocking_checkbox is not None:
-            self.preflight_non_blocking_checkbox.bind(active=self._on_preflight_mode_changed)
-
-        if self.preflight_timeout_input is not None:
-            self.preflight_timeout_input.bind(text=self._on_preflight_timeout_changed)
-
         self._refresh_controls_state()
         self.reload_gallery()
         self._reset_live_diagnostics()
         self._update_preflight_label(self.tests_summary, ok=None)
-        self._refresh_preflight_mode_labels()
         Clock.schedule_interval(self._update_resource_monitor, 1.0)
         Clock.schedule_interval(self._refresh_gallery_periodic, 3.0)
 
@@ -1293,6 +1291,107 @@ class CamouflageApp(App):
             Window.maximize()
         except Exception:
             pass
+
+        self._subscribe_runtime_feed()
+        self._bootstrap_runtime_feed()
+        self._emit_runtime("INFO", "start", "Interface Kivy démarrée")
+
+    # ---------------- runtime live ----------------
+
+    def _format_runtime_event_line(self, event: Any) -> str:
+        try:
+            formatter = getattr(event, "format_line", None)
+            if callable(formatter):
+                return str(formatter())
+        except Exception:
+            pass
+
+        ts = getattr(event, "ts", time.time())
+        level = str(getattr(event, "level", "INFO")).upper()
+        source = str(getattr(event, "source", "runtime"))
+        message = str(getattr(event, "message", ""))
+        payload = getattr(event, "payload", {}) or {}
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(ts)))
+        if payload:
+            try:
+                payload_txt = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+            except Exception:
+                payload_txt = str(payload)
+            return f"{stamp} | {level:<8} | {source} | {message} | {payload_txt}"
+        return f"{stamp} | {level:<8} | {source} | {message}"
+
+    def _emit_runtime(self, level: str, source: str, message: str, **payload: Any) -> None:
+        if camo_log is None or not hasattr(camo_log, "log_event"):
+            return
+        try:
+            camo_log.log_event(level, source, message, **payload)
+        except Exception:
+            pass
+
+    def _runtime_event_to_diag(self, event: Any) -> bool:
+        source = str(getattr(event, "source", "")).lower()
+        return source in {
+            "diagnostic",
+            "summary",
+            "tests",
+            "generate_diagnostics",
+            "async_generate_diagnostics",
+            "export",
+            "start_worker",
+        }
+
+    @mainthread
+    def _append_runtime_line(self, line: str, to_diag: bool) -> None:
+        if self.log_view is not None:
+            self.log_view.append(line)
+        if to_diag and self.diag_log_view is not None:
+            self.diag_log_view.append(line)
+        if self.runtime_last_label is not None:
+            shortened = line if len(line) <= 140 else line[:137] + "..."
+            self.runtime_last_label.text = f"Dernier runtime : {shortened}"
+
+    def _on_runtime_event(self, event: Any) -> None:
+        line = self._format_runtime_event_line(event)
+        self._append_runtime_line(line, self._runtime_event_to_diag(event))
+
+    def _subscribe_runtime_feed(self) -> None:
+        if camo_log is None:
+            return
+        if self._runtime_subscription_active:
+            return
+
+        callback = self._on_runtime_event
+        try:
+            manager = getattr(camo_log, "LOG_MANAGER", None)
+            if manager is not None and hasattr(manager, "subscribe"):
+                manager.subscribe(callback)
+                self._runtime_subscription_active = True
+                self._runtime_subscriber_callback = callback
+        except Exception as exc:
+            self.log(f"Abonnement runtime impossible : {exc}")
+
+    def _unsubscribe_runtime_feed(self) -> None:
+        if camo_log is None or not self._runtime_subscription_active:
+            return
+        callback = self._runtime_subscriber_callback
+        try:
+            manager = getattr(camo_log, "LOG_MANAGER", None)
+            if manager is not None and hasattr(manager, "unsubscribe") and callback is not None:
+                manager.unsubscribe(callback)
+        except Exception:
+            pass
+        self._runtime_subscription_active = False
+        self._runtime_subscriber_callback = None
+
+    def _bootstrap_runtime_feed(self) -> None:
+        if camo_log is None:
+            return
+        try:
+            lines = camo_log.get_recent_runtime_lines(25)
+        except Exception:
+            lines = []
+        for line in lines[-25:]:
+            self._append_runtime_line(str(line), True)
 
     # ---------------- style helpers ----------------
 
@@ -1334,61 +1433,6 @@ class CamouflageApp(App):
         lbl.bind(size=lambda *a: setattr(lbl, "text_size", lbl.size))
         return lbl
 
-    # ---------------- préflight options ----------------
-
-    def _get_preflight_non_blocking(self) -> bool:
-        if self.preflight_non_blocking_checkbox is None:
-            return False
-        return bool(self.preflight_non_blocking_checkbox.active)
-
-    def _get_preflight_timeout_value(self) -> Optional[float]:
-        if self.preflight_timeout_input is None:
-            return DEFAULT_PREFLIGHT_TIMEOUT_S
-
-        raw = self.preflight_timeout_input.text.strip()
-        if not raw:
-            return DEFAULT_PREFLIGHT_TIMEOUT_S
-
-        try:
-            value = float(raw.replace(",", "."))
-        except Exception:
-            return DEFAULT_PREFLIGHT_TIMEOUT_S
-
-        if value <= 0:
-            return None
-        return value
-
-    def _format_timeout_text(self, timeout_s: Optional[float]) -> str:
-        if timeout_s is None:
-            return "désactivé"
-        if abs(timeout_s - round(timeout_s)) < 1e-9:
-            return f"{int(round(timeout_s))} s"
-        return f"{timeout_s:.1f} s"
-
-    def _preflight_mode_text(self) -> str:
-        return "non bloquant" if self._get_preflight_non_blocking() else "bloquant"
-
-    def _should_continue_after_failed_preflight(self) -> bool:
-        return self._get_preflight_non_blocking()
-
-    def _refresh_preflight_mode_labels(self):
-        mode = self._preflight_mode_text()
-        timeout_s = self._get_preflight_timeout_value()
-
-        if self.preflight_mode_status_label is not None:
-            self.preflight_mode_status_label.text = f"Mode actuel : {mode}"
-
-        if self.preflight_timeout_hint is not None:
-            self.preflight_timeout_hint.text = (
-                f"Mode {mode} | timeout {self._format_timeout_text(timeout_s)}"
-            )
-
-    def _on_preflight_mode_changed(self, _checkbox, _value):
-        self._refresh_preflight_mode_labels()
-
-    def _on_preflight_timeout_changed(self, *_):
-        self._refresh_preflight_mode_labels()
-
     # ---------------- préflight tests ----------------
 
     @mainthread
@@ -1405,61 +1449,28 @@ class CamouflageApp(App):
 
     async def _async_run_preflight_via_log(self) -> Tuple[bool, str]:
         if camo_log is None:
-            self.last_preflight_completed = False
-            self.last_preflight_timed_out = False
             return False, "log.py indisponible : impossible de lancer le préflight."
 
-        timeout_s = self._get_preflight_timeout_value()
-        non_blocking = self._get_preflight_non_blocking()
-
         try:
-            summary = await camo_log.async_run_preflight_tests(
-                output_dir=Path("logs_generation"),
-                timeout_s=timeout_s,
-            )
+            summary = await camo_log.async_run_preflight_tests(output_dir=Path("logs_generation"))
 
-            ok = bool(getattr(summary, "ok", False))
-            completed = bool(getattr(summary, "completed", True))
-            timed_out = bool(getattr(summary, "timed_out", False))
-            timed_out_modules = list(getattr(summary, "timed_out_modules", []))
+            if hasattr(summary, "short_text"):
+                text = str(summary.short_text())
+                ok = bool(getattr(summary, "ok", False))
+                return ok, text
 
-            self.last_preflight_completed = completed
-            self.last_preflight_timed_out = timed_out
+            if isinstance(summary, dict):
+                ok = bool(summary.get("ok", False))
+                total = int(summary.get("total", 0))
+                failures = int(summary.get("failures", 0))
+                errors = int(summary.get("errors", 0))
+                if ok:
+                    return True, f"{total} tests OK"
+                return False, f"{total} tests exécutés | {failures} échec(s) | {errors} erreur(s)"
 
-            total = int(getattr(summary, "total", 0))
-            failures = int(getattr(summary, "failures", 0))
-            errors = int(getattr(summary, "errors", 0))
-
-            if ok:
-                base_text = f"{total} tests OK"
-            else:
-                base_text = f"{total} tests | {failures} échec(s) | {errors} erreur(s)"
-
-            meta_parts: List[str] = [
-                f"mode={'non bloquant' if non_blocking else 'bloquant'}",
-                f"timeout={self._format_timeout_text(timeout_s)}",
-            ]
-
-            if not completed:
-                meta_parts.append("incomplet")
-
-            if timed_out and timed_out_modules:
-                meta_parts.append("modules bloqués=" + ", ".join(map(str, timed_out_modules[:5])))
-            elif timed_out:
-                meta_parts.append("timeout")
-
-            text = f"{base_text} | " + " | ".join(meta_parts)
-            return ok, text
-
+            return False, "Préflight : format de réponse inattendu."
         except Exception as exc:
-            self.last_preflight_completed = False
-            self.last_preflight_timed_out = False
-            return False, (
-                f"Impossible d'exécuter les tests via log.py : "
-                f"{type(exc).__name__}: {exc} | "
-                f"mode={'non bloquant' if non_blocking else 'bloquant'} | "
-                f"timeout={self._format_timeout_text(timeout_s)}"
-            )
+            return False, f"Impossible d'exécuter les tests via log.py : {type(exc).__name__}: {exc}"
 
     def _ensure_preflight_tests(self) -> bool:
         if self.tests_ran and self.tests_ok:
@@ -1471,27 +1482,11 @@ class CamouflageApp(App):
 
         self.preflight_running = True
         self.preflight_pending_start = True
-
-        timeout_s = self._get_preflight_timeout_value()
-        non_blocking = self._get_preflight_non_blocking()
-
         self.status("Préflight en cours…", ok=True)
-        self.log(
-            "Lancement des tests de préflight via log.py… "
-            f"(mode={'non bloquant' if non_blocking else 'bloquant'}, "
-            f"timeout={self._format_timeout_text(timeout_s)})"
-        )
-        self.diag_log(
-            "Préflight lancé via log.py | "
-            f"mode={'non bloquant' if non_blocking else 'bloquant'} | "
-            f"timeout={self._format_timeout_text(timeout_s)}"
-        )
-        self._update_preflight_label(
-            "Préflight en cours… "
-            f"(mode={'non bloquant' if non_blocking else 'bloquant'}, "
-            f"timeout={self._format_timeout_text(timeout_s)})",
-            ok=None,
-        )
+        self.log("Lancement des tests de préflight via log.py…")
+        self.diag_log("Préflight lancé via log.py.")
+        self._emit_runtime("INFO", "start_preflight", "Préflight lancé depuis le front", mode="bloquant")
+        self._update_preflight_label("Préflight en cours…", ok=None)
         self._refresh_controls_state()
 
         fut = self.async_runner.submit(self._async_run_preflight_via_log())
@@ -1517,34 +1512,24 @@ class CamouflageApp(App):
 
         self._update_preflight_label(summary, ok=ok)
 
-        continue_anyway = (not ok) and self._should_continue_after_failed_preflight()
-
         if ok:
             self.log(f"Préflight OK : {summary}")
             self.diag_log(f"Préflight OK : {summary}")
             self.status("Préflight terminé", ok=True)
-
-        elif continue_anyway:
-            self.status("Tests KO mais non bloquants", ok=True)
-            self.log(f"Préflight KO mais poursuite autorisée : {summary}")
-            self.diag_log(f"Préflight KO mais poursuite autorisée : {summary}")
-
+            self._emit_runtime("INFO", "start_preflight", "Préflight terminé", ok=True, summary=summary)
         else:
             self.status("Tests KO", ok=False)
             self.log(f"Préflight KO : {summary}")
             self.diag_log(f"Préflight KO : {summary}")
+            self._emit_runtime("ERROR", "start_preflight", "Préflight en échec", ok=False, summary=summary)
 
         self._refresh_controls_state()
 
-        if self.preflight_pending_start:
+        if ok and self.preflight_pending_start:
             self.preflight_pending_start = False
-
-            if ok:
-                self._start_generation_after_preflight()
-            elif continue_anyway:
-                self.log("La génération démarre malgré le préflight KO, selon le choix utilisateur.")
-                self.diag_log("Génération autorisée malgré préflight KO.")
-                self._start_generation_after_preflight()
+            self._start_generation_after_preflight()
+        else:
+            self.preflight_pending_start = False
 
     # ---------------- diagnostic live ----------------
 
@@ -1789,16 +1774,9 @@ class CamouflageApp(App):
             self.log("Interface incomplète.")
             return
 
-        if self.tests_ran:
-            if self.tests_ok:
-                self._start_generation_after_preflight()
-                return
-
-            if self._get_preflight_non_blocking():
-                self.log("Dernier préflight KO, mais le mode non bloquant autorise la poursuite.")
-                self.diag_log("Poursuite autorisée après préflight KO.")
-                self._start_generation_after_preflight()
-                return
+        if self.tests_ran and self.tests_ok:
+            self._start_generation_after_preflight()
+            return
 
         self._ensure_preflight_tests()
 
@@ -1840,12 +1818,9 @@ class CamouflageApp(App):
 
         self.status("Génération en cours…", ok=True)
         self.log(f"Démarrage : {count} camouflage(s) demandé(s).")
-        self.log(
-            f"Préflight utilisateur : mode={self._preflight_mode_text()} | "
-            f"timeout={self._format_timeout_text(self._get_preflight_timeout_value())}"
-        )
         self.log(f"Dossier : {self.current_output_dir.resolve()}")
         self.diag_log("Diagnostic live initialisé.")
+        self._emit_runtime("INFO", "start_worker", "Génération démarrée", target_count=count, output_dir=str(self.current_output_dir.resolve()))
         self._refresh_controls_state()
 
         fut = self.async_runner.submit(self._async_worker_generate(count))
@@ -1868,6 +1843,7 @@ class CamouflageApp(App):
         self.status("Arrêt demandé…", ok=False)
         self.log("Arrêt demandé. Fin de la tentative courante puis arrêt.")
         self.diag_log("Arrêt demandé par l'utilisateur.")
+        self._emit_runtime("WARNING", "start_worker", "Arrêt demandé", accepted_count=self.accepted_count, total_attempts=self.total_attempts)
         self._refresh_controls_state()
 
     async def _async_should_stop(self) -> bool:
@@ -1891,6 +1867,7 @@ class CamouflageApp(App):
                     self.total_attempts = total_attempts
 
                     seed = camo.build_seed(target_index, local_attempt, base_seed=camo.DEFAULT_BASE_SEED)
+                    self._emit_runtime("INFO", "start_worker", "Tentative en cours", target_index=target_index, local_attempt=local_attempt, global_attempt=total_attempts, seed=seed)
                     candidate = await camo.async_generate_candidate_from_seed(seed)
 
                     extra_scores, valid_v3 = await async_evaluate_candidate_v3(
@@ -1931,6 +1908,7 @@ class CamouflageApp(App):
                             f"T={candidate.ratios[camo.IDX_TERRE]*100:.1f} "
                             f"G={candidate.ratios[camo.IDX_GRIS]*100:.1f}"
                         )
+                        self._emit_runtime("WARNING", "start_worker", "Candidat rejeté", target_index=target_index, local_attempt=local_attempt, global_attempt=total_attempts, seed=candidate.seed, score_final=round(float(extra_scores['score_final']), 5))
                         await self._adaptive_pause()
                         await asyncio.sleep(0)
                         continue
@@ -2006,6 +1984,7 @@ class CamouflageApp(App):
                         f"silhouette={extra_scores['score_silhouette']:.3f} | "
                         f"contour={extra_scores['contour_break_score']:.3f}"
                     )
+                    self._emit_runtime("INFO", "start_worker", "Candidat accepté", target_index=target_index, local_attempt=local_attempt, global_attempt=total_attempts, seed=candidate.seed, image_path=str(filename.resolve()), score_final=round(float(extra_scores['score_final']), 5))
                     self.reload_gallery()
 
                     await self._adaptive_pause()
@@ -2107,6 +2086,7 @@ class CamouflageApp(App):
         self.log(f"Best-of exporté : {best_dir}")
         self.log("Génération terminée avec succès.")
         self.diag_log("Diagnostic live terminé avec succès.")
+        self._emit_runtime("INFO", "start_worker", "Génération terminée avec succès", accepted_count=len(rows), total_attempts=self.total_attempts)
         self._refresh_controls_state()
         self.reload_gallery()
 
@@ -2127,6 +2107,7 @@ class CamouflageApp(App):
         self.status("Arrêté", ok=False)
         self.log("Génération arrêtée proprement.")
         self.diag_log("Diagnostic live arrêté proprement.")
+        self._emit_runtime("WARNING", "start_worker", "Génération arrêtée", accepted_count=len(rows), total_attempts=self.total_attempts)
         self._refresh_controls_state()
         self.reload_gallery()
 
@@ -2139,6 +2120,7 @@ class CamouflageApp(App):
         self.status("Erreur", ok=False)
         self.log(f"Erreur : {message}")
         self.diag_log(f"Erreur diagnostic : {message}")
+        self._emit_runtime("ERROR", "start_worker", "Erreur de génération", message=message, accepted_count=self.accepted_count, total_attempts=self.total_attempts)
         self._refresh_controls_state()
 
     # ---------------- UI updates ----------------
@@ -2216,6 +2198,8 @@ class CamouflageApp(App):
         self.stopping = True
         self.preflight_pending_start = False
         prevent_sleep(False)
+        self._emit_runtime("INFO", "start", "Arrêt de l'interface Kivy")
+        self._unsubscribe_runtime_feed()
 
         fut = self.current_future
         if fut is not None and not fut.done():

@@ -30,3 +30,6 @@
 2026-03-13 14:34:05 | INFO     | camo_log | [generate_diagnostics] Début génération candidat | payload={"index": 1, "seed": 202603220001}
 2026-03-13 14:38:21 | INFO     | camo_log | [tests] Début préflight asynchrone | payload={"modules": ["test_main"], "parallel": true, "timeout_s": 180.0}
 2026-03-13 14:38:21 | INFO     | camo_log | [tests] Lancement module de test | payload={"command": ["C:\\Python312\\python.exe", "-m", "unittest", "-v", "test_main"], "mode": "async-subprocess", "module": "test_main", "timeout_s": 180.0}
+2026-03-13 14:41:21 | ERROR    | camo_log | [tests] Fin module de test | payload={"completed": false, "duration_s": 180.019076, "module": "test_main", "ok": false, "returncode": -9, "timed_out": true}
+2026-03-13 14:41:21 | ERROR    | camo_log | [tests] Fin préflight asynchrone | payload={"completed": false, "duration_s": 180.074327, "errors": 1, "failures": 0, "ok": false, "parallel": true, "timed_out": true, "timed_out_modules": ["test_main"], "total": 89}
+2026-03-13 14:42:00 | INFO     | camo_log | [start] Interface Kivy démarrée

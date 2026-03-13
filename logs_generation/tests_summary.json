@@ -6,7 +6,7 @@
   "skipped": 0,
   "expected_failures": 0,
   "unexpected_successes": 0,
-  "duration_s": 180.08997789999557,
+  "duration_s": 180.0743269999948,
   "modules": [
     "test_main"
   ],
@@ -18,7 +18,7 @@
     "errors": [
       {
         "test": "test_main::timeout",
-        "trace": "STDERR:\ntest_generate_candidate_from_seed_returns_candidate_result (test_main.TestCandidateGeneration.test_generate_candidate_from_seed_returns_candidate_result) ..."
+        "trace": "STDERR:\nTimeout expiré après 180.0 s"
       }
     ]
   },
@@ -27,7 +27,7 @@
       "module": "test_main",
       "ok": false,
       "returncode": -9,
-      "duration_s": 180.05840480000188,
+      "duration_s": 180.0190755999938,
       "command": [
         "C:\\Python312\\python.exe",
         "-m",
@@ -36,15 +36,15 @@
         "test_main"
       ],
       "stdout": "",
-      "stderr": "test_generate_candidate_from_seed_returns_candidate_result (test_main.TestCandidateGeneration.test_generate_candidate_from_seed_returns_candidate_result) ... ",
+      "stderr": "Timeout expiré après 180.0 s",
       "log_file": "C:\\Users\\alpha\\Documents\\GitHub\\camo-generator\\logs_tests\\test_main.log",
       "completed": false,
       "timed_out": true,
       "timeout_s": 180.0,
-      "exception_message": "TimeoutExpired(180.0)"
+      "exception_message": "TimeoutError(180.0)"
     }
   ],
-  "parallel": false,
+  "parallel": true,
   "completed": false,
   "timed_out": true,
   "timed_out_modules": [
