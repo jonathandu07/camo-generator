@@ -1335,21 +1335,31 @@ class TestFinishMethods(TempDirMixin, unittest.IsolatedAsyncioTestCase):
         mock_best.assert_not_called()
         self.assertIn("Rapport vide écrit", self.app.log_view.label.text)
 
-    async def test_async_finish_error_reflects_current_start_behavior(self) -> None:
+    async def test_async_finish_error(self) -> None:
         """
-        start.py appelle actuellement _emit_runtime(..., message=message, ...)
-        alors que message est déjà le 3e argument positionnel.
-        Le test suit donc le comportement réel du start.py actuel.
+        Le start.py actuel ne lève plus de TypeError :
+        _async_finish_error() doit terminer proprement, journaliser l'erreur
+        et rafraîchir les contrôles.
         """
-        with patch.object(sut, "prevent_sleep") as mock_sleep:
-            with self.assertRaises(TypeError):
-                await self.app._async_finish_error("boom")
+        with patch.object(self.app, "_emit_runtime") as mock_emit_runtime,              patch.object(self.app, "_refresh_controls_state") as mock_refresh,              patch.object(sut, "prevent_sleep") as mock_sleep:
+            await self.app._async_finish_error("boom")
 
         self.assertFalse(self.app.running)
         self.assertFalse(self.app.stopping)
         self.assertFalse(self.app.stop_flag)
         self.assertEqual(self.app.status_label.text, "Erreur")
+        self.assertEqual(self.app.status_label.color, sut.C["danger"])
         self.assertIn("Erreur : boom", self.app.log_view.label.text)
+        self.assertIn("Erreur diagnostic : boom", self.app.diag_log_view.label.text)
+        mock_emit_runtime.assert_called_once_with(
+            "ERROR",
+            "start_worker",
+            "Erreur de génération",
+            error_message="boom",
+            accepted_count=self.app.accepted_count,
+            total_attempts=self.app.total_attempts,
+        )
+        mock_refresh.assert_called_once()
         mock_sleep.assert_called_once_with(False)
 
 
