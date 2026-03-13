@@ -1426,40 +1426,29 @@ class CamouflageApp(App):
             self.last_preflight_completed = completed
             self.last_preflight_timed_out = timed_out
 
-            if hasattr(summary, "short_text"):
-                text = str(summary.short_text())
-            elif isinstance(summary, dict):
-                ok = bool(summary.get("ok", False))
-                total = int(summary.get("total", 0))
-                failures = int(summary.get("failures", 0))
-                errors = int(summary.get("errors", 0))
-                completed = bool(summary.get("completed", True))
-                timed_out = bool(summary.get("timed_out", False))
-                timed_out_modules = list(summary.get("timed_out_modules", []))
+            total = int(getattr(summary, "total", 0))
+            failures = int(getattr(summary, "failures", 0))
+            errors = int(getattr(summary, "errors", 0))
 
-                self.last_preflight_completed = completed
-                self.last_preflight_timed_out = timed_out
-
-                if ok:
-                    text = f"{total} tests OK"
-                else:
-                    text = f"{total} tests exécutés | {failures} échec(s) | {errors} erreur(s)"
+            if ok:
+                base_text = f"{total} tests OK"
             else:
-                return False, "Préflight : format de réponse inattendu."
+                base_text = f"{total} tests | {failures} échec(s) | {errors} erreur(s)"
 
-            suffix_parts: List[str] = [
+            meta_parts: List[str] = [
                 f"mode={'non bloquant' if non_blocking else 'bloquant'}",
                 f"timeout={self._format_timeout_text(timeout_s)}",
             ]
 
             if not completed:
-                suffix_parts.append("incomplet")
-            if timed_out:
-                suffix_parts.append("timeout")
-            if timed_out_modules:
-                suffix_parts.append("modules timeout=" + ", ".join(map(str, timed_out_modules[:5])))
+                meta_parts.append("incomplet")
 
-            text = f"{text} | " + " | ".join(suffix_parts)
+            if timed_out and timed_out_modules:
+                meta_parts.append("modules bloqués=" + ", ".join(map(str, timed_out_modules[:5])))
+            elif timed_out:
+                meta_parts.append("timeout")
+
+            text = f"{base_text} | " + " | ".join(meta_parts)
             return ok, text
 
         except Exception as exc:
