@@ -10,6 +10,8 @@ Interface Kivy moderne, asynchrone, redimensionnable, stylée selon une directio
 
 Fonctions :
 - génération séquentielle stricte via main.py
+- prise en compte de log.py en direct
+- affichage live du diagnostic des rejets
 - barre de chargement stylée
 - aperçu principal + projection silhouette
 - galerie des camouflages générés
@@ -31,6 +33,7 @@ import platform
 import shutil
 import subprocess
 import threading
+from collections import Counter
 from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,13 +48,18 @@ try:
 except Exception:
     psutil = None
 
+try:
+    import log as camo_log
+except Exception:
+    camo_log = None
+
 # ---------------- Kivy config avant imports UI ----------------
 from kivy.config import Config
 
 Config.set("graphics", "fullscreen", "0")
 Config.set("graphics", "resizable", "1")
-Config.set("graphics", "minimum_width", "1200")
-Config.set("graphics", "minimum_height", "760")
+Config.set("graphics", "minimum_width", "1280")
+Config.set("graphics", "minimum_height", "780")
 Config.set("graphics", "width", "1680")
 Config.set("graphics", "height", "980")
 Config.set("input", "mouse", "mouse,multitouch_on_demand")
@@ -930,8 +938,8 @@ class LogView(ScrollView):
     def append(self, line: str) -> None:
         lines = self.label.text.splitlines() if self.label.text else []
         lines.append(line)
-        if len(lines) > 450:
-            lines = lines[-450:]
+        if len(lines) > 600:
+            lines = lines[-600:]
         self.label.text = "\n".join(lines)
         Clock.schedule_once(lambda dt: setattr(self, "scroll_y", 0), 0.05)
 
@@ -1051,6 +1059,18 @@ class CamouflageApp(App):
         self.preview_silhouette: Optional[Image] = None
         self.log_view: Optional[LogView] = None
 
+        self.diag_enabled_label: Optional[Label] = None
+        self.diag_summary_label: Optional[Label] = None
+        self.diag_top_rules_label: Optional[Label] = None
+        self.diag_last_fail_label: Optional[Label] = None
+        self.diag_log_view: Optional[LogView] = None
+
+        self.diag_total = 0
+        self.diag_accepts = 0
+        self.diag_rejects = 0
+        self.diag_rule_counter: Counter[str] = Counter()
+        self.diag_last_rules: List[str] = []
+
     def build(self):
         Window.clearcolor = C["bg_root"]
         root = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(10))
@@ -1105,7 +1125,7 @@ class CamouflageApp(App):
         controls = GlassCard(
             orientation="vertical",
             size_hint_y=None,
-            height=dp(520),
+            height=dp(560),
         )
 
         controls.add_widget(self._label("Paramètres"))
@@ -1156,6 +1176,19 @@ class CamouflageApp(App):
         controls.add_widget(self.color_text)
         controls.add_widget(self.extra_text)
 
+        controls.add_widget(self._label("Diagnostic live"))
+        self.diag_enabled_label = self._small_label(
+            "Analyse log.py : active" if camo_log is not None else "Analyse log.py : indisponible",
+            color=C["warning"] if camo_log is None else C["success"],
+        )
+        self.diag_summary_label = self._small_label("Tentatives 0 | acceptés 0 | rejetés 0 | taux 0.00%")
+        self.diag_top_rules_label = self._small_label("Top règles : --")
+        self.diag_last_fail_label = self._small_label("Dernier rejet : --")
+        controls.add_widget(self.diag_enabled_label)
+        controls.add_widget(self.diag_summary_label)
+        controls.add_widget(self.diag_top_rules_label)
+        controls.add_widget(self.diag_last_fail_label)
+
         left.add_widget(controls)
 
         gallery_card = GlassCard(orientation="vertical")
@@ -1175,7 +1208,7 @@ class CamouflageApp(App):
         # Colonne droite
         right = BoxLayout(orientation="vertical", spacing=dp(10))
 
-        previews = BoxLayout(spacing=dp(10), size_hint_y=0.58)
+        previews = BoxLayout(spacing=dp(10), size_hint_y=0.46)
 
         self.preview_img = Image(allow_stretch=True, keep_ratio=True)
         self.preview_silhouette = Image(allow_stretch=True, keep_ratio=True)
@@ -1184,11 +1217,22 @@ class CamouflageApp(App):
         previews.add_widget(self._carded_view("Projection silhouette", self.preview_silhouette))
         right.add_widget(previews)
 
+        bottom_split = BoxLayout(spacing=dp(10), size_hint_y=0.54)
+
         log_card = GlassCard(orientation="vertical")
         log_card.add_widget(self._label("Journal"))
         self.log_view = LogView()
         log_card.add_widget(self.log_view)
-        right.add_widget(log_card)
+
+        diag_card = GlassCard(orientation="vertical")
+        diag_card.add_widget(self._label("Logs diagnostic live"))
+        self.diag_log_view = LogView()
+        diag_card.add_widget(self.diag_log_view)
+
+        bottom_split.add_widget(log_card)
+        bottom_split.add_widget(diag_card)
+
+        right.add_widget(bottom_split)
 
         body.add_widget(left)
         body.add_widget(right)
@@ -1196,6 +1240,7 @@ class CamouflageApp(App):
 
         self._refresh_controls_state()
         self.reload_gallery()
+        self._reset_live_diagnostics()
         Clock.schedule_interval(self._update_resource_monitor, 1.0)
         Clock.schedule_interval(self._refresh_gallery_periodic, 3.0)
 
@@ -1251,6 +1296,99 @@ class CamouflageApp(App):
         lbl = Label(text=text, **kwargs)
         lbl.bind(size=lambda *a: setattr(lbl, "text_size", lbl.size))
         return lbl
+
+    # ---------------- diagnostic live ----------------
+
+    def _reset_live_diagnostics(self):
+        self.diag_total = 0
+        self.diag_accepts = 0
+        self.diag_rejects = 0
+        self.diag_rule_counter = Counter()
+        self.diag_last_rules = []
+        self._refresh_live_diag_labels()
+        if self.diag_log_view is not None:
+            self.diag_log_view.label.text = ""
+
+    def _extract_failure_rules(self, candidate: camo.CandidateResult, target_index: int, local_attempt: int) -> List[str]:
+        if camo_log is None or not hasattr(camo_log, "analyze_candidate"):
+            return []
+
+        try:
+            diagnostic = camo_log.analyze_candidate(candidate, target_index=target_index, local_attempt=local_attempt)
+            failures = getattr(diagnostic, "failures", [])
+            rules: List[str] = []
+            for failure in failures:
+                rule_name = getattr(failure, "rule", None)
+                if rule_name:
+                    rules.append(str(rule_name))
+            return rules
+        except Exception as exc:
+            self.diag_log(f"Diagnostic indisponible pour seed={candidate.seed} : {exc}")
+            return []
+
+    @mainthread
+    def _refresh_live_diag_labels(self):
+        if self.diag_summary_label is not None:
+            rate = (self.diag_accepts / self.diag_total) if self.diag_total else 0.0
+            self.diag_summary_label.text = (
+                f"Tentatives {self.diag_total} | acceptés {self.diag_accepts} | "
+                f"rejetés {self.diag_rejects} | taux {rate:.2%}"
+            )
+
+        if self.diag_top_rules_label is not None:
+            if self.diag_rule_counter:
+                top = self.diag_rule_counter.most_common(3)
+                text = " | ".join(f"{name}:{count}" for name, count in top)
+                self.diag_top_rules_label.text = f"Top règles : {text}"
+            else:
+                self.diag_top_rules_label.text = "Top règles : --"
+
+        if self.diag_last_fail_label is not None:
+            if self.diag_last_rules:
+                self.diag_last_fail_label.text = "Dernier rejet : " + " | ".join(self.diag_last_rules[:3])
+            else:
+                self.diag_last_fail_label.text = "Dernier rejet : --"
+
+    @mainthread
+    def diag_log(self, line: str):
+        if self.diag_log_view is not None:
+            self.diag_log_view.append(line)
+
+    def _register_live_diagnostic(
+        self,
+        candidate: camo.CandidateResult,
+        target_index: int,
+        local_attempt: int,
+        accepted: bool,
+    ):
+        self.diag_total += 1
+
+        if accepted:
+            self.diag_accepts += 1
+            self.diag_last_rules = []
+            self.diag_log(
+                f"[img={target_index:03d} essai={local_attempt:04d}] accepté | seed={candidate.seed}"
+            )
+            self._refresh_live_diag_labels()
+            return
+
+        self.diag_rejects += 1
+        rules = self._extract_failure_rules(candidate, target_index, local_attempt)
+        self.diag_last_rules = rules[:]
+
+        if rules:
+            for rule in rules:
+                self.diag_rule_counter[rule] += 1
+            joined = " | ".join(rules[:6])
+            self.diag_log(
+                f"[img={target_index:03d} essai={local_attempt:04d}] rejet | seed={candidate.seed} | règles: {joined}"
+            )
+        else:
+            self.diag_log(
+                f"[img={target_index:03d} essai={local_attempt:04d}] rejet | seed={candidate.seed} | règles: non disponibles"
+            )
+
+        self._refresh_live_diag_labels()
 
     # ---------------- controls / gallery ----------------
 
@@ -1360,6 +1498,7 @@ class CamouflageApp(App):
             prevent_sleep(False)
             self.status("Erreur", ok=False)
             self.log(f"Erreur non capturée : {exc}")
+            self.diag_log(f"Erreur diagnostic : {exc}")
             self._refresh_controls_state()
 
     @mainthread
@@ -1403,11 +1542,13 @@ class CamouflageApp(App):
         self.progress_bar.max_value = count
         self.progress_bar.value = 0
 
+        self._reset_live_diagnostics()
         prevent_sleep(True)
 
         self.status("Génération en cours…", ok=True)
         self.log(f"Démarrage : {count} camouflage(s) demandé(s).")
         self.log(f"Dossier : {self.current_output_dir.resolve()}")
+        self.diag_log("Diagnostic live initialisé.")
         self._refresh_controls_state()
 
         fut = self.async_runner.submit(self._async_worker_generate(count))
@@ -1421,6 +1562,7 @@ class CamouflageApp(App):
         self.stopping = True
         self.status("Arrêt demandé…", ok=False)
         self.log("Arrêt demandé. Fin de la tentative courante puis arrêt.")
+        self.diag_log("Arrêt demandé par l'utilisateur.")
         self._refresh_controls_state()
 
     async def _async_should_stop(self) -> bool:
@@ -1466,6 +1608,13 @@ class CamouflageApp(App):
                         rs=candidate.ratios,
                         extra_scores=extra_scores,
                         metrics=candidate.metrics,
+                    )
+
+                    self._register_live_diagnostic(
+                        candidate=candidate,
+                        target_index=target_index,
+                        local_attempt=local_attempt,
+                        accepted=full_valid,
                     )
 
                     if not full_valid:
@@ -1652,6 +1801,7 @@ class CamouflageApp(App):
         self.log(f"Rapport écrit : {report_path}")
         self.log(f"Best-of exporté : {best_dir}")
         self.log("Génération terminée avec succès.")
+        self.diag_log("Diagnostic live terminé avec succès.")
         self._refresh_controls_state()
         self.reload_gallery()
 
@@ -1671,6 +1821,7 @@ class CamouflageApp(App):
         self.stop_flag = False
         self.status("Arrêté", ok=False)
         self.log("Génération arrêtée proprement.")
+        self.diag_log("Diagnostic live arrêté proprement.")
         self._refresh_controls_state()
         self.reload_gallery()
 
@@ -1682,6 +1833,7 @@ class CamouflageApp(App):
         self.stop_flag = False
         self.status("Erreur", ok=False)
         self.log(f"Erreur : {message}")
+        self.diag_log(f"Erreur diagnostic : {message}")
         self._refresh_controls_state()
 
     # ---------------- UI updates ----------------
