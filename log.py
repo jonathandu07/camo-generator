@@ -27,11 +27,15 @@ import csv
 import importlib
 import json
 import logging
+import os
 import statistics
+import subprocess
+import sys
 import threading
 import time
 import unittest
 from collections import Counter, defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Sequence
@@ -45,12 +49,13 @@ import main as camo
 # CONFIG
 # ============================================================
 
-DEFAULT_ANALYSIS_COUNT = 300
+DEFAULT_ANALYSIS_COUNT = 20
 DEFAULT_OUTPUT_DIR = Path("logs_generation")
-DEFAULT_TEST_MODULES: tuple[str, ...] = ("test_main", "test_start")
+DEFAULT_TEST_MODULES: tuple[str, ...] = ("test_main",)
 DEFAULT_RUNTIME_LOG_FILE = "runtime.log"
 DEFAULT_TEST_SUMMARY_FILE = "tests_summary.json"
 DEFAULT_HISTORY_LIMIT = 5000
+DEFAULT_MAX_CONCURRENCY = max(1, min(4, (os.cpu_count() or 4)))
 
 LOGGER_NAME = "camo_log"
 
@@ -144,8 +149,26 @@ class RuntimeEvent:
     def format_line(self) -> str:
         stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.ts))
         if self.payload:
-            return f"{stamp} | {self.level:<8} | {self.source} | {self.message} | {json.dumps(self.payload, ensure_ascii=False, sort_keys=True)}"
+            return (
+                f"{stamp} | {self.level:<8} | {self.source} | {self.message} | "
+                f"{json.dumps(self.payload, ensure_ascii=False, sort_keys=True, default=str)}"
+            )
         return f"{stamp} | {self.level:<8} | {self.source} | {self.message}"
+
+
+@dataclass
+class TestModuleSummary:
+    module: str
+    ok: bool
+    returncode: int
+    duration_s: float
+    command: List[str]
+    stdout: str
+    stderr: str
+    log_file: str | None = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass
@@ -161,23 +184,23 @@ class TestRunSummary:
     modules: List[str]
     log_files: Dict[str, str]
     details: Dict[str, List[Dict[str, str]]]
+    per_module: List[TestModuleSummary] = field(default_factory=list)
+    parallel: bool = False
 
     def short_text(self) -> str:
         if self.ok:
             return f"{self.total} tests OK"
-        return (
-            f"{self.total} tests exécutés | "
-            f"{self.failures} échec(s) | {self.errors} erreur(s)"
-        )
+        return f"{self.total} tests exécutés | {self.failures} échec(s) | {self.errors} erreur(s)"
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        data["per_module"] = [m.to_dict() for m in self.per_module]
+        return data
 
 
 # ============================================================
 # OUTILS GÉNÉRIQUES
 # ============================================================
-
 
 def ensure_dir(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
@@ -196,6 +219,31 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 def _metric(metrics: Dict[str, Any], name: str, default: float = 0.0) -> float:
     return _safe_float(metrics.get(name, default), default=default)
+
+
+def _safe_relpath(path: Path) -> str:
+    try:
+        return str(path.resolve())
+    except Exception:
+        return str(path)
+
+
+def _normalize_module_names(module_names: Sequence[str] | None) -> List[str]:
+    if not module_names:
+        return list(DEFAULT_TEST_MODULES)
+
+    out: List[str] = []
+    seen = set()
+    for name in module_names:
+        name = str(name).strip()
+        if not name:
+            continue
+        if name.endswith(".py"):
+            name = name[:-3]
+        if name not in seen:
+            seen.add(name)
+            out.append(name)
+    return out or list(DEFAULT_TEST_MODULES)
 
 
 # ============================================================
@@ -266,7 +314,10 @@ class ContinuousLogManager:
             self.history.append(event)
             log_message = event.message
             if payload:
-                log_message = f"{log_message} | payload={json.dumps(payload, ensure_ascii=False, sort_keys=True)}"
+                log_message = (
+                    f"{log_message} | payload="
+                    f"{json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)}"
+                )
             self.logger.log(getattr(logging, event.level, logging.INFO), f"[{event.source}] {log_message}")
             subscribers = list(self._subscribers)
 
@@ -312,7 +363,6 @@ def get_runtime_snapshot(n: int = 200) -> List[Dict[str, Any]]:
 # ============================================================
 # RÈGLES DE DIAGNOSTIC
 # ============================================================
-
 
 def rule_fail_min(name: str, actual: float, min_value: float) -> RuleFailure | None:
     if actual >= min_value:
@@ -379,7 +429,6 @@ def rule_fail_target_abs(name: str, actual: float, target: float, max_abs_error:
 # ============================================================
 # ANALYSE D'UN CANDIDAT
 # ============================================================
-
 
 def analyze_candidate(
     candidate: camo.CandidateResult,
@@ -531,45 +580,125 @@ async def async_analyze_candidate(
 # GÉNÉRATION DE DIAGNOSTICS
 # ============================================================
 
+def _generate_one_diagnostic(i: int, base_seed: int) -> CandidateDiagnostic:
+    seed = camo.build_seed(target_index=1, local_attempt=i, base_seed=base_seed)
+    candidate = camo.generate_candidate_from_seed(seed)
+    return analyze_candidate(candidate, target_index=1, local_attempt=i)
+
 
 def generate_diagnostics(
     count: int,
     base_seed: int = camo.DEFAULT_BASE_SEED,
+    parallel: bool = False,
+    max_workers: int = DEFAULT_MAX_CONCURRENCY,
 ) -> List[CandidateDiagnostic]:
     diagnostics: List[CandidateDiagnostic] = []
+    count = max(0, int(count))
+    max_workers = max(1, int(max_workers))
 
-    log_event("INFO", "generate_diagnostics", "Début diagnostic synchrone", count=int(count), base_seed=int(base_seed))
-    for i in range(1, count + 1):
-        seed = camo.build_seed(target_index=1, local_attempt=i, base_seed=base_seed)
-        candidate = camo.generate_candidate_from_seed(seed)
-        diagnostic = analyze_candidate(candidate, target_index=1, local_attempt=i)
-        diagnostics.append(diagnostic)
+    log_event(
+        "INFO",
+        "generate_diagnostics",
+        "Début diagnostic synchrone",
+        count=count,
+        base_seed=int(base_seed),
+        parallel=bool(parallel),
+        max_workers=max_workers,
+    )
 
-    log_event("INFO", "generate_diagnostics", "Fin diagnostic synchrone", count=len(diagnostics))
+    if count == 0:
+        log_event("INFO", "generate_diagnostics", "Fin diagnostic synchrone", count=0)
+        return diagnostics
+
+    if not parallel or count == 1:
+        for i in range(1, count + 1):
+            diagnostics.append(_generate_one_diagnostic(i, base_seed))
+    else:
+        ordered: Dict[int, CandidateDiagnostic] = {}
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="diag") as executor:
+            futures = {executor.submit(_generate_one_diagnostic, i, base_seed): i for i in range(1, count + 1)}
+            for future in as_completed(futures):
+                idx = futures[future]
+                ordered[idx] = future.result()
+        diagnostics = [ordered[i] for i in range(1, count + 1)]
+
+    log_event(
+        "INFO",
+        "generate_diagnostics",
+        "Fin diagnostic synchrone",
+        count=len(diagnostics),
+        parallel=bool(parallel),
+    )
     return diagnostics
 
 
 async def async_generate_diagnostics(
     count: int,
     base_seed: int = camo.DEFAULT_BASE_SEED,
+    max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
+    parallel: bool = True,
 ) -> List[CandidateDiagnostic]:
-    diagnostics: List[CandidateDiagnostic] = []
+    count = max(0, int(count))
+    max_concurrency = max(1, int(max_concurrency))
 
-    await async_log_event("INFO", "async_generate_diagnostics", "Début diagnostic asynchrone", count=int(count), base_seed=int(base_seed))
-    for i in range(1, count + 1):
+    await async_log_event(
+        "INFO",
+        "async_generate_diagnostics",
+        "Début diagnostic asynchrone",
+        count=count,
+        base_seed=int(base_seed),
+        parallel=bool(parallel),
+        max_concurrency=max_concurrency,
+    )
+
+    if count == 0:
+        await async_log_event("INFO", "async_generate_diagnostics", "Fin diagnostic asynchrone", count=0)
+        return []
+
+    if not parallel or count == 1:
+        diagnostics: List[CandidateDiagnostic] = []
+        for i in range(1, count + 1):
+            seed = camo.build_seed(target_index=1, local_attempt=i, base_seed=base_seed)
+            candidate = await camo.async_generate_candidate_from_seed(seed)
+            diagnostic = await async_analyze_candidate(candidate, target_index=1, local_attempt=i)
+            diagnostics.append(diagnostic)
+
+        await async_log_event(
+            "INFO",
+            "async_generate_diagnostics",
+            "Fin diagnostic asynchrone",
+            count=len(diagnostics),
+            parallel=False,
+        )
+        return diagnostics
+
+    sem = asyncio.Semaphore(max_concurrency)
+
+    async def one(i: int) -> tuple[int, CandidateDiagnostic]:
         seed = camo.build_seed(target_index=1, local_attempt=i, base_seed=base_seed)
-        candidate = await camo.async_generate_candidate_from_seed(seed)
-        diagnostic = await async_analyze_candidate(candidate, target_index=1, local_attempt=i)
-        diagnostics.append(diagnostic)
+        async with sem:
+            candidate = await camo.async_generate_candidate_from_seed(seed)
+            diagnostic = await async_analyze_candidate(candidate, target_index=1, local_attempt=i)
+            return i, diagnostic
 
-    await async_log_event("INFO", "async_generate_diagnostics", "Fin diagnostic asynchrone", count=len(diagnostics))
+    results = await asyncio.gather(*(one(i) for i in range(1, count + 1)))
+    results.sort(key=lambda x: x[0])
+    diagnostics = [diag for _, diag in results]
+
+    await async_log_event(
+        "INFO",
+        "async_generate_diagnostics",
+        "Fin diagnostic asynchrone",
+        count=len(diagnostics),
+        parallel=True,
+        max_concurrency=max_concurrency,
+    )
     return diagnostics
 
 
 # ============================================================
 # SYNTHÈSE
 # ============================================================
-
 
 def build_summary(diagnostics: List[CandidateDiagnostic]) -> Dict[str, Any]:
     total = len(diagnostics)
@@ -657,7 +786,6 @@ def build_summary(diagnostics: List[CandidateDiagnostic]) -> Dict[str, Any]:
 # ============================================================
 # EXPORTS
 # ============================================================
-
 
 def write_candidates_csv(diagnostics: List[CandidateDiagnostic], output_dir: Path) -> Path:
     output_dir = ensure_dir(Path(output_dir))
@@ -747,19 +875,13 @@ def export_runtime_snapshot(output_dir: Path, filename: str = "runtime_snapshot.
 
 
 # ============================================================
-# TESTS UNITAIRES — ORCHESTRATION
+# TESTS UNITAIRES — OUTILS
 # ============================================================
-
 
 def _extract_test_case_tuples(items: Sequence[tuple[Any, str]]) -> List[Dict[str, str]]:
     extracted: List[Dict[str, str]] = []
     for case, trace in items:
-        extracted.append(
-            {
-                "test": str(case),
-                "trace": str(trace),
-            }
-        )
+        extracted.append({"test": str(case), "trace": str(trace)})
     return extracted
 
 
@@ -768,7 +890,6 @@ def discover_test_log_files(module_names: Sequence[str]) -> Dict[str, str]:
     for module_name in module_names:
         try:
             module = importlib.import_module(module_name)
-            module = importlib.reload(module)
             log_file = getattr(module, "LOG_FILE", None)
             if log_file is not None:
                 out[module_name] = str(Path(log_file).resolve())
@@ -777,12 +898,181 @@ def discover_test_log_files(module_names: Sequence[str]) -> Dict[str, str]:
     return out
 
 
+def _count_test_methods_in_module(module_name: str) -> int:
+    try:
+        importlib.invalidate_caches()
+        module = importlib.import_module(module_name)
+        suite = unittest.defaultTestLoader.loadTestsFromModule(module)
+        return int(suite.countTestCases())
+    except Exception:
+        return 0
+
+
+def _collect_parallel_test_counts(module_names: Sequence[str]) -> int:
+    return sum(_count_test_methods_in_module(module_name) for module_name in module_names)
+
+
+def _parse_unittest_output_for_failures(stdout: str, stderr: str) -> tuple[int, int]:
+    text = f"{stdout}\n{stderr}"
+    failures = 0
+    errors = 0
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("FAILED"):
+            continue
+        if "(" not in line or ")" not in line:
+            continue
+
+        inside = line[line.find("(") + 1 : line.rfind(")")]
+        parts = [p.strip() for p in inside.split(",")]
+        for part in parts:
+            if part.startswith("failures="):
+                try:
+                    failures = int(part.split("=", 1)[1])
+                except Exception:
+                    pass
+            elif part.startswith("errors="):
+                try:
+                    errors = int(part.split("=", 1)[1])
+                except Exception:
+                    pass
+
+    return failures, errors
+
+
+def _build_test_command(module_name: str) -> List[str]:
+    return [sys.executable, "-m", "unittest", "-v", module_name]
+
+
+async def _async_run_test_module_subprocess(module_name: str) -> TestModuleSummary:
+    cmd = _build_test_command(module_name)
+    t0 = time.perf_counter()
+
+    await async_log_event("INFO", "tests", "Lancement module de test", module=module_name, command=cmd)
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=os.environ.copy(),
+    )
+    stdout_b, stderr_b = await proc.communicate()
+    dt = time.perf_counter() - t0
+
+    stdout = stdout_b.decode("utf-8", errors="replace")
+    stderr = stderr_b.decode("utf-8", errors="replace")
+
+    log_file = None
+    try:
+        module = importlib.import_module(module_name)
+        lf = getattr(module, "LOG_FILE", None)
+        if lf is not None:
+            log_file = _safe_relpath(Path(lf))
+    except Exception:
+        pass
+
+    summary = TestModuleSummary(
+        module=module_name,
+        ok=(proc.returncode == 0),
+        returncode=int(proc.returncode or 0),
+        duration_s=float(dt),
+        command=cmd,
+        stdout=stdout,
+        stderr=stderr,
+        log_file=log_file,
+    )
+
+    await async_log_event(
+        "INFO" if summary.ok else "ERROR",
+        "tests",
+        "Fin module de test",
+        module=module_name,
+        ok=summary.ok,
+        returncode=summary.returncode,
+        duration_s=round(summary.duration_s, 6),
+    )
+    return summary
+
+
+def _module_summary_to_details(module_summary: TestModuleSummary) -> Dict[str, List[Dict[str, str]]]:
+    failures: List[Dict[str, str]] = []
+    errors: List[Dict[str, str]] = []
+
+    if module_summary.ok:
+        return {"failures": failures, "errors": errors}
+
+    trace_blob = module_summary.stdout.strip()
+    if module_summary.stderr.strip():
+        trace_blob = f"{trace_blob}\n\nSTDERR:\n{module_summary.stderr.strip()}".strip()
+
+    failure_count, error_count = _parse_unittest_output_for_failures(module_summary.stdout, module_summary.stderr)
+
+    if failure_count <= 0 and error_count <= 0:
+        errors.append({"test": module_summary.module, "trace": trace_blob})
+        return {"failures": failures, "errors": errors}
+
+    for i in range(failure_count):
+        failures.append({"test": f"{module_summary.module}::failure_{i+1}", "trace": trace_blob})
+    for i in range(error_count):
+        errors.append({"test": f"{module_summary.module}::error_{i+1}", "trace": trace_blob})
+
+    return {"failures": failures, "errors": errors}
+
+
+def _merge_parallel_module_summaries(module_summaries: Sequence[TestModuleSummary]) -> TestRunSummary:
+    modules = [m.module for m in module_summaries]
+    log_files = {m.module: m.log_file for m in module_summaries if m.log_file}
+
+    all_failures: List[Dict[str, str]] = []
+    all_errors: List[Dict[str, str]] = []
+
+    failures = 0
+    errors = 0
+    for module_summary in module_summaries:
+        f_count, e_count = _parse_unittest_output_for_failures(module_summary.stdout, module_summary.stderr)
+        failures += f_count
+        errors += e_count
+
+        details = _module_summary_to_details(module_summary)
+        all_failures.extend(details["failures"])
+        all_errors.extend(details["errors"])
+
+    total = _collect_parallel_test_counts(modules)
+    duration_s = max((m.duration_s for m in module_summaries), default=0.0)
+    ok = all(m.ok for m in module_summaries)
+
+    if not ok and failures == 0 and errors == 0:
+        errors = sum(1 for m in module_summaries if not m.ok)
+
+    return TestRunSummary(
+        ok=ok,
+        total=int(total),
+        failures=int(failures),
+        errors=int(errors),
+        skipped=0,
+        expected_failures=0,
+        unexpected_successes=0,
+        duration_s=float(duration_s),
+        modules=list(modules),
+        log_files=log_files,
+        details={"failures": all_failures, "errors": all_errors},
+        per_module=list(module_summaries),
+        parallel=True,
+    )
+
+
+# ============================================================
+# TESTS UNITAIRES — ORCHESTRATION
+# ============================================================
+
 def run_preflight_tests(
     module_names: Sequence[str] = DEFAULT_TEST_MODULES,
     output_dir: Path = DEFAULT_OUTPUT_DIR,
 ) -> TestRunSummary:
+    module_names = _normalize_module_names(module_names)
     ensure_dir(Path(output_dir))
-    log_event("INFO", "tests", "Début préflight", modules=list(module_names))
+    log_event("INFO", "tests", "Début préflight synchrone", modules=list(module_names), parallel=False)
 
     t0 = time.perf_counter()
     importlib.invalidate_caches()
@@ -793,7 +1083,6 @@ def run_preflight_tests(
 
     for module_name in module_names:
         module = importlib.import_module(module_name)
-        module = importlib.reload(module)
         suite.addTests(loader.loadTestsFromModule(module))
         loaded_modules.append(module_name)
 
@@ -816,18 +1105,21 @@ def run_preflight_tests(
             "failures": _extract_test_case_tuples(result.failures),
             "errors": _extract_test_case_tuples(result.errors),
         },
+        per_module=[],
+        parallel=False,
     )
 
     write_test_summary_json(summary, output_dir=output_dir)
     log_event(
         "INFO" if summary.ok else "ERROR",
         "tests",
-        "Fin préflight",
+        "Fin préflight synchrone",
         ok=summary.ok,
         total=summary.total,
         failures=summary.failures,
         errors=summary.errors,
         duration_s=round(summary.duration_s, 6),
+        parallel=False,
     )
     return summary
 
@@ -836,7 +1128,36 @@ async def async_run_preflight_tests(
     module_names: Sequence[str] = DEFAULT_TEST_MODULES,
     output_dir: Path = DEFAULT_OUTPUT_DIR,
 ) -> TestRunSummary:
-    return await asyncio.to_thread(run_preflight_tests, tuple(module_names), output_dir)
+    """
+    Lance les modules de tests en parallèle dans des sous-processus distincts.
+    C'est le mode à privilégier pour tester plusieurs modules lourds simultanément.
+    """
+    ensure_dir(Path(output_dir))
+    module_names = tuple(_normalize_module_names(module_names))
+
+    await async_log_event("INFO", "tests", "Début préflight asynchrone", modules=list(module_names), parallel=True)
+    t0 = time.perf_counter()
+
+    module_summaries = await asyncio.gather(
+        *[_async_run_test_module_subprocess(module_name) for module_name in module_names]
+    )
+
+    summary = _merge_parallel_module_summaries(module_summaries)
+    summary.duration_s = float(time.perf_counter() - t0)
+
+    await asyncio.to_thread(write_test_summary_json, summary, output_dir)
+    await async_log_event(
+        "INFO" if summary.ok else "ERROR",
+        "tests",
+        "Fin préflight asynchrone",
+        ok=summary.ok,
+        total=summary.total,
+        failures=summary.failures,
+        errors=summary.errors,
+        duration_s=round(summary.duration_s, 6),
+        parallel=True,
+    )
+    return summary
 
 
 def write_test_summary_json(summary: TestRunSummary, output_dir: Path, filename: str = DEFAULT_TEST_SUMMARY_FILE) -> Path:
@@ -850,20 +1171,27 @@ def write_test_summary_json(summary: TestRunSummary, output_dir: Path, filename:
 # ORCHESTRATION GLOBALE
 # ============================================================
 
-
 def run_full_diagnostic(
     count: int,
     output_dir: Path = DEFAULT_OUTPUT_DIR,
     base_seed: int = camo.DEFAULT_BASE_SEED,
     run_tests_first: bool = True,
+    test_modules: Sequence[str] = DEFAULT_TEST_MODULES,
+    parallel_diagnostics: bool = False,
+    max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
 ) -> Dict[str, Any]:
     output_dir = ensure_dir(Path(output_dir))
 
     tests_summary: Optional[TestRunSummary] = None
     if run_tests_first:
-        tests_summary = run_preflight_tests(output_dir=output_dir)
+        tests_summary = run_preflight_tests(module_names=test_modules, output_dir=output_dir)
 
-    diagnostics = generate_diagnostics(count=count, base_seed=base_seed)
+    diagnostics = generate_diagnostics(
+        count=count,
+        base_seed=base_seed,
+        parallel=parallel_diagnostics,
+        max_workers=max_concurrency,
+    )
     summary = build_summary(diagnostics)
 
     csv_path = write_candidates_csv(diagnostics, output_dir)
@@ -871,7 +1199,7 @@ def run_full_diagnostic(
     txt_path = write_summary_txt(summary, output_dir)
     runtime_snapshot_path = export_runtime_snapshot(output_dir)
 
-    result = {
+    return {
         "tests_summary": None if tests_summary is None else tests_summary.to_dict(),
         "summary": summary,
         "paths": {
@@ -882,7 +1210,6 @@ def run_full_diagnostic(
             "runtime_snapshot": str(runtime_snapshot_path.resolve()),
         },
     }
-    return result
 
 
 async def async_run_full_diagnostic(
@@ -890,14 +1217,26 @@ async def async_run_full_diagnostic(
     output_dir: Path = DEFAULT_OUTPUT_DIR,
     base_seed: int = camo.DEFAULT_BASE_SEED,
     run_tests_first: bool = True,
+    test_modules: Sequence[str] = DEFAULT_TEST_MODULES,
+    parallel_tests: bool = True,
+    parallel_diagnostics: bool = True,
+    max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
 ) -> Dict[str, Any]:
     output_dir = ensure_dir(Path(output_dir))
 
     tests_summary: Optional[TestRunSummary] = None
     if run_tests_first:
-        tests_summary = await async_run_preflight_tests(output_dir=output_dir)
+        if parallel_tests:
+            tests_summary = await async_run_preflight_tests(module_names=test_modules, output_dir=output_dir)
+        else:
+            tests_summary = await asyncio.to_thread(run_preflight_tests, tuple(test_modules), output_dir)
 
-    diagnostics = await async_generate_diagnostics(count=count, base_seed=base_seed)
+    diagnostics = await async_generate_diagnostics(
+        count=count,
+        base_seed=base_seed,
+        max_concurrency=max_concurrency,
+        parallel=parallel_diagnostics,
+    )
     summary = build_summary(diagnostics)
 
     csv_path = await async_write_candidates_csv(diagnostics, output_dir)
@@ -905,7 +1244,7 @@ async def async_run_full_diagnostic(
     txt_path = await async_write_summary_txt(summary, output_dir)
     runtime_snapshot_path = await asyncio.to_thread(export_runtime_snapshot, output_dir)
 
-    result = {
+    return {
         "tests_summary": None if tests_summary is None else tests_summary.to_dict(),
         "summary": summary,
         "paths": {
@@ -916,13 +1255,11 @@ async def async_run_full_diagnostic(
             "runtime_snapshot": str(runtime_snapshot_path.resolve()),
         },
     }
-    return result
 
 
 # ============================================================
 # CLI
 # ============================================================
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -932,14 +1269,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=str, default=str(DEFAULT_OUTPUT_DIR), help="Dossier de sortie des logs.")
     parser.add_argument("--base-seed", type=int, default=camo.DEFAULT_BASE_SEED, help="Seed de base.")
     parser.add_argument("--async", dest="use_async", action="store_true", help="Utiliser la version asynchrone.")
-    parser.add_argument("--skip-tests", action="store_true", help="Ne pas lancer test_main.py et test_start.py avant le diagnostic.")
+    parser.add_argument("--skip-tests", action="store_true", help="Ne pas lancer les tests avant le diagnostic.")
     parser.add_argument("--tests-only", action="store_true", help="Lancer uniquement les tests unitaires.")
+    parser.add_argument(
+        "--test-modules",
+        nargs="*",
+        default=list(DEFAULT_TEST_MODULES),
+        help="Liste des modules de tests à lancer, ex: test_main test_start",
+    )
+    parser.add_argument(
+        "--parallel-tests",
+        action="store_true",
+        help="En mode async, lancer les modules de tests en parallèle dans des sous-processus.",
+    )
+    parser.add_argument(
+        "--parallel-diagnostics",
+        action="store_true",
+        help="Paralléliser la génération/analyse des candidats.",
+    )
+    parser.add_argument(
+        "--max-concurrency",
+        type=int,
+        default=DEFAULT_MAX_CONCURRENCY,
+        help="Nombre maximal de workers/concurrence pour les diagnostics async/sync parallèles.",
+    )
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Mode rapide : count=10, test_modules=test_main, parallel_tests et parallel_diagnostics activés.",
+    )
     return parser.parse_args()
 
 
 def _print_test_summary(summary: TestRunSummary) -> None:
     print("\nPréflight tests terminé.")
     print(f"Modules            : {', '.join(summary.modules)}")
+    print(f"Mode parallèle     : {'oui' if summary.parallel else 'non'}")
     print(f"Résultat           : {'OK' if summary.ok else 'KO'}")
     print(f"Tests exécutés     : {summary.total}")
     print(f"Échecs             : {summary.failures}")
@@ -950,14 +1315,37 @@ def _print_test_summary(summary: TestRunSummary) -> None:
         print("Logs modules       :")
         for module_name, path in summary.log_files.items():
             print(f"  - {module_name}: {path}")
+    if summary.per_module:
+        print("Détail modules     :")
+        for item in summary.per_module:
+            print(
+                f"  - {item.module}: "
+                f"{'OK' if item.ok else 'KO'} | "
+                f"rc={item.returncode} | "
+                f"{item.duration_s:.2f} s"
+            )
+
+
+def _apply_fast_mode(args: argparse.Namespace) -> None:
+    if not args.fast:
+        return
+    args.count = 10
+    args.test_modules = ["test_main"]
+    args.parallel_tests = True
+    args.parallel_diagnostics = True
+    if int(args.max_concurrency) < 2:
+        args.max_concurrency = 2
 
 
 def main() -> None:
     args = parse_args()
+    _apply_fast_mode(args)
+
     output_dir = ensure_dir(Path(args.output))
+    test_modules = _normalize_module_names(args.test_modules)
 
     if args.tests_only:
-        summary = run_preflight_tests(output_dir=output_dir)
+        summary = run_preflight_tests(module_names=test_modules, output_dir=output_dir)
         _print_test_summary(summary)
         return
 
@@ -967,6 +1355,9 @@ def main() -> None:
         output_dir=output_dir,
         base_seed=int(args.base_seed),
         run_tests_first=not bool(args.skip_tests),
+        test_modules=test_modules,
+        parallel_diagnostics=bool(args.parallel_diagnostics),
+        max_concurrency=int(args.max_concurrency),
     )
     dt = time.perf_counter() - t0
 
@@ -992,10 +1383,16 @@ def main() -> None:
 
 async def async_main() -> None:
     args = parse_args()
+    _apply_fast_mode(args)
+
     output_dir = ensure_dir(Path(args.output))
+    test_modules = _normalize_module_names(args.test_modules)
 
     if args.tests_only:
-        summary = await async_run_preflight_tests(output_dir=output_dir)
+        if args.parallel_tests:
+            summary = await async_run_preflight_tests(module_names=test_modules, output_dir=output_dir)
+        else:
+            summary = await asyncio.to_thread(run_preflight_tests, tuple(test_modules), output_dir)
         _print_test_summary(summary)
         return
 
@@ -1005,6 +1402,10 @@ async def async_main() -> None:
         output_dir=output_dir,
         base_seed=int(args.base_seed),
         run_tests_first=not bool(args.skip_tests),
+        test_modules=test_modules,
+        parallel_tests=bool(args.parallel_tests),
+        parallel_diagnostics=bool(args.parallel_diagnostics),
+        max_concurrency=int(args.max_concurrency),
     )
     dt = time.perf_counter() - t0
 
@@ -1030,6 +1431,8 @@ async def async_main() -> None:
 
 if __name__ == "__main__":
     parsed = parse_args()
+    _apply_fast_mode(parsed)
+
     if parsed.use_async:
         asyncio.run(async_main())
     else:
