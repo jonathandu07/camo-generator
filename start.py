@@ -1052,7 +1052,7 @@ class CamouflageApp(App):
         self.total_attempts = 0
 
         self.process = psutil.Process() if psutil else None
-        self.machine_intensity = 85.0
+        self.machine_intensity = 100.0
 
         self.tests_ran = False
         self.tests_ok = False
@@ -1192,9 +1192,21 @@ class CamouflageApp(App):
 
         controls.add_widget(self._label("Mode de démarrage"))
         mode_grid = GridLayout(cols=1, size_hint_y=None, spacing=dp(8), height=dp(194))
-        self.mode_blocking_btn = self._styled_button("● Tests bloquants", "launch", lambda *_: self._set_run_mode(RUN_MODE_BLOCKING))
-        self.mode_non_blocking_btn = self._styled_button("○ Tests non bloquants", "neutral", lambda *_: self._set_run_mode(RUN_MODE_NON_BLOCKING))
-        self.mode_skip_tests_btn = self._styled_button("○ Sans tests", "neutral", lambda *_: self._set_run_mode(RUN_MODE_SKIP_TESTS))
+        self.mode_blocking_btn = self._styled_button(
+            "● Tests bloquants",
+            "launch",
+            lambda *_: self._set_run_mode(RUN_MODE_BLOCKING),
+        )
+        self.mode_non_blocking_btn = self._styled_button(
+            "○ Tests non bloquants",
+            "neutral",
+            lambda *_: self._set_run_mode(RUN_MODE_NON_BLOCKING),
+        )
+        self.mode_skip_tests_btn = self._styled_button(
+            "○ Sans tests",
+            "neutral",
+            lambda *_: self._set_run_mode(RUN_MODE_SKIP_TESTS),
+        )
         mode_grid.add_widget(self.mode_blocking_btn)
         mode_grid.add_widget(self.mode_non_blocking_btn)
         mode_grid.add_widget(self.mode_skip_tests_btn)
@@ -1220,8 +1232,8 @@ class CamouflageApp(App):
 
         controls.add_widget(self._label("Intensité machine"))
         intensity_row = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(10))
-        self.intensity_slider = Slider(min=25, max=100, value=85)
-        self.intensity_label = self._small_label("85 %", size_hint_x=0.22)
+        self.intensity_slider = Slider(min=25, max=100, value=100)
+        self.intensity_label = self._small_label("100 %", size_hint_x=0.22)
         self.intensity_slider.bind(value=self._on_intensity_change)
         intensity_row.add_widget(self.intensity_slider)
         intensity_row.add_widget(self.intensity_label)
@@ -1558,7 +1570,14 @@ class CamouflageApp(App):
         self.status("Préflight en cours…", ok=True)
         self.log(f"Lancement des tests de préflight via log.py ({mode_text})…")
         self.diag_log(f"Préflight lancé via log.py ({mode_text}).")
-        self._emit_runtime("INFO", "start_preflight", "Préflight lancé depuis le front", mode=mode_text, modules=list(DEFAULT_PREFLIGHT_MODULES), timeout_s=DEFAULT_PREFLIGHT_TIMEOUT_S)
+        self._emit_runtime(
+            "INFO",
+            "start_preflight",
+            "Préflight lancé depuis le front",
+            mode=mode_text,
+            modules=list(DEFAULT_PREFLIGHT_MODULES),
+            timeout_s=DEFAULT_PREFLIGHT_TIMEOUT_S,
+        )
         self._update_preflight_label(f"Préflight en cours ({mode_text})…", ok=None)
         self._refresh_controls_state()
 
@@ -1601,7 +1620,14 @@ class CamouflageApp(App):
                 self.status("Tests KO", ok=False)
             elif not self.running:
                 self.status("Tests KO (tolérés)", ok=False)
-            self._emit_runtime("ERROR", "start_preflight", "Préflight en échec", ok=False, summary=summary, blocking=pending_start)
+            self._emit_runtime(
+                "ERROR",
+                "start_preflight",
+                "Préflight en échec",
+                ok=False,
+                summary=summary,
+                blocking=pending_start,
+            )
             if not pending_start:
                 self.log("Préflight non bloquant : la génération continue malgré l'échec des tests.")
                 self.diag_log("Préflight non bloquant : poursuite malgré échec / timeout / incomplétude.")
@@ -1635,7 +1661,9 @@ class CamouflageApp(App):
         try:
             if hasattr(camo_log, "async_analyze_candidate"):
                 diagnostic = await camo_log.async_analyze_candidate(
-                    candidate, target_index=target_index, local_attempt=local_attempt
+                    candidate,
+                    target_index=target_index,
+                    local_attempt=local_attempt,
                 )
             elif hasattr(camo_log, "analyze_candidate"):
                 diagnostic = await asyncio.to_thread(
@@ -1714,11 +1742,13 @@ class CamouflageApp(App):
                 self.diag_rule_counter[rule] += 1
             joined = " | ".join(rules[:6])
             self.diag_log(
-                f"[img={target_index:03d} essai={local_attempt:04d}] rejet | seed={candidate.seed} | règles: {joined}"
+                f"[img={target_index:03d} essai={local_attempt:04d}] rejet | "
+                f"seed={candidate.seed} | règles: {joined}"
             )
         else:
             self.diag_log(
-                f"[img={target_index:03d} essai={local_attempt:04d}] rejet | seed={candidate.seed} | règles: non disponibles"
+                f"[img={target_index:03d} essai={local_attempt:04d}] rejet | "
+                f"seed={candidate.seed} | règles: non disponibles"
             )
 
         self._refresh_live_diag_labels()
@@ -1783,7 +1813,7 @@ class CamouflageApp(App):
             self.resource_text.text = "Monitoring indisponible."
 
     async def _adaptive_pause(self):
-        base = (100.0 - self.machine_intensity) / 1000.0
+        base = 0.0 if self.machine_intensity >= 90 else (100.0 - self.machine_intensity) / 5000.0
 
         if psutil is None:
             if base > 0:
@@ -1795,12 +1825,10 @@ class CamouflageApp(App):
             ram = psutil.virtual_memory().percent
 
             extra = 0.0
-            if cpu >= 95 or ram >= 92:
-                extra = 0.09
-            elif cpu >= 88 or ram >= 88:
-                extra = 0.05
-            elif cpu >= 80 or ram >= 84:
-                extra = 0.02
+            if cpu >= 98 or ram >= 95:
+                extra = 0.03
+            elif cpu >= 95 or ram >= 92:
+                extra = 0.015
 
             pause = base + extra
             if pause > 0:
@@ -1926,7 +1954,14 @@ class CamouflageApp(App):
         self.log(f"Mode : {self._run_mode_text()}.")
         self.log(f"Dossier : {self.current_output_dir.resolve()}")
         self.diag_log("Diagnostic live initialisé.")
-        self._emit_runtime("INFO", "start_worker", "Génération démarrée", target_count=count, output_dir=str(self.current_output_dir.resolve()), run_mode=self.run_mode)
+        self._emit_runtime(
+            "INFO",
+            "start_worker",
+            "Génération démarrée",
+            target_count=count,
+            output_dir=str(self.current_output_dir.resolve()),
+            run_mode=self.run_mode,
+        )
         self._refresh_controls_state()
 
         fut = self.async_runner.submit(self._async_worker_generate(count))
@@ -1941,7 +1976,13 @@ class CamouflageApp(App):
             if self.preflight_running:
                 self.log("Le préflight en arrière-plan continue jusqu'à sa fin, mais la génération s'arrête.")
             self.diag_log("Arrêt demandé par l'utilisateur.")
-            self._emit_runtime("WARNING", "start_worker", "Arrêt demandé", accepted_count=self.accepted_count, total_attempts=self.total_attempts)
+            self._emit_runtime(
+                "WARNING",
+                "start_worker",
+                "Arrêt demandé",
+                accepted_count=self.accepted_count,
+                total_attempts=self.total_attempts,
+            )
             self._refresh_controls_state()
             return
 
@@ -1977,7 +2018,15 @@ class CamouflageApp(App):
                     self.total_attempts = total_attempts
 
                     seed = camo.build_seed(target_index, local_attempt, base_seed=camo.DEFAULT_BASE_SEED)
-                    self._emit_runtime("INFO", "start_worker", "Tentative en cours", target_index=target_index, local_attempt=local_attempt, global_attempt=total_attempts, seed=seed)
+                    self._emit_runtime(
+                        "INFO",
+                        "start_worker",
+                        "Tentative en cours",
+                        target_index=target_index,
+                        local_attempt=local_attempt,
+                        global_attempt=total_attempts,
+                        seed=seed,
+                    )
                     candidate = await camo.async_generate_candidate_from_seed(seed)
 
                     extra_scores, valid_v3 = await async_evaluate_candidate_v3(
@@ -2018,7 +2067,16 @@ class CamouflageApp(App):
                             f"T={candidate.ratios[camo.IDX_TERRE]*100:.1f} "
                             f"G={candidate.ratios[camo.IDX_GRIS]*100:.1f}"
                         )
-                        self._emit_runtime("WARNING", "start_worker", "Candidat rejeté", target_index=target_index, local_attempt=local_attempt, global_attempt=total_attempts, seed=candidate.seed, score_final=round(float(extra_scores['score_final']), 5))
+                        self._emit_runtime(
+                            "WARNING",
+                            "start_worker",
+                            "Candidat rejeté",
+                            target_index=target_index,
+                            local_attempt=local_attempt,
+                            global_attempt=total_attempts,
+                            seed=candidate.seed,
+                            score_final=round(float(extra_scores["score_final"]), 5),
+                        )
                         await self._adaptive_pause()
                         await asyncio.sleep(0)
                         continue
@@ -2094,7 +2152,17 @@ class CamouflageApp(App):
                         f"silhouette={extra_scores['score_silhouette']:.3f} | "
                         f"contour={extra_scores['contour_break_score']:.3f}"
                     )
-                    self._emit_runtime("INFO", "start_worker", "Candidat accepté", target_index=target_index, local_attempt=local_attempt, global_attempt=total_attempts, seed=candidate.seed, image_path=str(filename.resolve()), score_final=round(float(extra_scores['score_final']), 5))
+                    self._emit_runtime(
+                        "INFO",
+                        "start_worker",
+                        "Candidat accepté",
+                        target_index=target_index,
+                        local_attempt=local_attempt,
+                        global_attempt=total_attempts,
+                        seed=candidate.seed,
+                        image_path=str(filename.resolve()),
+                        score_final=round(float(extra_scores["score_final"]), 5),
+                    )
                     self.reload_gallery()
 
                     await self._adaptive_pause()
@@ -2196,7 +2264,13 @@ class CamouflageApp(App):
         self.log(f"Best-of exporté : {best_dir}")
         self.log("Génération terminée avec succès.")
         self.diag_log("Diagnostic live terminé avec succès.")
-        self._emit_runtime("INFO", "start_worker", "Génération terminée avec succès", accepted_count=len(rows), total_attempts=self.total_attempts)
+        self._emit_runtime(
+            "INFO",
+            "start_worker",
+            "Génération terminée avec succès",
+            accepted_count=len(rows),
+            total_attempts=self.total_attempts,
+        )
         self._refresh_controls_state()
         self._refresh_run_mode_buttons()
         self.reload_gallery()
@@ -2218,7 +2292,13 @@ class CamouflageApp(App):
         self.status("Arrêté", ok=False)
         self.log("Génération arrêtée proprement.")
         self.diag_log("Diagnostic live arrêté proprement.")
-        self._emit_runtime("WARNING", "start_worker", "Génération arrêtée", accepted_count=len(rows), total_attempts=self.total_attempts)
+        self._emit_runtime(
+            "WARNING",
+            "start_worker",
+            "Génération arrêtée",
+            accepted_count=len(rows),
+            total_attempts=self.total_attempts,
+        )
         self._refresh_controls_state()
         self._refresh_run_mode_buttons()
         self.reload_gallery()
