@@ -11,6 +11,7 @@ Objectifs :
 - couvrir les exports CSV / best-of ;
 - couvrir le runner asyncio dédié ;
 - couvrir les méthodes applicatives de CamouflageApp ;
+- couvrir le préflight non bloquant ;
 - fournir des logs lisibles, précis et exploitables.
 
 Exécution :
@@ -19,18 +20,15 @@ Exécution :
 
 from __future__ import annotations
 
-import asyncio
 import csv
-import importlib
 import logging
 import tempfile
-import threading
 import time
 import types
 import unittest
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
@@ -195,10 +193,6 @@ def make_fake_input(text: str = "10") -> Any:
     return types.SimpleNamespace(text=text)
 
 
-def make_fake_slider(value: float = 85.0) -> Any:
-    return types.SimpleNamespace(value=value)
-
-
 def make_fake_image_widget() -> Any:
     return types.SimpleNamespace(texture=None)
 
@@ -229,7 +223,7 @@ class FakeProcess:
 
 
 # ============================================================
-# TESTS PALETTE / COULEURS / CONSTANTES
+# TESTS PALETTE / CONSTANTES
 # ============================================================
 
 class TestPaletteAndConstants(TestAssertionsMixin, unittest.TestCase):
@@ -315,8 +309,8 @@ class TestPureUtilities(TestAssertionsMixin, unittest.TestCase):
 
     def test_largest_component_ratio_non_empty(self) -> None:
         mask = np.zeros((6, 6), dtype=bool)
-        mask[0:2, 0:2] = True   # 4
-        mask[3:6, 3:6] = True   # 9
+        mask[0:2, 0:2] = True
+        mask[3:6, 3:6] = True
         ratio = sut.largest_component_ratio(mask)
         self.assertFloatClose(ratio, 9 / 13)
 
@@ -329,7 +323,7 @@ class TestPureUtilities(TestAssertionsMixin, unittest.TestCase):
 
 
 # ============================================================
-# TESTS SILHOUETTE / CONTOUR / STRUCTURE
+# TESTS SILHOUETTE / SCORING
 # ============================================================
 
 class TestSilhouetteAndScoring(TestAssertionsMixin, unittest.TestCase):
@@ -411,15 +405,14 @@ class TestSilhouetteAndScoring(TestAssertionsMixin, unittest.TestCase):
         self.assertEqual(set(scores.keys()), required)
         self.assertIsInstance(ok, bool)
 
-    def test_async_evaluate_candidate_v3(self) -> None:
-        async def runner() -> None:
-            canvas = make_index_canvas_quadrants(160, 100)
-            img = make_pil_from_index_canvas(canvas)
-            scores, ok = await sut.async_evaluate_candidate_v3(img, valid_ratios(), valid_main_metrics())
-            self.assertIn("score_final", scores)
-            self.assertIsInstance(ok, bool)
 
-        asyncio.run(runner())
+class TestSilhouetteAndScoringAsync(unittest.IsolatedAsyncioTestCase):
+    async def test_async_evaluate_candidate_v3(self) -> None:
+        canvas = make_index_canvas_quadrants(160, 100)
+        img = make_pil_from_index_canvas(canvas)
+        scores, ok = await sut.async_evaluate_candidate_v3(img, valid_ratios(), valid_main_metrics())
+        self.assertIn("score_final", scores)
+        self.assertIsInstance(ok, bool)
 
 
 # ============================================================
@@ -431,7 +424,7 @@ class TestAsyncioThreadRunner(unittest.TestCase):
         runner = sut.AsyncioThreadRunner()
         try:
             async def coro() -> int:
-                await asyncio.sleep(0.01)
+                await sut.asyncio.sleep(0.01)
                 return 42
 
             fut = runner.submit(coro())
@@ -705,15 +698,26 @@ class TestCamouflageAppMethods(TempDirMixin, unittest.TestCase):
         self.assertEqual(int(self.app.machine_intensity), 72)
         self.assertEqual(self.app.intensity_label.text, "72 %")
 
-    def test_refresh_controls_state(self) -> None:
+    def test_refresh_controls_state_normal(self) -> None:
         self.app.running = False
         self.app.stopping = False
+        self.app.preflight_running = False
         self.app._refresh_controls_state()
         self.assertFalse(self.app.start_btn.disabled)
         self.assertTrue(self.app.stop_btn.disabled)
 
+    def test_refresh_controls_state_running(self) -> None:
         self.app.running = True
         self.app.stopping = False
+        self.app.preflight_running = False
+        self.app._refresh_controls_state()
+        self.assertTrue(self.app.start_btn.disabled)
+        self.assertFalse(self.app.stop_btn.disabled)
+
+    def test_refresh_controls_state_preflight(self) -> None:
+        self.app.running = False
+        self.app.stopping = False
+        self.app.preflight_running = True
         self.app._refresh_controls_state()
         self.assertTrue(self.app.start_btn.disabled)
         self.assertFalse(self.app.stop_btn.disabled)
@@ -802,7 +806,7 @@ class TestCamouflageAppMethods(TempDirMixin, unittest.TestCase):
 
 
 # ============================================================
-# TESTS PRÉFLIGHT
+# TESTS PRÉFLIGHT NON BLOQUANT
 # ============================================================
 
 class TestPreflight(TempDirMixin, unittest.TestCase):
@@ -815,6 +819,13 @@ class TestPreflight(TempDirMixin, unittest.TestCase):
         self.app.status_label = make_fake_label()
         self.app.log_view = make_fake_log_view()
         self.app.diag_log_view = make_fake_log_view()
+        self.app.start_btn = make_fake_button()
+        self.app.stop_btn = make_fake_button()
+        self.app.count_input = make_fake_input("2")
+        self.app.progress_bar = make_fake_progress_bar()
+        self.app.diag_summary_label = make_fake_label()
+        self.app.diag_top_rules_label = make_fake_label()
+        self.app.diag_last_fail_label = make_fake_label()
 
     def tearDown(self) -> None:
         try:
@@ -824,12 +835,11 @@ class TestPreflight(TempDirMixin, unittest.TestCase):
         self._tmpdir_obj.cleanup()
 
     def test_run_preflight_tests_once_success(self) -> None:
-        fake_result = unittest.TestResult()
-        fake_result.testsRun = 4
+        def suite_run(result: unittest.TestResult) -> None:
+            result.testsRun = 4
 
         fake_suite = MagicMock()
-        fake_suite.run.side_effect = lambda result: setattr(result, "testsRun", 4)
-
+        fake_suite.run.side_effect = suite_run
         fake_module = types.ModuleType("dummy")
 
         with patch.object(sut.importlib, "invalidate_caches"), \
@@ -864,25 +874,11 @@ class TestPreflight(TempDirMixin, unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("5 tests exécutés", summary)
 
-    def test_ensure_preflight_tests_ok(self) -> None:
-        with patch.object(self.app, "_run_preflight_tests_once", return_value=(True, "12 tests OK")):
-            ok = self.app._ensure_preflight_tests()
-
-        self.assertTrue(ok)
-        self.assertTrue(self.app.tests_ran)
-        self.assertTrue(self.app.tests_ok)
-        self.assertEqual(self.app.tests_summary, "12 tests OK")
-        self.assertIn("Préflight OK", self.app.log_view.label.text)
-
-    def test_ensure_preflight_tests_fail(self) -> None:
-        with patch.object(self.app, "_run_preflight_tests_once", return_value=(False, "KO")):
-            ok = self.app._ensure_preflight_tests()
-
+    def test_run_preflight_tests_once_exception(self) -> None:
+        with patch.object(sut.importlib, "invalidate_caches", side_effect=RuntimeError("boom")):
+            ok, summary = self.app._run_preflight_tests_once()
         self.assertFalse(ok)
-        self.assertTrue(self.app.tests_ran)
-        self.assertFalse(self.app.tests_ok)
-        self.assertEqual(self.app.status_label.text, "Tests KO")
-        self.assertIn("Préflight KO", self.app.log_view.label.text)
+        self.assertIn("RuntimeError", summary)
 
     def test_ensure_preflight_tests_cached(self) -> None:
         self.app.tests_ran = True
@@ -893,6 +889,61 @@ class TestPreflight(TempDirMixin, unittest.TestCase):
 
         self.assertTrue(ok)
         mock_run.assert_not_called()
+
+    def test_ensure_preflight_tests_already_running(self) -> None:
+        self.app.preflight_running = True
+        ok = self.app._ensure_preflight_tests()
+        self.assertFalse(ok)
+        self.assertIn("Préflight déjà en cours", self.app.log_view.label.text)
+
+    def test_ensure_preflight_tests_starts_background_worker(self) -> None:
+        with patch.object(sut.Clock, "schedule_once", side_effect=lambda cb, dt=0: cb(0)):
+            with patch.object(self.app, "_run_preflight_tests_once", return_value=(True, "12 tests OK")):
+                ok = self.app._ensure_preflight_tests()
+                if self.app.preflight_thread is not None:
+                    self.app.preflight_thread.join(timeout=1.0)
+
+        self.assertFalse(ok)
+        self.assertTrue(self.app.tests_ran)
+        self.assertTrue(self.app.tests_ok)
+        self.assertEqual(self.app.tests_summary, "12 tests OK")
+        self.assertIn("Préflight OK", self.app.log_view.label.text)
+
+    def test_on_preflight_finished_ok_without_pending_start(self) -> None:
+        self.app.preflight_running = True
+        self.app.preflight_pending_start = False
+
+        with patch.object(self.app, "_start_generation_after_preflight") as mock_start:
+            self.app._on_preflight_finished(True, "9 tests OK")
+
+        self.assertFalse(self.app.preflight_running)
+        self.assertTrue(self.app.tests_ran)
+        self.assertTrue(self.app.tests_ok)
+        self.assertEqual(self.app.tests_summary, "9 tests OK")
+        self.assertEqual(self.app.status_label.text, "Préflight terminé")
+        mock_start.assert_not_called()
+
+    def test_on_preflight_finished_ok_with_pending_start(self) -> None:
+        self.app.preflight_running = True
+        self.app.preflight_pending_start = True
+
+        with patch.object(self.app, "_start_generation_after_preflight") as mock_start:
+            self.app._on_preflight_finished(True, "9 tests OK")
+
+        mock_start.assert_called_once()
+        self.assertFalse(self.app.preflight_pending_start)
+
+    def test_on_preflight_finished_fail(self) -> None:
+        self.app.preflight_running = True
+        self.app.preflight_pending_start = True
+
+        with patch.object(self.app, "_start_generation_after_preflight") as mock_start:
+            self.app._on_preflight_finished(False, "KO")
+
+        self.assertFalse(self.app.tests_ok)
+        self.assertEqual(self.app.status_label.text, "Tests KO")
+        self.assertIn("Préflight KO", self.app.log_view.label.text)
+        mock_start.assert_not_called()
 
 
 # ============================================================
@@ -930,6 +981,13 @@ class TestLiveDiagnostics(unittest.IsolatedAsyncioTestCase):
         with patch.object(sut, "camo_log", None):
             rules = await self.app._extract_failure_rules_async(types.SimpleNamespace(seed=1), 1, 1)
         self.assertEqual(rules, [])
+
+    async def test_extract_failure_rules_async_with_exception(self) -> None:
+        fake_log = types.SimpleNamespace(async_analyze_candidate=AsyncMock(side_effect=RuntimeError("boom")))
+        with patch.object(sut, "camo_log", fake_log):
+            rules = await self.app._extract_failure_rules_async(types.SimpleNamespace(seed=7), 1, 1)
+        self.assertEqual(rules, [])
+        self.assertIn("Diagnostic indisponible", self.app.diag_log_view.label.text)
 
     async def test_register_live_diagnostic_async_accept(self) -> None:
         candidate = types.SimpleNamespace(seed=111)
@@ -995,47 +1053,53 @@ class TestStartStopWorkflow(TempDirMixin, unittest.TestCase):
             pass
         self._tmpdir_obj.cleanup()
 
-    def test_start_generation_invalid_count(self) -> None:
-        self.app.count_input.text = "abc"
-
-        with patch.object(self.app, "_ensure_preflight_tests", return_value=True):
-            self.app.start_generation()
-
-        self.assertIn("Nombre de camouflages invalide", self.app.log_view.label.text)
-        self.assertFalse(self.app.running)
-
-    def test_start_generation_preflight_fail(self) -> None:
-        with patch.object(self.app, "_ensure_preflight_tests", return_value=False):
-            self.app.start_generation()
-
-        self.assertFalse(self.app.running)
-
-    def test_start_generation_already_running(self) -> None:
+    def test_start_generation_while_running(self) -> None:
         self.app.running = True
         self.app.start_generation()
         self.assertTrue(self.app.running)
+
+    def test_start_generation_while_preflight_running(self) -> None:
+        self.app.preflight_running = True
+        with patch.object(self.app, "_ensure_preflight_tests") as mock_pf:
+            self.app.start_generation()
+        mock_pf.assert_not_called()
 
     def test_start_generation_already_has_future(self) -> None:
         fake_future = MagicMock()
         fake_future.done.return_value = False
         self.app.current_future = fake_future
-
-        with patch.object(self.app, "_ensure_preflight_tests", return_value=True):
-            self.app.start_generation()
-
+        self.app.start_generation()
         self.assertIn("déjà en cours", self.app.log_view.label.text)
 
-    def test_start_generation_success_path(self) -> None:
+    def test_start_generation_launches_preflight_if_needed(self) -> None:
+        with patch.object(self.app, "_ensure_preflight_tests", return_value=False) as mock_pf:
+            self.app.start_generation()
+        mock_pf.assert_called_once()
+
+    def test_start_generation_uses_cached_preflight(self) -> None:
+        self.app.tests_ran = True
+        self.app.tests_ok = True
+
+        with patch.object(self.app, "_start_generation_after_preflight") as mock_start:
+            self.app.start_generation()
+
+        mock_start.assert_called_once()
+
+    def test_start_generation_after_preflight_invalid_count(self) -> None:
+        self.app.count_input.text = "abc"
+        self.app._start_generation_after_preflight()
+        self.assertIn("Nombre de camouflages invalide", self.app.log_view.label.text)
+        self.assertFalse(self.app.running)
+
+    def test_start_generation_after_preflight_success_path(self) -> None:
         fake_future = MagicMock()
         fake_future.done.return_value = False
 
         self.app.async_runner = types.SimpleNamespace(submit=MagicMock(return_value=fake_future))
 
-        with patch.object(self.app, "_ensure_preflight_tests", return_value=True), \
-             patch.object(self.app, "_bind_future") as mock_bind, \
+        with patch.object(self.app, "_bind_future") as mock_bind, \
              patch.object(sut, "prevent_sleep") as mock_sleep:
-
-            self.app.start_generation()
+            self.app._start_generation_after_preflight()
 
         self.assertTrue(self.app.running)
         self.assertFalse(self.app.stopping)
@@ -1046,7 +1110,17 @@ class TestStartStopWorkflow(TempDirMixin, unittest.TestCase):
         mock_bind.assert_called_once_with(fake_future)
         mock_sleep.assert_called_once_with(True)
 
-    def test_stop_generation(self) -> None:
+    def test_stop_generation_during_preflight(self) -> None:
+        self.app.preflight_running = True
+        self.app.preflight_pending_start = True
+
+        self.app.stop_generation()
+
+        self.assertFalse(self.app.preflight_pending_start)
+        self.assertEqual(self.app.status_label.text, "Préflight en cours…")
+        self.assertIn("La génération ne démarrera pas", self.app.log_view.label.text)
+
+    def test_stop_generation_running(self) -> None:
         self.app.running = True
         self.app.stopping = False
 
@@ -1069,10 +1143,11 @@ class TestStartStopWorkflow(TempDirMixin, unittest.TestCase):
 
         self.assertTrue(self.app.stop_flag)
         self.assertTrue(self.app.stopping)
+        self.assertFalse(self.app.preflight_pending_start)
         mock_sleep.assert_called_once_with(False)
 
     def test_on_stop_with_pending_future(self) -> None:
-        callback_holder = {}
+        callback_holder: Dict[str, Any] = {}
 
         fake_future = MagicMock()
         fake_future.done.return_value = False

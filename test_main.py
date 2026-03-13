@@ -10,14 +10,12 @@ Objectifs :
 - couvrir les exports PNG / CSV ;
 - couvrir les orchestrateurs sync et async ;
 - fournir des logs lisibles, précis et exploitables ;
-- rendre les diagnostics d'échec plus rapides à comprendre.
+- rendre les diagnostics d'échec plus rapides à comprendre ;
+- accélérer les tests async en exécutant en parallèle
+  les opérations indépendantes (I/O, wrappers async, batchs).
 
 Exécution :
     python -m unittest -v test_main.py
-
-Pré-requis :
-- ce fichier doit pouvoir importer le module cible via : import main as mut
-- adapter éventuellement cette ligne si ton fichier main.py est ailleurs.
 """
 
 from __future__ import annotations
@@ -26,9 +24,10 @@ import asyncio
 import csv
 import logging
 import tempfile
+import time
 import unittest
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List
 from unittest.mock import AsyncMock, patch
 
 import numpy as np
@@ -112,6 +111,17 @@ class TestAssertionsMixin:
         self.assertIsInstance(candidate.metrics, dict)
         self.assertGreaterEqual(candidate.seed, 0)
         self.assertAlmostEqual(float(np.sum(candidate.ratios)), 1.0, places=5)
+
+
+class AsyncTempDirMixin:
+    async def asyncSetUp(self) -> None:
+        self._tmpdir_obj = tempfile.TemporaryDirectory(prefix="test_main_async_")
+        self.tmpdir = Path(self._tmpdir_obj.name)
+        LOGGER.info("Répertoire temporaire async créé : %s", self.tmpdir)
+
+    async def asyncTearDown(self) -> None:
+        LOGGER.info("Nettoyage du répertoire temporaire async : %s", self.tmpdir)
+        self._tmpdir_obj.cleanup()
 
 
 def valid_metrics() -> Dict[str, float]:
@@ -210,6 +220,10 @@ def iter_metric_failure_cases() -> Iterable[tuple[str, float]]:
     yield "terre_de_france_transition_share", mut.MIN_VISIBLE_TERRE_TRANS_SHARE - 0.001
     yield "vert_de_gris_micro_share", mut.MIN_VISIBLE_GRIS_MICRO_SHARE - 0.001
     yield "vert_de_gris_macro_share", mut.MAX_VISIBLE_GRIS_MACRO_SHARE + 0.001
+
+
+async def gather_concurrent(*aws):
+    return await asyncio.gather(*aws)
 
 
 # ============================================================
@@ -575,7 +589,13 @@ class TestStructuralControls(unittest.TestCase):
             mut.MacroRecord(mut.IDX_OLIVE, [], 20, (100, 100), dummy_mask, 2),
             mut.MacroRecord(mut.IDX_OLIVE, [], 22, (150, 110), dummy_mask, 2),
         ]
-        conflict = mut.local_parallel_conflict(macros, center=(130, 105), angle_deg=18, dist_threshold_px=100, angle_threshold_deg=8)
+        conflict = mut.local_parallel_conflict(
+            macros,
+            center=(130, 105),
+            angle_deg=18,
+            dist_threshold_px=100,
+            angle_threshold_deg=8,
+        )
         self.assertTrue(conflict)
 
     def test_local_parallel_conflict_false_when_far(self) -> None:
@@ -584,7 +604,13 @@ class TestStructuralControls(unittest.TestCase):
             mut.MacroRecord(mut.IDX_OLIVE, [], 20, (100, 100), dummy_mask, 2),
             mut.MacroRecord(mut.IDX_OLIVE, [], 22, (600, 600), dummy_mask, 2),
         ]
-        conflict = mut.local_parallel_conflict(macros, center=(130, 105), angle_deg=18, dist_threshold_px=100, angle_threshold_deg=8)
+        conflict = mut.local_parallel_conflict(
+            macros,
+            center=(130, 105),
+            angle_deg=18,
+            dist_threshold_px=100,
+            angle_threshold_deg=8,
+        )
         self.assertFalse(conflict)
 
     def test_transition_is_attached(self) -> None:
@@ -716,15 +742,6 @@ class TestValidationAndExport(TempDirMixin, TestAssertionsMixin, unittest.TestCa
         self.assertTrue(path.exists())
         self.assertEqual(out, path)
 
-    def test_async_save_candidate_image(self) -> None:
-        async def runner() -> None:
-            path = self.tmpdir / "img" / "camouflage_async.png"
-            cand = make_candidate()
-            out = await mut.async_save_candidate_image(cand, path)
-            self.assertTrue(out.exists())
-
-        asyncio.run(runner())
-
     def test_candidate_row_contains_expected_fields(self) -> None:
         cand = make_candidate(seed=999)
         row = mut.candidate_row(
@@ -791,23 +808,81 @@ class TestValidationAndExport(TempDirMixin, TestAssertionsMixin, unittest.TestCa
         self.assertTrue(csv_path.exists())
         self.assertEqual(csv_path.read_text(encoding="utf-8"), "")
 
-    def test_async_write_report(self) -> None:
-        async def runner() -> None:
-            rows = [
-                mut.candidate_row(1, 1, 1, make_candidate(seed=1)),
-                mut.candidate_row(2, 1, 2, make_candidate(seed=2)),
-            ]
-            path = await mut.async_write_report(rows, self.tmpdir, filename="async_report.csv")
-            self.assertTrue(path.exists())
 
-            with path.open("r", encoding="utf-8", newline="") as f:
-                data = list(csv.DictReader(f))
+# ============================================================
+# TESTS VALIDATION / EXPORT ASYNC CONCURRENTS
+# ============================================================
 
-            self.assertEqual(len(data), 2)
-            self.assertEqual(data[0]["seed"], "1")
-            self.assertEqual(data[1]["seed"], "2")
+class TestValidationAndExportAsync(AsyncTempDirMixin, TestAssertionsMixin, unittest.IsolatedAsyncioTestCase):
+    async def test_async_save_candidate_image(self) -> None:
+        path = self.tmpdir / "img" / "camouflage_async.png"
+        cand = make_candidate()
+        out = await mut.async_save_candidate_image(cand, path)
+        self.assertTrue(out.exists())
 
-        asyncio.run(runner())
+    async def test_async_write_report(self) -> None:
+        rows = [
+            mut.candidate_row(1, 1, 1, make_candidate(seed=1)),
+            mut.candidate_row(2, 1, 2, make_candidate(seed=2)),
+        ]
+        path = await mut.async_write_report(rows, self.tmpdir, filename="async_report.csv")
+        self.assertTrue(path.exists())
+
+        with path.open("r", encoding="utf-8", newline="") as f:
+            data = list(csv.DictReader(f))
+
+        self.assertEqual(len(data), 2)
+        self.assertEqual(data[0]["seed"], "1")
+        self.assertEqual(data[1]["seed"], "2")
+
+    async def test_async_save_multiple_candidate_images_concurrently(self) -> None:
+        candidates = [make_candidate(seed=i) for i in range(10, 14)]
+        paths = [self.tmpdir / "batch" / f"camouflage_{i}.png" for i in range(10, 14)]
+
+        results = await gather_concurrent(
+            *(mut.async_save_candidate_image(c, p) for c, p in zip(candidates, paths))
+        )
+
+        self.assertEqual(len(results), 4)
+        for p in paths:
+            self.assertTrue(p.exists(), f"Fichier absent: {p}")
+
+    async def test_async_write_multiple_reports_concurrently(self) -> None:
+        rows1 = [mut.candidate_row(1, 1, 1, make_candidate(seed=101))]
+        rows2 = [mut.candidate_row(2, 1, 2, make_candidate(seed=202))]
+        rows3 = [mut.candidate_row(3, 1, 3, make_candidate(seed=303))]
+
+        p1 = self.tmpdir / "r1"
+        p2 = self.tmpdir / "r2"
+        p3 = self.tmpdir / "r3"
+
+        out1, out2, out3 = await gather_concurrent(
+            mut.async_write_report(rows1, p1, filename="a.csv"),
+            mut.async_write_report(rows2, p2, filename="b.csv"),
+            mut.async_write_report(rows3, p3, filename="c.csv"),
+        )
+
+        self.assertTrue(out1.exists())
+        self.assertTrue(out2.exists())
+        self.assertTrue(out3.exists())
+
+    async def test_async_io_batch_is_parallelizable(self) -> None:
+        async def fake_save(candidate: mut.CandidateResult, path: Path) -> Path:
+            await asyncio.sleep(0.10)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("ok", encoding="utf-8")
+            return path
+
+        candidates = [make_candidate(seed=i) for i in range(4)]
+        paths = [self.tmpdir / "parallel" / f"{i}.png" for i in range(4)]
+
+        started = time.perf_counter()
+        with patch.object(mut, "async_save_candidate_image", side_effect=fake_save):
+            await gather_concurrent(*(mut.async_save_candidate_image(c, p) for c, p in zip(candidates, paths)))
+        elapsed = time.perf_counter() - started
+
+        LOGGER.info("Temps batch async simulé = %.4fs", elapsed)
+        self.assertLess(elapsed, 0.30)
 
 
 # ============================================================
@@ -830,25 +905,47 @@ class TestCandidateGeneration(TestAssertionsMixin, unittest.TestCase):
         self.assertCandidateLooksConsistent(cand)
         self.assertEqual(cand.seed, seed)
 
-    def test_async_generate_candidate_from_seed_returns_candidate_result(self) -> None:
-        async def runner() -> None:
-            cand = await mut.async_generate_candidate_from_seed(mut.DEFAULT_BASE_SEED + 1)
-            LOGGER.info("Async candidate généré : %s", summarize_candidate(cand))
-            self.assertCandidateLooksConsistent(cand)
-
-        asyncio.run(runner())
-
-    def test_async_validate_candidate_result(self) -> None:
-        async def runner() -> None:
-            cand = make_candidate()
-            ok = await mut.async_validate_candidate_result(cand)
-            self.assertTrue(ok)
-
-        asyncio.run(runner())
-
     def test_validate_candidate_result_false_candidate(self) -> None:
         cand = make_candidate(ratios=invalid_ratios_far())
         self.assertFalse(mut.validate_candidate_result(cand))
+
+
+class TestCandidateGenerationAsync(TestAssertionsMixin, unittest.IsolatedAsyncioTestCase):
+    async def test_async_generate_candidate_from_seed_returns_candidate_result(self) -> None:
+        cand = await mut.async_generate_candidate_from_seed(mut.DEFAULT_BASE_SEED + 1)
+        LOGGER.info("Async candidate généré : %s", summarize_candidate(cand))
+        self.assertCandidateLooksConsistent(cand)
+
+    async def test_async_validate_candidate_result(self) -> None:
+        cand = make_candidate()
+        ok = await mut.async_validate_candidate_result(cand)
+        self.assertTrue(ok)
+
+    async def test_async_generate_multiple_candidates_concurrently(self) -> None:
+        seeds = [mut.DEFAULT_BASE_SEED + i for i in range(4)]
+        candidates = await gather_concurrent(*(mut.async_generate_candidate_from_seed(seed) for seed in seeds))
+
+        self.assertEqual(len(candidates), 4)
+        for seed, cand in zip(seeds, candidates):
+            self.assertCandidateLooksConsistent(cand)
+            self.assertEqual(cand.seed, seed)
+
+    async def test_async_generate_multiple_candidates_parallel_mocked(self) -> None:
+        async def fake_generate(seed: int) -> mut.CandidateResult:
+            await asyncio.sleep(0.10)
+            return make_candidate(seed=seed)
+
+        seeds = [1001, 1002, 1003, 1004]
+        started = time.perf_counter()
+
+        with patch.object(mut, "async_generate_candidate_from_seed", side_effect=fake_generate):
+            candidates = await gather_concurrent(*(mut.async_generate_candidate_from_seed(seed) for seed in seeds))
+
+        elapsed = time.perf_counter() - started
+        LOGGER.info("Temps génération async simulée = %.4fs", elapsed)
+
+        self.assertEqual([c.seed for c in candidates], seeds)
+        self.assertLess(elapsed, 0.30)
 
 
 # ============================================================
@@ -973,7 +1070,7 @@ class TestGenerateAllSync(TempDirMixin, unittest.TestCase):
 # TESTS ORCHESTRATEUR ASYNCHRONE
 # ============================================================
 
-class TestGenerateAllAsync(TempDirMixin, unittest.IsolatedAsyncioTestCase):
+class TestGenerateAllAsync(AsyncTempDirMixin, unittest.IsolatedAsyncioTestCase):
     async def test_async_generate_all_accepts_first_attempt(self) -> None:
         candidate = make_candidate(seed=301)
         progress_calls: List[tuple] = []
