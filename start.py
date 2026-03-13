@@ -19,6 +19,7 @@ Fonctions :
 - prévention de la mise en veille sous Windows
 - réglage léger de l'intensité machine
 - boutons Commencer / Arrêter
+- préflight tests automatiques sur test_main.py et test_start.py
 """
 
 from __future__ import annotations
@@ -26,13 +27,16 @@ from __future__ import annotations
 import asyncio
 import csv
 import ctypes
+import importlib
 import io
 import math
 import os
 import platform
 import shutil
 import subprocess
+import sys
 import threading
+import unittest
 from collections import Counter
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -52,6 +56,9 @@ try:
     import log as camo_log
 except Exception:
     camo_log = None
+
+# Permet aux tests d'importer proprement le module courant
+sys.modules.setdefault("start", sys.modules[__name__])
 
 # ---------------- Kivy config avant imports UI ----------------
 from kivy.config import Config
@@ -1038,6 +1045,10 @@ class CamouflageApp(App):
         self.process = psutil.Process() if psutil else None
         self.machine_intensity = 85.0
 
+        self.tests_ran = False
+        self.tests_ok = False
+        self.tests_summary = "Tests non lancés."
+
         self.title_label: Optional[Label] = None
         self.status_label: Optional[Label] = None
         self.count_input: Optional[SoftTextInput] = None
@@ -1058,6 +1069,8 @@ class CamouflageApp(App):
         self.preview_img: Optional[Image] = None
         self.preview_silhouette: Optional[Image] = None
         self.log_view: Optional[LogView] = None
+
+        self.tests_label: Optional[Label] = None
 
         self.diag_enabled_label: Optional[Label] = None
         self.diag_summary_label: Optional[Label] = None
@@ -1125,7 +1138,7 @@ class CamouflageApp(App):
         controls = GlassCard(
             orientation="vertical",
             size_hint_y=None,
-            height=dp(560),
+            height=dp(620),
         )
 
         controls.add_widget(self._label("Paramètres"))
@@ -1145,6 +1158,10 @@ class CamouflageApp(App):
         btn_row.add_widget(self.start_btn)
         btn_row.add_widget(self.stop_btn)
         controls.add_widget(btn_row)
+
+        controls.add_widget(self._label("Préflight tests"))
+        self.tests_label = self._small_label("Tests non lancés.")
+        controls.add_widget(self.tests_label)
 
         controls.add_widget(self._label("Chargement"))
         self.progress_bar = GlassProgressBar()
@@ -1241,6 +1258,7 @@ class CamouflageApp(App):
         self._refresh_controls_state()
         self.reload_gallery()
         self._reset_live_diagnostics()
+        self._update_preflight_label(self.tests_summary, ok=None)
         Clock.schedule_interval(self._update_resource_monitor, 1.0)
         Clock.schedule_interval(self._refresh_gallery_periodic, 3.0)
 
@@ -1264,9 +1282,7 @@ class CamouflageApp(App):
         box.add_widget(self._label(title))
 
         stage_container = SoftPane(orientation="vertical")
-        stage = ImageStage(image_widget, size_hint=(1, 1))
-        wrapper = BoxLayout(orientation="vertical")
-        wrapper.add_widget(stage)
+        _stage = ImageStage(image_widget, size_hint=(1, 1))
 
         overlay = BoxLayout(orientation="vertical", padding=dp(8))
         overlay.add_widget(image_widget)
@@ -1297,6 +1313,72 @@ class CamouflageApp(App):
         lbl.bind(size=lambda *a: setattr(lbl, "text_size", lbl.size))
         return lbl
 
+    # ---------------- préflight tests ----------------
+
+    @mainthread
+    def _update_preflight_label(self, text: str, ok: Optional[bool] = None):
+        if self.tests_label is None:
+            return
+        self.tests_label.text = text
+        if ok is True:
+            self.tests_label.color = C["success"]
+        elif ok is False:
+            self.tests_label.color = C["danger"]
+        else:
+            self.tests_label.color = C["text_soft"]
+
+    def _run_preflight_tests_once(self) -> Tuple[bool, str]:
+        try:
+            importlib.invalidate_caches()
+
+            suite = unittest.TestSuite()
+            loader = unittest.defaultTestLoader
+
+            module_names = ("test_main", "test_start")
+            for module_name in module_names:
+                module = importlib.import_module(module_name)
+                module = importlib.reload(module)
+                suite.addTests(loader.loadTestsFromModule(module))
+
+            result = unittest.TestResult()
+            suite.run(result)
+
+            total = result.testsRun
+            failures = len(result.failures)
+            errors = len(result.errors)
+            ok = result.wasSuccessful()
+
+            if ok:
+                summary = f"{total} tests OK"
+            else:
+                summary = f"{total} tests exécutés | {failures} échec(s) | {errors} erreur(s)"
+
+            return ok, summary
+
+        except Exception as exc:
+            return False, f"Impossible d'exécuter les tests : {exc}"
+
+    def _ensure_preflight_tests(self) -> bool:
+        if self.tests_ran and self.tests_ok:
+            return True
+
+        ok, summary = self._run_preflight_tests_once()
+        self.tests_ran = True
+        self.tests_ok = ok
+        self.tests_summary = summary
+
+        self._update_preflight_label(summary, ok=ok)
+
+        if ok:
+            self.log(f"Préflight OK : {summary}")
+            self.diag_log(f"Préflight OK : {summary}")
+            return True
+
+        self.status("Tests KO", ok=False)
+        self.log(f"Préflight KO : {summary}")
+        self.diag_log(f"Préflight KO : {summary}")
+        return False
+
     # ---------------- diagnostic live ----------------
 
     def _reset_live_diagnostics(self):
@@ -1309,12 +1391,30 @@ class CamouflageApp(App):
         if self.diag_log_view is not None:
             self.diag_log_view.label.text = ""
 
-    def _extract_failure_rules(self, candidate: camo.CandidateResult, target_index: int, local_attempt: int) -> List[str]:
-        if camo_log is None or not hasattr(camo_log, "analyze_candidate"):
+    async def _extract_failure_rules_async(
+        self,
+        candidate: camo.CandidateResult,
+        target_index: int,
+        local_attempt: int,
+    ) -> List[str]:
+        if camo_log is None:
             return []
 
         try:
-            diagnostic = camo_log.analyze_candidate(candidate, target_index=target_index, local_attempt=local_attempt)
+            if hasattr(camo_log, "async_analyze_candidate"):
+                diagnostic = await camo_log.async_analyze_candidate(
+                    candidate, target_index=target_index, local_attempt=local_attempt
+                )
+            elif hasattr(camo_log, "analyze_candidate"):
+                diagnostic = await asyncio.to_thread(
+                    camo_log.analyze_candidate,
+                    candidate,
+                    target_index,
+                    local_attempt,
+                )
+            else:
+                return []
+
             failures = getattr(diagnostic, "failures", [])
             rules: List[str] = []
             for failure in failures:
@@ -1322,6 +1422,7 @@ class CamouflageApp(App):
                 if rule_name:
                     rules.append(str(rule_name))
             return rules
+
         except Exception as exc:
             self.diag_log(f"Diagnostic indisponible pour seed={candidate.seed} : {exc}")
             return []
@@ -1354,7 +1455,7 @@ class CamouflageApp(App):
         if self.diag_log_view is not None:
             self.diag_log_view.append(line)
 
-    def _register_live_diagnostic(
+    async def _register_live_diagnostic_async(
         self,
         candidate: camo.CandidateResult,
         target_index: int,
@@ -1373,7 +1474,7 @@ class CamouflageApp(App):
             return
 
         self.diag_rejects += 1
-        rules = self._extract_failure_rules(candidate, target_index, local_attempt)
+        rules = await self._extract_failure_rules_async(candidate, target_index, local_attempt)
         self.diag_last_rules = rules[:]
 
         if rules:
@@ -1521,6 +1622,9 @@ class CamouflageApp(App):
             self.log("Interface incomplète.")
             return
 
+        if not self._ensure_preflight_tests():
+            return
+
         try:
             count = int(self.count_input.text.strip())
             if count <= 0:
@@ -1610,7 +1714,7 @@ class CamouflageApp(App):
                         metrics=candidate.metrics,
                     )
 
-                    self._register_live_diagnostic(
+                    await self._register_live_diagnostic_async(
                         candidate=candidate,
                         target_index=target_index,
                         local_attempt=local_attempt,
