@@ -38,7 +38,7 @@ from collections import Counter, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Deque, Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -56,6 +56,7 @@ DEFAULT_RUNTIME_LOG_FILE = "runtime.log"
 DEFAULT_TEST_SUMMARY_FILE = "tests_summary.json"
 DEFAULT_HISTORY_LIMIT = 5000
 DEFAULT_MAX_CONCURRENCY = max(1, min(4, (os.cpu_count() or 4)))
+DEFAULT_TEST_TIMEOUT_S = 180.0
 
 LOGGER_NAME = "camo_log"
 
@@ -166,6 +167,10 @@ class TestModuleSummary:
     stdout: str
     stderr: str
     log_file: str | None = None
+    completed: bool = True
+    timed_out: bool = False
+    timeout_s: float | None = None
+    exception_message: str | None = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -186,10 +191,18 @@ class TestRunSummary:
     details: Dict[str, List[Dict[str, str]]]
     per_module: List[TestModuleSummary] = field(default_factory=list)
     parallel: bool = False
+    completed: bool = True
+    timed_out: bool = False
+    timed_out_modules: List[str] = field(default_factory=list)
 
     def short_text(self) -> str:
-        if self.ok:
+        if self.ok and self.completed and not self.timed_out:
             return f"{self.total} tests OK"
+        if self.timed_out:
+            return (
+                f"{self.total} tests comptés | {self.failures} échec(s) | "
+                f"{self.errors} erreur(s) | timeout module(s): {', '.join(self.timed_out_modules)}"
+            )
         return f"{self.total} tests exécutés | {self.failures} échec(s) | {self.errors} erreur(s)"
 
     def to_dict(self) -> Dict[str, Any]:
@@ -244,6 +257,10 @@ def _normalize_module_names(module_names: Sequence[str] | None) -> List[str]:
             seen.add(name)
             out.append(name)
     return out or list(DEFAULT_TEST_MODULES)
+
+
+def _should_block_on_tests(summary: TestRunSummary) -> bool:
+    return (not summary.ok) or (not summary.completed) or summary.timed_out
 
 
 # ============================================================
@@ -945,43 +962,212 @@ def _build_test_command(module_name: str) -> List[str]:
     return [sys.executable, "-m", "unittest", "-v", module_name]
 
 
-async def _async_run_test_module_subprocess(module_name: str) -> TestModuleSummary:
-    cmd = _build_test_command(module_name)
-    t0 = time.perf_counter()
-
-    await async_log_event("INFO", "tests", "Lancement module de test", module=module_name, command=cmd)
-
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=os.environ.copy(),
-    )
-    stdout_b, stderr_b = await proc.communicate()
-    dt = time.perf_counter() - t0
-
-    stdout = stdout_b.decode("utf-8", errors="replace")
-    stderr = stderr_b.decode("utf-8", errors="replace")
-
-    log_file = None
+def _read_declared_test_log_file(module_name: str) -> str | None:
     try:
         module = importlib.import_module(module_name)
         lf = getattr(module, "LOG_FILE", None)
         if lf is not None:
-            log_file = _safe_relpath(Path(lf))
+            return _safe_relpath(Path(lf))
     except Exception:
         pass
+    return None
 
-    summary = TestModuleSummary(
+
+def _run_test_module_subprocess(module_name: str, timeout_s: float | None = None) -> TestModuleSummary:
+    cmd = _build_test_command(module_name)
+    t0 = time.perf_counter()
+
+    log_event(
+        "INFO",
+        "tests",
+        "Lancement module de test",
         module=module_name,
-        ok=(proc.returncode == 0),
-        returncode=int(proc.returncode or 0),
-        duration_s=float(dt),
         command=cmd,
-        stdout=stdout,
-        stderr=stderr,
-        log_file=log_file,
+        timeout_s=timeout_s,
+        mode="sync-subprocess",
     )
+
+    try:
+        completed = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=os.environ.copy(),
+            timeout=None if timeout_s is None or timeout_s <= 0 else float(timeout_s),
+        )
+        dt = time.perf_counter() - t0
+        summary = TestModuleSummary(
+            module=module_name,
+            ok=(completed.returncode == 0),
+            returncode=int(completed.returncode),
+            duration_s=float(dt),
+            command=cmd,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+            log_file=_read_declared_test_log_file(module_name),
+            completed=True,
+            timed_out=False,
+            timeout_s=timeout_s,
+            exception_message=None,
+        )
+    except subprocess.TimeoutExpired as exc:
+        dt = time.perf_counter() - t0
+        stdout = ""
+        stderr = ""
+        if exc.stdout:
+            stdout = exc.stdout if isinstance(exc.stdout, str) else exc.stdout.decode("utf-8", errors="replace")
+        if exc.stderr:
+            stderr = exc.stderr if isinstance(exc.stderr, str) else exc.stderr.decode("utf-8", errors="replace")
+
+        summary = TestModuleSummary(
+            module=module_name,
+            ok=False,
+            returncode=-9,
+            duration_s=float(dt),
+            command=cmd,
+            stdout=stdout,
+            stderr=stderr or f"Timeout expiré après {timeout_s} s",
+            log_file=_read_declared_test_log_file(module_name),
+            completed=False,
+            timed_out=True,
+            timeout_s=timeout_s,
+            exception_message=f"TimeoutExpired({timeout_s})",
+        )
+    except Exception as exc:
+        dt = time.perf_counter() - t0
+        summary = TestModuleSummary(
+            module=module_name,
+            ok=False,
+            returncode=-1,
+            duration_s=float(dt),
+            command=cmd,
+            stdout="",
+            stderr=f"Exception durant l'exécution du module {module_name}: {exc}",
+            log_file=_read_declared_test_log_file(module_name),
+            completed=False,
+            timed_out=False,
+            timeout_s=timeout_s,
+            exception_message=str(exc),
+        )
+
+    log_event(
+        "INFO" if summary.ok else "ERROR",
+        "tests",
+        "Fin module de test",
+        module=module_name,
+        ok=summary.ok,
+        returncode=summary.returncode,
+        duration_s=round(summary.duration_s, 6),
+        completed=summary.completed,
+        timed_out=summary.timed_out,
+    )
+    return summary
+
+
+async def _async_run_test_module_subprocess(
+    module_name: str,
+    timeout_s: float | None = None,
+) -> TestModuleSummary:
+    cmd = _build_test_command(module_name)
+    t0 = time.perf_counter()
+
+    await async_log_event(
+        "INFO",
+        "tests",
+        "Lancement module de test",
+        module=module_name,
+        command=cmd,
+        timeout_s=timeout_s,
+        mode="async-subprocess",
+    )
+
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=os.environ.copy(),
+        )
+
+        if timeout_s is None or timeout_s <= 0:
+            stdout_b, stderr_b = await proc.communicate()
+        else:
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=float(timeout_s))
+
+        dt = time.perf_counter() - t0
+        stdout = stdout_b.decode("utf-8", errors="replace")
+        stderr = stderr_b.decode("utf-8", errors="replace")
+
+        summary = TestModuleSummary(
+            module=module_name,
+            ok=(proc.returncode == 0),
+            returncode=int(proc.returncode or 0),
+            duration_s=float(dt),
+            command=cmd,
+            stdout=stdout,
+            stderr=stderr,
+            log_file=_read_declared_test_log_file(module_name),
+            completed=True,
+            timed_out=False,
+            timeout_s=timeout_s,
+            exception_message=None,
+        )
+
+    except asyncio.TimeoutError:
+        dt = time.perf_counter() - t0
+        if proc is not None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                stdout_b, stderr_b = await proc.communicate()
+            except Exception:
+                stdout_b, stderr_b = b"", b""
+
+            stdout = stdout_b.decode("utf-8", errors="replace")
+            stderr = stderr_b.decode("utf-8", errors="replace")
+        else:
+            stdout = ""
+            stderr = ""
+
+        if not stderr:
+            stderr = f"Timeout expiré après {timeout_s} s"
+
+        summary = TestModuleSummary(
+            module=module_name,
+            ok=False,
+            returncode=-9,
+            duration_s=float(dt),
+            command=cmd,
+            stdout=stdout,
+            stderr=stderr,
+            log_file=_read_declared_test_log_file(module_name),
+            completed=False,
+            timed_out=True,
+            timeout_s=timeout_s,
+            exception_message=f"TimeoutError({timeout_s})",
+        )
+
+    except Exception as exc:
+        dt = time.perf_counter() - t0
+        summary = TestModuleSummary(
+            module=module_name,
+            ok=False,
+            returncode=-1,
+            duration_s=float(dt),
+            command=cmd,
+            stdout="",
+            stderr=f"Exception durant l'exécution du module {module_name}: {exc}",
+            log_file=_read_declared_test_log_file(module_name),
+            completed=False,
+            timed_out=False,
+            timeout_s=timeout_s,
+            exception_message=str(exc),
+        )
 
     await async_log_event(
         "INFO" if summary.ok else "ERROR",
@@ -991,6 +1177,8 @@ async def _async_run_test_module_subprocess(module_name: str) -> TestModuleSumma
         ok=summary.ok,
         returncode=summary.returncode,
         duration_s=round(summary.duration_s, 6),
+        completed=summary.completed,
+        timed_out=summary.timed_out,
     )
     return summary
 
@@ -999,7 +1187,7 @@ def _module_summary_to_details(module_summary: TestModuleSummary) -> Dict[str, L
     failures: List[Dict[str, str]] = []
     errors: List[Dict[str, str]] = []
 
-    if module_summary.ok:
+    if module_summary.ok and module_summary.completed and not module_summary.timed_out:
         return {"failures": failures, "errors": errors}
 
     trace_blob = module_summary.stdout.strip()
@@ -1008,7 +1196,15 @@ def _module_summary_to_details(module_summary: TestModuleSummary) -> Dict[str, L
 
     failure_count, error_count = _parse_unittest_output_for_failures(module_summary.stdout, module_summary.stderr)
 
-    if failure_count <= 0 and error_count <= 0:
+    if module_summary.timed_out:
+        errors.append({"test": f"{module_summary.module}::timeout", "trace": trace_blob})
+        return {"failures": failures, "errors": errors}
+
+    if module_summary.exception_message and failure_count <= 0 and error_count <= 0:
+        errors.append({"test": f"{module_summary.module}::exception", "trace": trace_blob})
+        return {"failures": failures, "errors": errors}
+
+    if failure_count <= 0 and error_count <= 0 and not module_summary.ok:
         errors.append({"test": module_summary.module, "trace": trace_blob})
         return {"failures": failures, "errors": errors}
 
@@ -1029,6 +1225,8 @@ def _merge_parallel_module_summaries(module_summaries: Sequence[TestModuleSummar
 
     failures = 0
     errors = 0
+    timed_out_modules: List[str] = []
+
     for module_summary in module_summaries:
         f_count, e_count = _parse_unittest_output_for_failures(module_summary.stdout, module_summary.stderr)
         failures += f_count
@@ -1038,12 +1236,17 @@ def _merge_parallel_module_summaries(module_summaries: Sequence[TestModuleSummar
         all_failures.extend(details["failures"])
         all_errors.extend(details["errors"])
 
+        if module_summary.timed_out:
+            timed_out_modules.append(module_summary.module)
+
     total = _collect_parallel_test_counts(modules)
     duration_s = max((m.duration_s for m in module_summaries), default=0.0)
-    ok = all(m.ok for m in module_summaries)
+    completed = all(m.completed for m in module_summaries)
+    timed_out = any(m.timed_out for m in module_summaries)
+    ok = all(m.ok for m in module_summaries) and completed and not timed_out
 
     if not ok and failures == 0 and errors == 0:
-        errors = sum(1 for m in module_summaries if not m.ok)
+        errors = sum(1 for m in module_summaries if not m.ok or not m.completed or m.timed_out)
 
     return TestRunSummary(
         ok=ok,
@@ -1059,6 +1262,9 @@ def _merge_parallel_module_summaries(module_summaries: Sequence[TestModuleSummar
         details={"failures": all_failures, "errors": all_errors},
         per_module=list(module_summaries),
         parallel=True,
+        completed=completed,
+        timed_out=timed_out,
+        timed_out_modules=timed_out_modules,
     )
 
 
@@ -1069,45 +1275,30 @@ def _merge_parallel_module_summaries(module_summaries: Sequence[TestModuleSummar
 def run_preflight_tests(
     module_names: Sequence[str] = DEFAULT_TEST_MODULES,
     output_dir: Path = DEFAULT_OUTPUT_DIR,
+    timeout_s: float | None = DEFAULT_TEST_TIMEOUT_S,
 ) -> TestRunSummary:
     module_names = _normalize_module_names(module_names)
     ensure_dir(Path(output_dir))
-    log_event("INFO", "tests", "Début préflight synchrone", modules=list(module_names), parallel=False)
+    log_event(
+        "INFO",
+        "tests",
+        "Début préflight synchrone",
+        modules=list(module_names),
+        parallel=False,
+        timeout_s=timeout_s,
+    )
 
     t0 = time.perf_counter()
     importlib.invalidate_caches()
 
-    suite = unittest.TestSuite()
-    loader = unittest.defaultTestLoader
-    loaded_modules: List[str] = []
+    module_summaries = [
+        _run_test_module_subprocess(module_name, timeout_s=timeout_s)
+        for module_name in module_names
+    ]
 
-    for module_name in module_names:
-        module = importlib.import_module(module_name)
-        suite.addTests(loader.loadTestsFromModule(module))
-        loaded_modules.append(module_name)
-
-    result = unittest.TestResult()
-    suite.run(result)
-    dt = time.perf_counter() - t0
-
-    summary = TestRunSummary(
-        ok=result.wasSuccessful(),
-        total=int(result.testsRun),
-        failures=len(result.failures),
-        errors=len(result.errors),
-        skipped=len(getattr(result, "skipped", [])),
-        expected_failures=len(getattr(result, "expectedFailures", [])),
-        unexpected_successes=len(getattr(result, "unexpectedSuccesses", [])),
-        duration_s=float(dt),
-        modules=list(loaded_modules),
-        log_files=discover_test_log_files(loaded_modules),
-        details={
-            "failures": _extract_test_case_tuples(result.failures),
-            "errors": _extract_test_case_tuples(result.errors),
-        },
-        per_module=[],
-        parallel=False,
-    )
+    summary = _merge_parallel_module_summaries(module_summaries)
+    summary.parallel = False
+    summary.duration_s = float(time.perf_counter() - t0)
 
     write_test_summary_json(summary, output_dir=output_dir)
     log_event(
@@ -1120,6 +1311,9 @@ def run_preflight_tests(
         errors=summary.errors,
         duration_s=round(summary.duration_s, 6),
         parallel=False,
+        completed=summary.completed,
+        timed_out=summary.timed_out,
+        timed_out_modules=summary.timed_out_modules,
     )
     return summary
 
@@ -1127,6 +1321,7 @@ def run_preflight_tests(
 async def async_run_preflight_tests(
     module_names: Sequence[str] = DEFAULT_TEST_MODULES,
     output_dir: Path = DEFAULT_OUTPUT_DIR,
+    timeout_s: float | None = DEFAULT_TEST_TIMEOUT_S,
 ) -> TestRunSummary:
     """
     Lance les modules de tests en parallèle dans des sous-processus distincts.
@@ -1135,11 +1330,18 @@ async def async_run_preflight_tests(
     ensure_dir(Path(output_dir))
     module_names = tuple(_normalize_module_names(module_names))
 
-    await async_log_event("INFO", "tests", "Début préflight asynchrone", modules=list(module_names), parallel=True)
+    await async_log_event(
+        "INFO",
+        "tests",
+        "Début préflight asynchrone",
+        modules=list(module_names),
+        parallel=True,
+        timeout_s=timeout_s,
+    )
     t0 = time.perf_counter()
 
     module_summaries = await asyncio.gather(
-        *[_async_run_test_module_subprocess(module_name) for module_name in module_names]
+        *[_async_run_test_module_subprocess(module_name, timeout_s=timeout_s) for module_name in module_names]
     )
 
     summary = _merge_parallel_module_summaries(module_summaries)
@@ -1156,6 +1358,9 @@ async def async_run_preflight_tests(
         errors=summary.errors,
         duration_s=round(summary.duration_s, 6),
         parallel=True,
+        completed=summary.completed,
+        timed_out=summary.timed_out,
+        timed_out_modules=summary.timed_out_modules,
     )
     return summary
 
@@ -1179,12 +1384,35 @@ def run_full_diagnostic(
     test_modules: Sequence[str] = DEFAULT_TEST_MODULES,
     parallel_diagnostics: bool = False,
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
+    tests_non_blocking: bool = False,
+    test_timeout_s: float | None = DEFAULT_TEST_TIMEOUT_S,
 ) -> Dict[str, Any]:
     output_dir = ensure_dir(Path(output_dir))
 
     tests_summary: Optional[TestRunSummary] = None
     if run_tests_first:
-        tests_summary = run_preflight_tests(module_names=test_modules, output_dir=output_dir)
+        tests_summary = run_preflight_tests(
+            module_names=test_modules,
+            output_dir=output_dir,
+            timeout_s=test_timeout_s,
+        )
+
+        if _should_block_on_tests(tests_summary):
+            if tests_non_blocking:
+                log_event(
+                    "WARNING",
+                    "tests",
+                    "Préflight non bloquant : poursuite du diagnostic malgré échec/timeout/incomplétude",
+                    ok=tests_summary.ok,
+                    completed=tests_summary.completed,
+                    timed_out=tests_summary.timed_out,
+                    timed_out_modules=tests_summary.timed_out_modules,
+                )
+            else:
+                raise RuntimeError(
+                    "Préflight bloquant: tests en échec, incomplets ou timeout. "
+                    "Active tests_non_blocking=True pour continuer malgré cela."
+                )
 
     diagnostics = generate_diagnostics(
         count=count,
@@ -1221,15 +1449,43 @@ async def async_run_full_diagnostic(
     parallel_tests: bool = True,
     parallel_diagnostics: bool = True,
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
+    tests_non_blocking: bool = False,
+    test_timeout_s: float | None = DEFAULT_TEST_TIMEOUT_S,
 ) -> Dict[str, Any]:
     output_dir = ensure_dir(Path(output_dir))
 
     tests_summary: Optional[TestRunSummary] = None
     if run_tests_first:
         if parallel_tests:
-            tests_summary = await async_run_preflight_tests(module_names=test_modules, output_dir=output_dir)
+            tests_summary = await async_run_preflight_tests(
+                module_names=test_modules,
+                output_dir=output_dir,
+                timeout_s=test_timeout_s,
+            )
         else:
-            tests_summary = await asyncio.to_thread(run_preflight_tests, tuple(test_modules), output_dir)
+            tests_summary = await asyncio.to_thread(
+                run_preflight_tests,
+                tuple(test_modules),
+                output_dir,
+                test_timeout_s,
+            )
+
+        if _should_block_on_tests(tests_summary):
+            if tests_non_blocking:
+                await async_log_event(
+                    "WARNING",
+                    "tests",
+                    "Préflight non bloquant : poursuite du diagnostic malgré échec/timeout/incomplétude",
+                    ok=tests_summary.ok,
+                    completed=tests_summary.completed,
+                    timed_out=tests_summary.timed_out,
+                    timed_out_modules=tests_summary.timed_out_modules,
+                )
+            else:
+                raise RuntimeError(
+                    "Préflight bloquant: tests en échec, incomplets ou timeout. "
+                    "Active tests_non_blocking=True pour continuer malgré cela."
+                )
 
     diagnostics = await async_generate_diagnostics(
         count=count,
@@ -1298,6 +1554,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Mode rapide : count=10, test_modules=test_main, parallel_tests et parallel_diagnostics activés.",
     )
+    parser.add_argument(
+        "--tests-non-blocking",
+        action="store_true",
+        help="Continue le diagnostic même si les tests échouent, crashent ou timeout.",
+    )
+    parser.add_argument(
+        "--test-timeout",
+        type=float,
+        default=DEFAULT_TEST_TIMEOUT_S,
+        help="Timeout par module de tests en secondes. <= 0 désactive le timeout.",
+    )
     return parser.parse_args()
 
 
@@ -1306,6 +1573,10 @@ def _print_test_summary(summary: TestRunSummary) -> None:
     print(f"Modules            : {', '.join(summary.modules)}")
     print(f"Mode parallèle     : {'oui' if summary.parallel else 'non'}")
     print(f"Résultat           : {'OK' if summary.ok else 'KO'}")
+    print(f"Terminé            : {'oui' if summary.completed else 'non'}")
+    print(f"Timeout détecté    : {'oui' if summary.timed_out else 'non'}")
+    if summary.timed_out_modules:
+        print(f"Modules timeout    : {', '.join(summary.timed_out_modules)}")
     print(f"Tests exécutés     : {summary.total}")
     print(f"Échecs             : {summary.failures}")
     print(f"Erreurs            : {summary.errors}")
@@ -1322,7 +1593,9 @@ def _print_test_summary(summary: TestRunSummary) -> None:
                 f"  - {item.module}: "
                 f"{'OK' if item.ok else 'KO'} | "
                 f"rc={item.returncode} | "
-                f"{item.duration_s:.2f} s"
+                f"{item.duration_s:.2f} s | "
+                f"completed={'oui' if item.completed else 'non'} | "
+                f"timeout={'oui' if item.timed_out else 'non'}"
             )
 
 
@@ -1333,6 +1606,7 @@ def _apply_fast_mode(args: argparse.Namespace) -> None:
     args.test_modules = ["test_main"]
     args.parallel_tests = True
     args.parallel_diagnostics = True
+    args.tests_non_blocking = True
     if int(args.max_concurrency) < 2:
         args.max_concurrency = 2
 
@@ -1345,7 +1619,11 @@ def main() -> None:
     test_modules = _normalize_module_names(args.test_modules)
 
     if args.tests_only:
-        summary = run_preflight_tests(module_names=test_modules, output_dir=output_dir)
+        summary = run_preflight_tests(
+            module_names=test_modules,
+            output_dir=output_dir,
+            timeout_s=float(args.test_timeout) if args.test_timeout is not None else None,
+        )
         _print_test_summary(summary)
         return
 
@@ -1358,6 +1636,8 @@ def main() -> None:
         test_modules=test_modules,
         parallel_diagnostics=bool(args.parallel_diagnostics),
         max_concurrency=int(args.max_concurrency),
+        tests_non_blocking=bool(args.tests_non_blocking),
+        test_timeout_s=float(args.test_timeout) if args.test_timeout is not None else None,
     )
     dt = time.perf_counter() - t0
 
@@ -1390,9 +1670,18 @@ async def async_main() -> None:
 
     if args.tests_only:
         if args.parallel_tests:
-            summary = await async_run_preflight_tests(module_names=test_modules, output_dir=output_dir)
+            summary = await async_run_preflight_tests(
+                module_names=test_modules,
+                output_dir=output_dir,
+                timeout_s=float(args.test_timeout) if args.test_timeout is not None else None,
+            )
         else:
-            summary = await asyncio.to_thread(run_preflight_tests, tuple(test_modules), output_dir)
+            summary = await asyncio.to_thread(
+                run_preflight_tests,
+                tuple(test_modules),
+                output_dir,
+                float(args.test_timeout) if args.test_timeout is not None else None,
+            )
         _print_test_summary(summary)
         return
 
@@ -1406,6 +1695,8 @@ async def async_main() -> None:
         parallel_tests=bool(args.parallel_tests),
         parallel_diagnostics=bool(args.parallel_diagnostics),
         max_concurrency=int(args.max_concurrency),
+        tests_non_blocking=bool(args.tests_non_blocking),
+        test_timeout_s=float(args.test_timeout) if args.test_timeout is not None else None,
     )
     dt = time.perf_counter() - t0
 
