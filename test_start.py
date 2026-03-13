@@ -221,6 +221,23 @@ class FakeProcess:
     def memory_info(self) -> "_Mem":
         return self._Mem()
 
+
+
+def make_submit_closing_coroutines(return_future: Any):
+    """
+    Fabrique un faux submit() qui ferme explicitement la coroutine reçue
+    pour éviter les RuntimeWarning: coroutine was never awaited.
+    """
+    def _submit(coro):
+        try:
+            close = getattr(coro, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            pass
+        return return_future
+    return _submit
+
 def make_ui_methods_sync(app: Any) -> Any:
     """
     Remplace, pour les tests, les méthodes décorées avec @mainthread
@@ -934,8 +951,10 @@ class TestPreflight(TempDirMixin, unittest.TestCase):
                 return self._result
 
         fake_future = FakeFuture((True, "12 tests OK"))
+        fake_submit = make_submit_closing_coroutines(fake_future)
 
-        with patch.object(sut.Clock, "schedule_once", side_effect=lambda cb, dt=0: cb(0)),              patch.object(self.app.async_runner, "submit", return_value=fake_future) as mock_submit:
+        with patch.object(sut.Clock, "schedule_once", side_effect=lambda cb, dt=0: cb(0)), \
+             patch.object(self.app.async_runner, "submit", side_effect=fake_submit) as mock_submit:
             ok = self.app._ensure_preflight_tests()
             self.assertFalse(ok)
             self.assertTrue(self.app.preflight_running)
@@ -1139,7 +1158,9 @@ class TestStartStopWorkflow(TempDirMixin, unittest.TestCase):
         fake_future = MagicMock()
         fake_future.done.return_value = False
 
-        self.app.async_runner = types.SimpleNamespace(submit=MagicMock(return_value=fake_future))
+        self.app.async_runner = types.SimpleNamespace(
+            submit=make_submit_closing_coroutines(fake_future)
+        )
 
         with patch.object(self.app, "_bind_future") as mock_bind, \
              patch.object(sut, "prevent_sleep") as mock_sleep:
