@@ -28,8 +28,10 @@ import asyncio
 import csv
 import ctypes
 import io
+import json
 import math
 import os
+import time
 import platform
 import shutil
 import subprocess
@@ -186,6 +188,13 @@ REPORT_NAME = "rapport_camouflages_v3.csv"
 DEFAULT_OUTPUT_DIR = Path("camouflages_federale_europe")
 DEFAULT_TARGET_COUNT = 100
 DEFAULT_TOP_K = 20
+
+DEFAULT_PREFLIGHT_MODULES = ("test_main", "test_start")
+DEFAULT_PREFLIGHT_TIMEOUT_S = 180.0
+
+RUN_MODE_BLOCKING = "blocking"
+RUN_MODE_NON_BLOCKING = "non_blocking"
+RUN_MODE_SKIP_TESTS = "skip_tests"
 
 WEIGHT_RATIO = 0.28
 WEIGHT_SILHOUETTE = 0.30
@@ -1049,8 +1058,15 @@ class CamouflageApp(App):
         self.tests_ok = False
         self.tests_summary = "Tests non lancés."
 
+        self.run_mode = RUN_MODE_BLOCKING
+
         self.preflight_running = False
         self.preflight_pending_start = False
+
+        self.run_mode_label: Optional[Label] = None
+        self.mode_blocking_btn: Optional[SoftButton] = None
+        self.mode_non_blocking_btn: Optional[SoftButton] = None
+        self.mode_skip_tests_btn: Optional[SoftButton] = None
 
         self.title_label: Optional[Label] = None
         self.status_label: Optional[Label] = None
@@ -1174,6 +1190,18 @@ class CamouflageApp(App):
         self.tests_label = self._small_label("Tests non lancés.")
         controls.add_widget(self.tests_label)
 
+        controls.add_widget(self._label("Mode de démarrage"))
+        mode_grid = GridLayout(cols=1, size_hint_y=None, spacing=dp(8), height=dp(194))
+        self.mode_blocking_btn = self._styled_button("● Tests bloquants", "launch", lambda *_: self._set_run_mode(RUN_MODE_BLOCKING))
+        self.mode_non_blocking_btn = self._styled_button("○ Tests non bloquants", "neutral", lambda *_: self._set_run_mode(RUN_MODE_NON_BLOCKING))
+        self.mode_skip_tests_btn = self._styled_button("○ Sans tests", "neutral", lambda *_: self._set_run_mode(RUN_MODE_SKIP_TESTS))
+        mode_grid.add_widget(self.mode_blocking_btn)
+        mode_grid.add_widget(self.mode_non_blocking_btn)
+        mode_grid.add_widget(self.mode_skip_tests_btn)
+        controls.add_widget(mode_grid)
+        self.run_mode_label = self._small_label("Mode actuel : tests bloquants")
+        controls.add_widget(self.run_mode_label)
+
         controls.add_widget(self._label("Runtime live"))
         self.runtime_enabled_label = self._small_label(
             "Flux runtime : actif" if camo_log is not None else "Flux runtime : indisponible",
@@ -1278,6 +1306,7 @@ class CamouflageApp(App):
         root.add_widget(body)
 
         self._refresh_controls_state()
+        self._refresh_run_mode_buttons()
         self.reload_gallery()
         self._reset_live_diagnostics()
         self._update_preflight_label(self.tests_summary, ok=None)
@@ -1433,6 +1462,44 @@ class CamouflageApp(App):
         lbl.bind(size=lambda *a: setattr(lbl, "text_size", lbl.size))
         return lbl
 
+    def _run_mode_text(self, mode: Optional[str] = None) -> str:
+        mode = self.run_mode if mode is None else mode
+        if mode == RUN_MODE_NON_BLOCKING:
+            return "tests non bloquants"
+        if mode == RUN_MODE_SKIP_TESTS:
+            return "sans tests"
+        return "tests bloquants"
+
+    @mainthread
+    def _refresh_run_mode_buttons(self):
+        items = [
+            (self.mode_blocking_btn, RUN_MODE_BLOCKING, "Tests bloquants"),
+            (self.mode_non_blocking_btn, RUN_MODE_NON_BLOCKING, "Tests non bloquants"),
+            (self.mode_skip_tests_btn, RUN_MODE_SKIP_TESTS, "Sans tests"),
+        ]
+        for btn, mode, label in items:
+            if btn is None:
+                continue
+            selected = self.run_mode == mode
+            btn.text = f"{'●' if selected else '○'} {label}"
+            btn.role = "launch" if selected else "neutral"
+            btn.disabled = self.running or self.preflight_running
+            btn._redraw()
+
+        if self.run_mode_label is not None:
+            self.run_mode_label.text = f"Mode actuel : {self._run_mode_text()}"
+
+    def _set_run_mode(self, mode: str):
+        if mode not in {RUN_MODE_BLOCKING, RUN_MODE_NON_BLOCKING, RUN_MODE_SKIP_TESTS}:
+            return
+        if self.running or self.preflight_running:
+            self.log("Impossible de changer le mode pendant une exécution ou un préflight.")
+            return
+        self.run_mode = mode
+        self._refresh_run_mode_buttons()
+        self.log(f"Mode sélectionné : {self._run_mode_text(mode)}.")
+        self._emit_runtime("INFO", "start_mode", "Mode de démarrage mis à jour", mode=mode)
+
     # ---------------- préflight tests ----------------
 
     @mainthread
@@ -1452,7 +1519,11 @@ class CamouflageApp(App):
             return False, "log.py indisponible : impossible de lancer le préflight."
 
         try:
-            summary = await camo_log.async_run_preflight_tests(output_dir=Path("logs_generation"))
+            summary = await camo_log.async_run_preflight_tests(
+                module_names=DEFAULT_PREFLIGHT_MODULES,
+                output_dir=Path("logs_generation"),
+                timeout_s=DEFAULT_PREFLIGHT_TIMEOUT_S,
+            )
 
             if hasattr(summary, "short_text"):
                 text = str(summary.short_text())
@@ -1472,7 +1543,7 @@ class CamouflageApp(App):
         except Exception as exc:
             return False, f"Impossible d'exécuter les tests via log.py : {type(exc).__name__}: {exc}"
 
-    def _ensure_preflight_tests(self) -> bool:
+    def _ensure_preflight_tests(self, pending_start: bool = True) -> bool:
         if self.tests_ran and self.tests_ok:
             return True
 
@@ -1480,13 +1551,15 @@ class CamouflageApp(App):
             self.log("Préflight déjà en cours…")
             return False
 
+        mode_text = "bloquant" if pending_start else "non bloquant"
+
         self.preflight_running = True
-        self.preflight_pending_start = True
+        self.preflight_pending_start = pending_start
         self.status("Préflight en cours…", ok=True)
-        self.log("Lancement des tests de préflight via log.py…")
-        self.diag_log("Préflight lancé via log.py.")
-        self._emit_runtime("INFO", "start_preflight", "Préflight lancé depuis le front", mode="bloquant")
-        self._update_preflight_label("Préflight en cours…", ok=None)
+        self.log(f"Lancement des tests de préflight via log.py ({mode_text})…")
+        self.diag_log(f"Préflight lancé via log.py ({mode_text}).")
+        self._emit_runtime("INFO", "start_preflight", "Préflight lancé depuis le front", mode=mode_text, modules=list(DEFAULT_PREFLIGHT_MODULES), timeout_s=DEFAULT_PREFLIGHT_TIMEOUT_S)
+        self._update_preflight_label(f"Préflight en cours ({mode_text})…", ok=None)
         self._refresh_controls_state()
 
         fut = self.async_runner.submit(self._async_run_preflight_via_log())
@@ -1504,32 +1577,39 @@ class CamouflageApp(App):
 
     @mainthread
     def _on_preflight_finished(self, ok: bool, summary: str):
+        pending_start = self.preflight_pending_start
+
         self.preflight_running = False
         self.preflight_future = None
         self.tests_ran = True
         self.tests_ok = ok
         self.tests_summary = summary
+        self.preflight_pending_start = False
 
         self._update_preflight_label(summary, ok=ok)
 
         if ok:
             self.log(f"Préflight OK : {summary}")
             self.diag_log(f"Préflight OK : {summary}")
-            self.status("Préflight terminé", ok=True)
+            if not self.running:
+                self.status("Préflight terminé", ok=True)
             self._emit_runtime("INFO", "start_preflight", "Préflight terminé", ok=True, summary=summary)
         else:
-            self.status("Tests KO", ok=False)
             self.log(f"Préflight KO : {summary}")
             self.diag_log(f"Préflight KO : {summary}")
-            self._emit_runtime("ERROR", "start_preflight", "Préflight en échec", ok=False, summary=summary)
+            if pending_start:
+                self.status("Tests KO", ok=False)
+            elif not self.running:
+                self.status("Tests KO (tolérés)", ok=False)
+            self._emit_runtime("ERROR", "start_preflight", "Préflight en échec", ok=False, summary=summary, blocking=pending_start)
+            if not pending_start:
+                self.log("Préflight non bloquant : la génération continue malgré l'échec des tests.")
+                self.diag_log("Préflight non bloquant : poursuite malgré échec / timeout / incomplétude.")
 
         self._refresh_controls_state()
 
-        if ok and self.preflight_pending_start:
-            self.preflight_pending_start = False
+        if pending_start and ok:
             self._start_generation_after_preflight()
-        else:
-            self.preflight_pending_start = False
 
     # ---------------- diagnostic live ----------------
 
@@ -1656,6 +1736,7 @@ class CamouflageApp(App):
             self.start_btn.disabled = self.running or self.stopping or self.preflight_running
         if self.stop_btn is not None:
             self.stop_btn.disabled = (not self.running) and (not self.stopping) and (not self.preflight_running)
+        self._refresh_run_mode_buttons()
 
     @mainthread
     def reload_gallery(self):
@@ -1774,14 +1855,38 @@ class CamouflageApp(App):
             self.log("Interface incomplète.")
             return
 
+        if self.run_mode == RUN_MODE_SKIP_TESTS:
+            self.tests_summary = "Tests ignorés (mode sans tests)."
+            self._update_preflight_label(self.tests_summary, ok=None)
+            self.log("Mode sans tests : démarrage direct de la génération.")
+            self.diag_log("Préflight ignoré : démarrage sans tests.")
+            self._emit_runtime("WARNING", "start_preflight", "Préflight ignoré", mode="sans_tests")
+            self._start_generation_after_preflight()
+            return
+
+        if self.run_mode == RUN_MODE_NON_BLOCKING:
+            if self.tests_ran and self.tests_ok:
+                self.log("Préflight déjà validé : démarrage direct en mode non bloquant.")
+                self._start_generation_after_preflight()
+                return
+
+            if camo_log is None:
+                self.log("log.py indisponible : démarrage direct sans préflight non bloquant.")
+                self._start_generation_after_preflight()
+                return
+
+            self._ensure_preflight_tests(pending_start=False)
+            self._start_generation_after_preflight(allow_during_preflight=True)
+            return
+
         if self.tests_ran and self.tests_ok:
             self._start_generation_after_preflight()
             return
 
-        self._ensure_preflight_tests()
+        self._ensure_preflight_tests(pending_start=True)
 
-    def _start_generation_after_preflight(self):
-        if self.running or self.stopping or self.preflight_running:
+    def _start_generation_after_preflight(self, allow_during_preflight: bool = False):
+        if self.running or self.stopping or (self.preflight_running and not allow_during_preflight):
             return
 
         if self.current_future is not None and not self.current_future.done():
@@ -1818,15 +1923,28 @@ class CamouflageApp(App):
 
         self.status("Génération en cours…", ok=True)
         self.log(f"Démarrage : {count} camouflage(s) demandé(s).")
+        self.log(f"Mode : {self._run_mode_text()}.")
         self.log(f"Dossier : {self.current_output_dir.resolve()}")
         self.diag_log("Diagnostic live initialisé.")
-        self._emit_runtime("INFO", "start_worker", "Génération démarrée", target_count=count, output_dir=str(self.current_output_dir.resolve()))
+        self._emit_runtime("INFO", "start_worker", "Génération démarrée", target_count=count, output_dir=str(self.current_output_dir.resolve()), run_mode=self.run_mode)
         self._refresh_controls_state()
 
         fut = self.async_runner.submit(self._async_worker_generate(count))
         self._bind_future(fut)
 
     def stop_generation(self, *_):
+        if self.running and not self.stopping:
+            self.stop_flag = True
+            self.stopping = True
+            self.status("Arrêt demandé…", ok=False)
+            self.log("Arrêt demandé. Fin de la tentative courante puis arrêt.")
+            if self.preflight_running:
+                self.log("Le préflight en arrière-plan continue jusqu'à sa fin, mais la génération s'arrête.")
+            self.diag_log("Arrêt demandé par l'utilisateur.")
+            self._emit_runtime("WARNING", "start_worker", "Arrêt demandé", accepted_count=self.accepted_count, total_attempts=self.total_attempts)
+            self._refresh_controls_state()
+            return
+
         if self.preflight_running:
             self.preflight_pending_start = False
             self.status("Préflight en cours…", ok=False)
@@ -1837,14 +1955,6 @@ class CamouflageApp(App):
 
         if not self.running or self.stopping:
             return
-
-        self.stop_flag = True
-        self.stopping = True
-        self.status("Arrêt demandé…", ok=False)
-        self.log("Arrêt demandé. Fin de la tentative courante puis arrêt.")
-        self.diag_log("Arrêt demandé par l'utilisateur.")
-        self._emit_runtime("WARNING", "start_worker", "Arrêt demandé", accepted_count=self.accepted_count, total_attempts=self.total_attempts)
-        self._refresh_controls_state()
 
     async def _async_should_stop(self) -> bool:
         return self.stop_flag
@@ -2088,6 +2198,7 @@ class CamouflageApp(App):
         self.diag_log("Diagnostic live terminé avec succès.")
         self._emit_runtime("INFO", "start_worker", "Génération terminée avec succès", accepted_count=len(rows), total_attempts=self.total_attempts)
         self._refresh_controls_state()
+        self._refresh_run_mode_buttons()
         self.reload_gallery()
 
     async def _async_finish_stopped(self, rows: List[dict]):
@@ -2109,6 +2220,7 @@ class CamouflageApp(App):
         self.diag_log("Diagnostic live arrêté proprement.")
         self._emit_runtime("WARNING", "start_worker", "Génération arrêtée", accepted_count=len(rows), total_attempts=self.total_attempts)
         self._refresh_controls_state()
+        self._refresh_run_mode_buttons()
         self.reload_gallery()
 
     async def _async_finish_error(self, message: str):
