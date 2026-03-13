@@ -6,7 +6,7 @@
   "skipped": 0,
   "expected_failures": 0,
   "unexpected_successes": 0,
-  "duration_s": 180.0743269999948,
+  "duration_s": 180.10158760000195,
   "modules": [
     "test_main"
   ],
@@ -27,7 +27,7 @@
       "module": "test_main",
       "ok": false,
       "returncode": -9,
-      "duration_s": 180.0190755999938,
+      "duration_s": 180.05689180000627,
       "command": [
         "C:\\Python312\\python.exe",
         "-m",

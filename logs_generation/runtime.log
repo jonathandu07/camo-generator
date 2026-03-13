@@ -36,3 +36,7 @@
 2026-03-13 14:42:22 | INFO     | camo_log | [start_preflight] Préflight lancé depuis le front | payload={"mode": "bloquant"}
 2026-03-13 14:42:22 | INFO     | camo_log | [tests] Début préflight asynchrone | payload={"modules": ["test_main"], "parallel": true, "timeout_s": 180.0}
 2026-03-13 14:42:22 | INFO     | camo_log | [tests] Lancement module de test | payload={"command": ["C:\\Python312\\python.exe", "-m", "unittest", "-v", "test_main"], "mode": "async-subprocess", "module": "test_main", "timeout_s": 180.0}
+2026-03-13 14:45:22 | ERROR    | camo_log | [tests] Fin module de test | payload={"completed": false, "duration_s": 180.056892, "module": "test_main", "ok": false, "returncode": -9, "timed_out": true}
+2026-03-13 14:45:22 | ERROR    | camo_log | [tests] Fin préflight asynchrone | payload={"completed": false, "duration_s": 180.101588, "errors": 1, "failures": 0, "ok": false, "parallel": true, "timed_out": true, "timed_out_modules": ["test_main"], "total": 89}
+2026-03-13 14:45:22 | ERROR    | camo_log | [start_preflight] Préflight en échec | payload={"ok": false, "summary": "89 tests comptés | 0 échec(s) | 1 erreur(s) | timeout module(s): test_main"}
+2026-03-13 14:47:42 | INFO     | camo_log | [start] Arrêt de l'interface Kivy
