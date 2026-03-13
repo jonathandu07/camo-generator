@@ -57,7 +57,6 @@ try:
 except Exception:
     camo_log = None
 
-# Permet aux tests d'importer proprement le module courant
 sys.modules.setdefault("start", sys.modules[__name__])
 
 # ---------------- Kivy config avant imports UI ----------------
@@ -719,8 +718,8 @@ class GlassCard(BoxLayout):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.bind(pos=self._redraw, size=self._redraw)
-        self.padding = dp(16)
-        self.spacing = dp(10)
+        self.padding = dp(18)
+        self.spacing = dp(12)
 
     def _redraw(self, *_):
         self.canvas.before.clear()
@@ -866,7 +865,7 @@ class SoftButton(Button):
         self.background_color = (0, 0, 0, 0)
         self.color = C["text_main"]
         self.size_hint_y = None
-        self.height = dp(52)
+        self.height = dp(58)
         self.bold = True
         self.bind(pos=self._redraw, size=self._redraw, state=self._redraw, disabled=self._redraw)
 
@@ -1088,14 +1087,15 @@ class CamouflageApp(App):
         Window.clearcolor = C["bg_root"]
         root = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(10))
 
-        header = GlassCard(orientation="horizontal", size_hint_y=None, height=dp(84))
+        # Header
+        header = GlassCard(orientation="horizontal", size_hint_y=None, height=dp(132))
 
-        title_box = BoxLayout(orientation="vertical", spacing=dp(0))
+        title_box = BoxLayout(orientation="vertical", spacing=dp(2))
         tiny = Label(
             text="Image 000 | essai 0000",
             size_hint_y=None,
-            height=dp(18),
-            font_size=sp(12),
+            height=dp(20),
+            font_size=sp(11),
             color=C["text_muted"],
             halign="left",
             valign="middle",
@@ -1105,7 +1105,7 @@ class CamouflageApp(App):
 
         self.title_label = Label(
             text=APP_TITLE,
-            font_size=sp(21),
+            font_size=sp(18),
             bold=True,
             color=C["text_main"],
             halign="left",
@@ -1132,14 +1132,20 @@ class CamouflageApp(App):
 
         body = BoxLayout(spacing=dp(10))
 
-        # Colonne gauche
+        # --------------------------------------------------
+        # Colonne gauche scrollable
+        # --------------------------------------------------
         left = BoxLayout(orientation="vertical", size_hint_x=0.34, spacing=dp(10))
+
+        left_scroll = ScrollView(do_scroll_x=False, bar_width=dp(8))
+        left_content = BoxLayout(orientation="vertical", spacing=dp(10), size_hint_y=None)
+        left_content.bind(minimum_height=left_content.setter("height"))
 
         controls = GlassCard(
             orientation="vertical",
             size_hint_y=None,
-            height=dp(620),
         )
+        controls.bind(minimum_height=controls.setter("height"))
 
         controls.add_widget(self._label("Paramètres"))
 
@@ -1152,7 +1158,7 @@ class CamouflageApp(App):
         )
         controls.add_widget(self.count_input)
 
-        btn_row = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(10))
+        btn_row = BoxLayout(size_hint_y=None, height=dp(64), spacing=dp(12))
         self.start_btn = self._styled_button("Commencer", "launch", self.start_generation)
         self.stop_btn = self._styled_button("Arrêter", "stop", self.stop_generation)
         btn_row.add_widget(self.start_btn)
@@ -1206,9 +1212,9 @@ class CamouflageApp(App):
         controls.add_widget(self.diag_top_rules_label)
         controls.add_widget(self.diag_last_fail_label)
 
-        left.add_widget(controls)
+        left_content.add_widget(controls)
 
-        gallery_card = GlassCard(orientation="vertical")
+        gallery_card = GlassCard(orientation="vertical", size_hint_y=None, height=dp(520))
         gallery_card.add_widget(self._label("Galerie"))
         self.gallery_scroll = ScrollView(do_scroll_x=False)
         self.gallery_grid = GridLayout(
@@ -1220,9 +1226,14 @@ class CamouflageApp(App):
         self.gallery_grid.bind(minimum_height=self.gallery_grid.setter("height"))
         self.gallery_scroll.add_widget(self.gallery_grid)
         gallery_card.add_widget(self.gallery_scroll)
-        left.add_widget(gallery_card)
+        left_content.add_widget(gallery_card)
 
+        left_scroll.add_widget(left_content)
+        left.add_widget(left_scroll)
+
+        # --------------------------------------------------
         # Colonne droite
+        # --------------------------------------------------
         right = BoxLayout(orientation="vertical", spacing=dp(10))
 
         previews = BoxLayout(spacing=dp(10), size_hint_y=0.46)
@@ -1282,11 +1293,8 @@ class CamouflageApp(App):
         box.add_widget(self._label(title))
 
         stage_container = SoftPane(orientation="vertical")
-        _stage = ImageStage(image_widget, size_hint=(1, 1))
-
         overlay = BoxLayout(orientation="vertical", padding=dp(8))
         overlay.add_widget(image_widget)
-
         stage_container.add_widget(overlay)
         box.add_widget(stage_container)
         return box
