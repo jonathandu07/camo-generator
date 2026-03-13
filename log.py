@@ -42,7 +42,7 @@ from collections import Counter, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Deque, Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -55,12 +55,12 @@ import main as camo
 
 DEFAULT_ANALYSIS_COUNT = 20
 DEFAULT_OUTPUT_DIR = Path("logs_generation")
-DEFAULT_TEST_MODULES: tuple[str, ...] = ("test_main",)
+DEFAULT_TEST_MODULES: tuple[str, ...] = ("test_main", "test_start")
 DEFAULT_RUNTIME_LOG_FILE = "runtime.log"
 DEFAULT_TEST_SUMMARY_FILE = "tests_summary.json"
 DEFAULT_HISTORY_LIMIT = 5000
 DEFAULT_MAX_CONCURRENCY = max(1, min(4, (os.cpu_count() or 4)))
-DEFAULT_TEST_TIMEOUT_S = None
+DEFAULT_TEST_TIMEOUT_S: float | None = None
 DEFAULT_LIVE_CONSOLE = True
 DEFAULT_CONSOLE_LEVEL = "INFO"
 
@@ -294,6 +294,16 @@ def _coerce_test_run_summary(value: Any) -> TestRunSummary:
     if isinstance(value, dict):
         return TestRunSummary.from_dict(value)
     raise TypeError(f"Impossible de convertir en TestRunSummary: {type(value)!r}")
+
+
+def _normalize_timeout(timeout_s: float | None) -> float | None:
+    if timeout_s is None:
+        return None
+    try:
+        value = float(timeout_s)
+    except Exception:
+        return None
+    return None if value <= 0 else value
 
 
 # ============================================================
@@ -1089,6 +1099,7 @@ def _read_declared_test_log_file(module_name: str) -> str | None:
 
 
 def _run_test_module_subprocess(module_name: str, timeout_s: float | None = None) -> TestModuleSummary:
+    timeout_s = _normalize_timeout(timeout_s)
     cmd = _build_test_command(module_name)
     t0 = time.perf_counter()
 
@@ -1110,7 +1121,7 @@ def _run_test_module_subprocess(module_name: str, timeout_s: float | None = None
             encoding="utf-8",
             errors="replace",
             env=_subprocess_env(),
-            timeout=None if timeout_s is None or timeout_s <= 0 else float(timeout_s),
+            timeout=timeout_s,
         )
         dt = time.perf_counter() - t0
         summary = TestModuleSummary(
@@ -1185,6 +1196,7 @@ async def _async_run_test_module_subprocess(
     module_name: str,
     timeout_s: float | None = None,
 ) -> TestModuleSummary:
+    timeout_s = _normalize_timeout(timeout_s)
     cmd = _build_test_command(module_name)
     t0 = time.perf_counter()
 
@@ -1207,10 +1219,10 @@ async def _async_run_test_module_subprocess(
             env=_subprocess_env(),
         )
 
-        if timeout_s is None or timeout_s <= 0:
+        if timeout_s is None:
             stdout_b, stderr_b = await proc.communicate()
         else:
-            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=float(timeout_s))
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
 
         dt = time.perf_counter() - t0
         stdout = stdout_b.decode("utf-8", errors="replace")
@@ -1392,6 +1404,7 @@ def run_preflight_tests(
     output_dir: Path = DEFAULT_OUTPUT_DIR,
     timeout_s: float | None = DEFAULT_TEST_TIMEOUT_S,
 ) -> TestRunSummary:
+    timeout_s = _normalize_timeout(timeout_s)
     module_names = _normalize_module_names(module_names)
     ensure_dir(Path(output_dir))
     log_event(
@@ -1438,6 +1451,7 @@ async def async_run_preflight_tests(
     output_dir: Path = DEFAULT_OUTPUT_DIR,
     timeout_s: float | None = DEFAULT_TEST_TIMEOUT_S,
 ) -> TestRunSummary:
+    timeout_s = _normalize_timeout(timeout_s)
     ensure_dir(Path(output_dir))
     module_names = tuple(_normalize_module_names(module_names))
 
@@ -1769,12 +1783,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     try:
         output_dir = ensure_dir(Path(args.output))
         test_modules = _normalize_module_names(args.test_modules)
+        timeout_s = _normalize_timeout(args.test_timeout)
 
         if args.tests_only:
             summary = run_preflight_tests(
                 module_names=test_modules,
                 output_dir=output_dir,
-                timeout_s=float(args.test_timeout) if args.test_timeout is not None else None,
+                timeout_s=timeout_s,
             )
             _print_test_summary(summary)
             return
@@ -1789,7 +1804,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             parallel_diagnostics=bool(args.parallel_diagnostics),
             max_concurrency=int(args.max_concurrency),
             tests_non_blocking=bool(args.tests_non_blocking),
-            test_timeout_s=float(args.test_timeout) if args.test_timeout is not None else None,
+            test_timeout_s=timeout_s,
         )
         dt = time.perf_counter() - t0
 
@@ -1830,20 +1845,21 @@ async def async_main(argv: Sequence[str] | None = None) -> None:
     try:
         output_dir = ensure_dir(Path(args.output))
         test_modules = _normalize_module_names(args.test_modules)
+        timeout_s = _normalize_timeout(args.test_timeout)
 
         if args.tests_only:
             if args.parallel_tests:
                 summary = await async_run_preflight_tests(
                     module_names=test_modules,
                     output_dir=output_dir,
-                    timeout_s=float(args.test_timeout) if args.test_timeout is not None else None,
+                    timeout_s=timeout_s,
                 )
             else:
                 summary = await asyncio.to_thread(
                     run_preflight_tests,
                     tuple(test_modules),
                     output_dir,
-                    float(args.test_timeout) if args.test_timeout is not None else None,
+                    timeout_s,
                 )
             _print_test_summary(summary)
             return
@@ -1859,7 +1875,7 @@ async def async_main(argv: Sequence[str] | None = None) -> None:
             parallel_diagnostics=bool(args.parallel_diagnostics),
             max_concurrency=int(args.max_concurrency),
             tests_non_blocking=bool(args.tests_non_blocking),
-            test_timeout_s=float(args.test_timeout) if args.test_timeout is not None else None,
+            test_timeout_s=timeout_s,
         )
         dt = time.perf_counter() - t0
 
@@ -1890,7 +1906,8 @@ if __name__ == "__main__":
     parsed = parse_args()
     _apply_fast_mode(parsed)
 
+    argv = sys.argv[1:]
     if parsed.use_async:
-        asyncio.run(async_main())
+        asyncio.run(async_main(argv))
     else:
-        main()
+        main(argv)
