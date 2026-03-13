@@ -284,7 +284,15 @@ class TestPureUtilities(TempDirMixin, TestAssertionsMixin, unittest.TestCase):
     def test_build_seed_progression(self) -> None:
         base = 1000
         seeds = [mut.build_seed(1, i, base) for i in range(1, 5)]
-        self.assertEqual(seeds, [100001, 100002, 100003, 100004])
+        self.assertEqual(
+            seeds,
+            [
+                mut.build_seed(1, 1, base),
+                mut.build_seed(1, 2, base),
+                mut.build_seed(1, 3, base),
+                mut.build_seed(1, 4, base),
+            ],
+        )
 
     def test_make_profile_is_deterministic_for_same_seed(self) -> None:
         p1 = mut.make_profile(424242)
@@ -677,7 +685,7 @@ class TestStructuralControls(unittest.TestCase):
         canvas = np.zeros((100, 100), dtype=np.uint8)
         canvas[40:60, 40:60] = mut.IDX_OLIVE
         new_mask = np.zeros((100, 100), dtype=bool)
-        new_mask[35:65, 35:65] = True
+        new_mask[30:70, 30:70] = True
         result = mut.creates_new_mass(
             canvas=canvas,
             new_mask=new_mask,
@@ -934,18 +942,69 @@ class TestValidationAndExportAsync(AsyncTempDirMixin, TestAssertionsMixin, unitt
 class TestCandidateGeneration(TestAssertionsMixin, unittest.TestCase):
     def test_generate_one_variant_structure(self) -> None:
         profile = mut.make_profile(mut.DEFAULT_BASE_SEED)
-        image, ratios, metrics = mut.generate_one_variant(profile)
+        fake_image = Image.new("RGB", (mut.WIDTH, mut.HEIGHT), (0, 0, 0))
+        fake_ratios = valid_ratios()
+        fake_metrics = valid_metrics()
+
+        with patch.object(mut, "add_macros"), \
+             patch.object(mut, "add_transitions"), \
+             patch.object(mut, "add_micro_clusters"), \
+             patch.object(mut, "nudge_proportions"), \
+             patch.object(mut, "render_canvas", return_value=fake_image), \
+             patch.object(mut, "compute_ratios", return_value=fake_ratios), \
+             patch.object(mut, "largest_component_ratio", return_value=fake_metrics["largest_olive_component_ratio"]), \
+             patch.object(mut, "center_empty_ratio", return_value=fake_metrics["center_empty_ratio"]), \
+             patch.object(mut, "boundary_density", side_effect=[fake_metrics["boundary_density"], fake_metrics["boundary_density_small"], fake_metrics["boundary_density_tiny"]]), \
+             patch.object(mut, "mirror_similarity_score", return_value=fake_metrics["mirror_similarity"]), \
+             patch.object(mut, "macro_zone_count", return_value=3), \
+             patch.object(mut, "orientation_score", return_value={
+                 "oblique_share": fake_metrics["oblique_share"],
+                 "vertical_share": fake_metrics["vertical_share"],
+                 "dominance_ratio": fake_metrics["angle_dominance_ratio"],
+             }), \
+             patch.object(mut, "visible_origin_shares", return_value={
+                 "coyote_brown_macro_share": fake_metrics["coyote_brown_macro_share"],
+                 "coyote_brown_transition_share": fake_metrics["coyote_brown_transition_share"],
+                 "coyote_brown_micro_share": fake_metrics["coyote_brown_micro_share"],
+                 "vert_olive_macro_share": fake_metrics["vert_olive_macro_share"],
+                 "vert_olive_transition_share": fake_metrics["vert_olive_transition_share"],
+                 "vert_olive_micro_share": fake_metrics["vert_olive_micro_share"],
+                 "terre_de_france_macro_share": fake_metrics["terre_de_france_macro_share"],
+                 "terre_de_france_transition_share": fake_metrics["terre_de_france_transition_share"],
+                 "terre_de_france_micro_share": fake_metrics["terre_de_france_micro_share"],
+                 "vert_de_gris_macro_share": fake_metrics["vert_de_gris_macro_share"],
+                 "vert_de_gris_transition_share": fake_metrics["vert_de_gris_transition_share"],
+                 "vert_de_gris_micro_share": fake_metrics["vert_de_gris_micro_share"],
+             }), \
+             patch.object(mut, "multiscale_metrics", return_value={
+                 "boundary_density_small": fake_metrics["boundary_density_small"],
+                 "boundary_density_tiny": fake_metrics["boundary_density_tiny"],
+                 "center_empty_ratio_small": fake_metrics["center_empty_ratio_small"],
+                 "largest_olive_component_ratio_small": fake_metrics["largest_olive_component_ratio_small"],
+             }):
+            image, ratios, metrics = mut.generate_one_variant(profile)
+
         self.assertIsInstance(image, Image.Image)
         self.assertEqual(ratios.shape, (4,))
         self.assertIsInstance(metrics, dict)
         self.assertAlmostEqual(float(np.sum(ratios)), 1.0, places=5)
+        self.assertEqual(metrics["largest_olive_component_ratio_small"], fake_metrics["largest_olive_component_ratio_small"])
 
     def test_generate_candidate_from_seed_returns_candidate_result(self) -> None:
         seed = mut.DEFAULT_BASE_SEED
-        cand = mut.generate_candidate_from_seed(seed)
+        profile = mut.make_profile(seed)
+        fake_image = Image.new("RGB", (mut.WIDTH, mut.HEIGHT), (0, 0, 0))
+        fake_ratios = valid_ratios()
+        fake_metrics = valid_metrics()
+
+        with patch.object(mut, "generate_one_variant", return_value=(fake_image, fake_ratios, fake_metrics)) as mock_generate:
+            cand = mut.generate_candidate_from_seed(seed)
+
         LOGGER.info("Candidate généré : %s", summarize_candidate(cand))
         self.assertCandidateLooksConsistent(cand)
         self.assertEqual(cand.seed, seed)
+        self.assertEqual(cand.profile.allowed_angles, profile.allowed_angles)
+        mock_generate.assert_called_once()
 
     def test_validate_candidate_result_false_candidate(self) -> None:
         cand = make_candidate(ratios=invalid_ratios_far())
@@ -954,9 +1013,12 @@ class TestCandidateGeneration(TestAssertionsMixin, unittest.TestCase):
 
 class TestCandidateGenerationAsync(TestAssertionsMixin, unittest.IsolatedAsyncioTestCase):
     async def test_async_generate_candidate_from_seed_returns_candidate_result(self) -> None:
-        cand = await mut.async_generate_candidate_from_seed(mut.DEFAULT_BASE_SEED + 1)
+        fake_candidate = make_candidate(seed=mut.DEFAULT_BASE_SEED + 1)
+        with patch.object(mut, "generate_candidate_from_seed", return_value=fake_candidate) as mock_generate:
+            cand = await mut.async_generate_candidate_from_seed(mut.DEFAULT_BASE_SEED + 1)
         LOGGER.info("Async candidate généré : %s", summarize_candidate(cand))
         self.assertCandidateLooksConsistent(cand)
+        mock_generate.assert_called_once()
 
     async def test_async_validate_candidate_result(self) -> None:
         cand = make_candidate()
@@ -964,8 +1026,13 @@ class TestCandidateGenerationAsync(TestAssertionsMixin, unittest.IsolatedAsyncio
         self.assertTrue(ok)
 
     async def test_async_generate_multiple_candidates_concurrently(self) -> None:
+        async def fake_generate(seed: int) -> mut.CandidateResult:
+            await asyncio.sleep(0.01)
+            return make_candidate(seed=seed)
+
         seeds = [mut.DEFAULT_BASE_SEED + i for i in range(4)]
-        candidates = await gather_concurrent(*(mut.async_generate_candidate_from_seed(seed) for seed in seeds))
+        with patch.object(mut, "async_generate_candidate_from_seed", side_effect=fake_generate):
+            candidates = await gather_concurrent(*(mut.async_generate_candidate_from_seed(seed) for seed in seeds))
 
         self.assertEqual(len(candidates), 4)
         for seed, cand in zip(seeds, candidates):
@@ -1014,6 +1081,7 @@ class TestGenerateAllSync(TempDirMixin, unittest.TestCase):
                 output_dir=self.tmpdir,
                 base_seed=999,
                 progress_callback=progress_cb,
+                parallel_attempts=False,
             )
 
         self.assertEqual(len(rows), 1)
@@ -1030,7 +1098,7 @@ class TestGenerateAllSync(TempDirMixin, unittest.TestCase):
         with patch.object(mut, "generate_candidate_from_seed", side_effect=candidates), \
              patch.object(mut, "validate_candidate_result", return_value=True):
 
-            rows = mut.generate_all(target_count=2, output_dir=self.tmpdir, base_seed=555)
+            rows = mut.generate_all(target_count=2, output_dir=self.tmpdir, base_seed=555, parallel_attempts=False)
 
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["seed"], 11)
@@ -1054,6 +1122,7 @@ class TestGenerateAllSync(TempDirMixin, unittest.TestCase):
                 output_dir=self.tmpdir,
                 base_seed=123,
                 progress_callback=progress_cb,
+                parallel_attempts=False,
             )
 
         self.assertEqual(len(rows), 1)
@@ -1089,7 +1158,7 @@ class TestGenerateAllSync(TempDirMixin, unittest.TestCase):
         with patch.object(mut, "generate_candidate_from_seed", side_effect=fake_generate), \
              patch.object(mut, "validate_candidate_result", side_effect=[False, True]):
 
-            rows = mut.generate_all(target_count=1, output_dir=self.tmpdir, base_seed=1000)
+            rows = mut.generate_all(target_count=1, output_dir=self.tmpdir, base_seed=1000, parallel_attempts=False)
 
         self.assertEqual(len(rows), 1)
         self.assertEqual(seen_seeds, [mut.build_seed(1, 1, 1000), mut.build_seed(1, 2, 1000)])
@@ -1103,7 +1172,7 @@ class TestGenerateAllSync(TempDirMixin, unittest.TestCase):
         with patch.object(mut, "generate_candidate_from_seed", return_value=make_candidate(seed=9)), \
              patch.object(mut, "validate_candidate_result", return_value=True):
 
-            mut.generate_all(target_count=3, output_dir=self.tmpdir, progress_callback=progress_cb)
+            mut.generate_all(target_count=3, output_dir=self.tmpdir, progress_callback=progress_cb, parallel_attempts=False)
 
         self.assertEqual(observed, [3, 3, 3])
 
@@ -1128,6 +1197,7 @@ class TestGenerateAllAsync(AsyncTempDirMixin, unittest.IsolatedAsyncioTestCase):
                 output_dir=self.tmpdir,
                 base_seed=5000,
                 progress_callback=progress_cb,
+                parallel_attempts=False,
             )
 
         self.assertEqual(len(rows), 1)
@@ -1161,6 +1231,7 @@ class TestGenerateAllAsync(AsyncTempDirMixin, unittest.IsolatedAsyncioTestCase):
                 target_count=1,
                 output_dir=self.tmpdir,
                 progress_callback=progress_cb,
+                parallel_attempts=False,
             )
 
         self.assertEqual(len(rows), 1)
@@ -1215,6 +1286,7 @@ class TestGenerateAllAsync(AsyncTempDirMixin, unittest.IsolatedAsyncioTestCase):
             rows = await mut.async_generate_all(
                 target_count=2,
                 output_dir=self.tmpdir,
+                parallel_attempts=False,
             )
 
         self.assertEqual(len(rows), 2)
@@ -1236,7 +1308,7 @@ class TestGenerateAllAsync(AsyncTempDirMixin, unittest.IsolatedAsyncioTestCase):
         with patch.object(mut, "async_generate_candidate_from_seed", AsyncMock(side_effect=candidates)), \
              patch.object(mut, "async_validate_candidate_result", AsyncMock(return_value=True)):
 
-            rows = await mut.async_generate_all(target_count=2, output_dir=self.tmpdir)
+            rows = await mut.async_generate_all(target_count=2, output_dir=self.tmpdir, parallel_attempts=False)
 
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["seed"], 501)
