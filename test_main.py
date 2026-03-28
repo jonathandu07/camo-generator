@@ -185,7 +185,7 @@ def valid_metrics_fixed() -> Dict[str, float]:
         "terre_de_france_macro_share": 0.20,
         "terre_de_france_transition_share": 0.55,
         "terre_de_france_micro_share": 0.05,
-        "vert_de_gris_macro_share": 0.07,
+        "vert_de_gris_macro_share": 0.05,
         "vert_de_gris_transition_share": 0.05,
         "vert_de_gris_micro_share": 0.83,
     }
