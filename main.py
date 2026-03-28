@@ -105,9 +105,9 @@ TRANSITION_WIDTH_CM = (5, 15)
 
 MICRO_SIZE_CM = (2, 8)
 
-VISIBLE_MACRO_OLIVE_TARGET = 0.215
-VISIBLE_MACRO_TERRE_TARGET = 0.075
-VISIBLE_MACRO_GRIS_TARGET = 0.015
+VISIBLE_MACRO_OLIVE_TARGET = 0.205
+VISIBLE_MACRO_TERRE_TARGET = 0.050
+VISIBLE_MACRO_GRIS_TARGET = 0.000
 
 VISIBLE_TOTAL_OLIVE_TARGET = TARGET[IDX_OLIVE]
 VISIBLE_TOTAL_TERRE_TARGET = TARGET[IDX_TERRE]
@@ -123,17 +123,17 @@ MAX_BOUNDARY_DENSITY = 0.250
 MIN_BOUNDARY_DENSITY_SMALL = 0.060
 MAX_BOUNDARY_DENSITY_SMALL = 0.220
 
-MAX_MIRROR_SIMILARITY = 0.79
+MAX_MIRROR_SIMILARITY = 0.76
 
 MIN_VISIBLE_OLIVE_MACRO_SHARE = 0.60
-MIN_VISIBLE_TERRE_TRANS_SHARE = 0.36
-MIN_VISIBLE_GRIS_MICRO_SHARE = 0.70
-MAX_VISIBLE_GRIS_MACRO_SHARE = 0.18
+MIN_VISIBLE_TERRE_TRANS_SHARE = 0.50
+MIN_VISIBLE_GRIS_MICRO_SHARE = 0.82
+MAX_VISIBLE_GRIS_MACRO_SHARE = 0.06
 
-MIN_OBLIQUE_SHARE = 0.58
-MIN_VERTICAL_SHARE = 0.08
-MAX_VERTICAL_SHARE = 0.34
-MAX_ANGLE_DOMINANCE_RATIO = 0.34
+MIN_OBLIQUE_SHARE = 0.64
+MIN_VERTICAL_SHARE = 0.10
+MAX_VERTICAL_SHARE = 0.30
+MAX_ANGLE_DOMINANCE_RATIO = 0.32
 
 BOUNDARY_NUDGE_PASSES = 10
 BOUNDARY_NUDGE_SAMPLE_RATIO = 0.0035
@@ -141,11 +141,31 @@ BOUNDARY_NUDGE_SAMPLE_RATIO = 0.0035
 MIN_TRANSITION_TOUCH_PIXELS = 22
 MIN_MICRO_BOUNDARY_COVERAGE = 0.24
 MAX_LOCAL_MASS_RATIO_TRANSITION = 0.72
+MAX_CENTER_TORSO_OVERLAP_MACRO = 0.34
+MAX_CENTER_TORSO_OVERLAP_TERRAIN_MACRO = 0.22
+MAX_MACRO_PLACEMENT_ATTEMPTS_OLIVE = 420
+MAX_MACRO_PLACEMENT_ATTEMPTS_TERRE = 240
+MAX_MACRO_PLACEMENT_ATTEMPTS_GRIS = 40
+MAX_TRANSITION_PLACEMENTS = 900
+MAX_MICRO_CLUSTER_PLACEMENTS = 1200
 
 # Accélération contrôlée
 CPU_COUNT = max(1, os.cpu_count() or 1)
 DEFAULT_MAX_WORKERS = max(1, min(12, CPU_COUNT - 2 if CPU_COUNT > 4 else CPU_COUNT))
 DEFAULT_ATTEMPT_BATCH_SIZE = max(1, min(8, DEFAULT_MAX_WORKERS))
+
+# Validation perceptive / visuelle
+VISUAL_MIN_SILHOUETTE_COLOR_DIVERSITY = 0.62
+VISUAL_MIN_CONTOUR_BREAK_SCORE = 0.44
+VISUAL_MIN_OUTLINE_BAND_DIVERSITY = 0.58
+VISUAL_MIN_SMALL_SCALE_STRUCTURAL_SCORE = 0.42
+VISUAL_MIN_FINAL_SCORE = 0.60
+VISUAL_MIN_MILITARY_SCORE = 0.62
+MIN_PERIPHERY_BOUNDARY_DENSITY_RATIO = 1.10
+MIN_PERIPHERY_NON_COYOTE_RATIO = 1.05
+MIN_MACRO_OLIVE_VISIBLE_RATIO = 0.16
+MAX_MACRO_TERRE_VISIBLE_RATIO = 0.09
+MAX_MACRO_GRIS_VISIBLE_RATIO = 0.015
 
 
 # ============================================================
@@ -365,6 +385,10 @@ def downsample_nearest(canvas: np.ndarray, factor: int) -> np.ndarray:
     return canvas[::factor, ::factor]
 
 
+def clamp01(x: float) -> float:
+    return max(0.0, min(1.0, float(x)))
+
+
 def boundary_density(canvas: np.ndarray) -> float:
     return float(np.mean(compute_boundary_mask(canvas)))
 
@@ -434,6 +458,25 @@ def rect_mask(x1: float, x2: float, y1: float, y2: float) -> np.ndarray:
 
 ANATOMY_ZONES = anatomy_zone_masks()
 ANATOMY_ZONE_VALUES = tuple(ANATOMY_ZONES.values())
+HIGH_DENSITY_ZONE_NAMES = (
+    "left_shoulder",
+    "right_shoulder",
+    "left_flank",
+    "right_flank",
+    "left_thigh",
+    "right_thigh",
+)
+
+
+def combine_zone_masks(names: Sequence[str]) -> np.ndarray:
+    mask = np.zeros((HEIGHT, WIDTH), dtype=bool)
+    for name in names:
+        mask |= ANATOMY_ZONES[name]
+    return mask
+
+
+HIGH_DENSITY_ZONE_MASK = combine_zone_masks(HIGH_DENSITY_ZONE_NAMES)
+CENTER_TORSO_MASK = ANATOMY_ZONES["center_torso"]
 
 
 def macro_zone_count(mask: np.ndarray) -> int:
@@ -443,6 +486,13 @@ def macro_zone_count(mask: np.ndarray) -> int:
         if overlap >= 600:
             count += 1
     return count
+
+
+def zone_overlap_ratio(mask: np.ndarray, zone_mask: np.ndarray) -> float:
+    area = int(mask.sum())
+    if area <= 0:
+        return 0.0
+    return float(np.mean(zone_mask[mask]))
 
 
 def center_empty_ratio(canvas: np.ndarray) -> float:
@@ -575,7 +625,8 @@ def jagged_spine_poly(
         right.append((axis_dx + local_half_w + ejr, y))
 
     poly = left + right[::-1]
-    rot = [rotate(x, y, angle_from_vertical_deg - 90) for x, y in poly]
+    # Le repère local est construit avec l'axe de longueur sur Y : 0° doit donc rester vertical.
+    rot = [rotate(x, y, angle_from_vertical_deg) for x, y in poly]
     return [(cx + x, cy + y) for x, y in rot]
 
 
@@ -710,9 +761,14 @@ def add_macros(
 
     target_macro_olive_pixels = int(VISIBLE_MACRO_OLIVE_TARGET * canvas.size)
     target_macro_terre_pixels = int(VISIBLE_MACRO_TERRE_TARGET * canvas.size)
+    # Le vert-de-gris ne doit pas constituer une vraie masse macro par défaut.
     target_macro_gris_pixels = int(VISIBLE_MACRO_GRIS_TARGET * canvas.size)
 
+    olive_attempts = 0
     while int(np.sum((canvas == IDX_OLIVE) & (origin_map == ORIGIN_MACRO))) < target_macro_olive_pixels:
+        olive_attempts += 1
+        if olive_attempts > MAX_MACRO_PLACEMENT_ATTEMPTS_OLIVE:
+            break
         cx, cy = choose_biased_center(rng)
         angle = rng.choice(profile.allowed_angles)
 
@@ -743,10 +799,17 @@ def add_macros(
         if zc < 2 and rng.random() < 0.75:
             continue
 
+        if zone_overlap_ratio(mask, ANATOMY_ZONES["center_torso"]) > MAX_CENTER_TORSO_OVERLAP_MACRO:
+            continue
+
         apply_mask(canvas, origin_map, mask, IDX_OLIVE, ORIGIN_MACRO)
         macros.append(MacroRecord(IDX_OLIVE, poly, angle, (cx, cy), mask, zc))
 
+    terre_attempts = 0
     while int(np.sum((canvas == IDX_TERRE) & (origin_map == ORIGIN_MACRO))) < target_macro_terre_pixels:
+        terre_attempts += 1
+        if terre_attempts > MAX_MACRO_PLACEMENT_ATTEMPTS_TERRE:
+            break
         cx, cy = choose_biased_center(rng)
         angle = rng.choice(profile.allowed_angles)
 
@@ -757,8 +820,8 @@ def add_macros(
             rng=rng,
             cx=cx,
             cy=cy,
-            length_px=cm_to_px(rng.uniform(42, 70)),
-            width_px=cm_to_px(rng.uniform(12, 26)),
+            length_px=cm_to_px(rng.uniform(40, 66)),
+            width_px=cm_to_px(rng.uniform(12, 24)),
             angle_from_vertical_deg=angle,
             segments=rng.randint(6, 9),
             width_variation=max(0.18, profile.macro_width_variation - 0.03),
@@ -771,14 +834,24 @@ def add_macros(
             continue
 
         cur = canvas[mask]
-        if float(np.mean(np.isin(cur, [IDX_COYOTE, IDX_OLIVE]))) < 0.60:
+        if float(np.mean(np.isin(cur, [IDX_COYOTE, IDX_OLIVE]))) < 0.65:
+            continue
+
+        if zone_overlap_ratio(mask, ANATOMY_ZONES["center_torso"]) > MAX_CENTER_TORSO_OVERLAP_TERRAIN_MACRO:
             continue
 
         zc = macro_zone_count(mask)
+        if zc < 1 and rng.random() < 0.65:
+            continue
+
         apply_mask(canvas, origin_map, mask, IDX_TERRE, ORIGIN_MACRO)
         macros.append(MacroRecord(IDX_TERRE, poly, angle, (cx, cy), mask, zc))
 
+    gris_attempts = 0
     while int(np.sum((canvas == IDX_GRIS) & (origin_map == ORIGIN_MACRO))) < target_macro_gris_pixels:
+        gris_attempts += 1
+        if gris_attempts > MAX_MACRO_PLACEMENT_ATTEMPTS_GRIS:
+            break
         cx, cy = choose_biased_center(rng)
         angle = rng.choice(profile.allowed_angles)
 
@@ -786,11 +859,11 @@ def add_macros(
             rng=rng,
             cx=cx,
             cy=cy,
-            length_px=cm_to_px(rng.uniform(35, 55)),
-            width_px=cm_to_px(rng.uniform(10, 18)),
+            length_px=cm_to_px(rng.uniform(34, 46)),
+            width_px=cm_to_px(rng.uniform(9, 14)),
             angle_from_vertical_deg=angle,
-            segments=rng.randint(5, 8),
-            width_variation=max(0.16, profile.macro_width_variation - 0.08),
+            segments=rng.randint(5, 7),
+            width_variation=max(0.15, profile.macro_width_variation - 0.08),
             lateral_jitter=max(0.10, profile.macro_lateral_jitter - 0.05),
             tip_taper=profile.macro_tip_taper,
             edge_break=profile.macro_edge_break,
@@ -800,7 +873,10 @@ def add_macros(
             continue
 
         cur = canvas[mask]
-        if float(np.mean(np.isin(cur, [IDX_OLIVE, IDX_TERRE]))) < 0.48:
+        if float(np.mean(np.isin(cur, [IDX_OLIVE, IDX_TERRE]))) < 0.55:
+            continue
+
+        if zone_overlap_ratio(mask, ANATOMY_ZONES["center_torso"]) > 0.18:
             continue
 
         zc = macro_zone_count(mask)
@@ -816,18 +892,23 @@ def add_transitions(
     macros: Sequence[MacroRecord],
     rng: random.Random,
 ) -> None:
+    placement_attempts = 0
     while True:
+        placement_attempts += 1
+        if placement_attempts > MAX_TRANSITION_PLACEMENTS:
+            break
         rs = compute_ratios(canvas)
         visible = visible_origin_shares(canvas, origin_map)
 
         enough_terre = rs[IDX_TERRE] >= VISIBLE_TOTAL_TERRE_TARGET
         enough_olive = rs[IDX_OLIVE] >= VISIBLE_TOTAL_OLIVE_TARGET * 0.985
-        enough_trans_share = visible["terre_de_france_transition_share"] >= 0.30
+        enough_trans_share = visible["terre_de_france_transition_share"] >= MIN_VISIBLE_TERRE_TRANS_SHARE
 
         if enough_terre and enough_olive and enough_trans_share:
             break
 
-        parent = rng.choice(macros)
+        parent_pool = [m for m in macros if m.color_idx in (IDX_OLIVE, IDX_TERRE)]
+        parent = rng.choice(parent_pool or list(macros))
 
         poly = attached_transition(
             rng=rng,
@@ -846,11 +927,18 @@ def add_transitions(
         deficits = TARGET - rs
         terre_need = max(0.0, deficits[IDX_TERRE])
         olive_need = max(0.0, deficits[IDX_OLIVE])
+        coyote_need = max(0.0, deficits[IDX_COYOTE])
 
+        # Terre de France doit rester la couleur dominante des transitions.
         if terre_need >= olive_need:
             p_terre, p_olive, p_coyote = 0.74, 0.18, 0.08
         else:
-            p_terre, p_olive, p_coyote = 0.62, 0.28, 0.10
+            p_terre, p_olive, p_coyote = 0.68, 0.22, 0.10
+
+        if coyote_need > max(terre_need, olive_need) * 1.4:
+            p_coyote += 0.06
+            p_terre -= 0.04
+            p_olive -= 0.02
 
         r = rng.random()
         if r < p_terre:
@@ -863,7 +951,7 @@ def add_transitions(
         if color == IDX_TERRE and float(np.mean(cur != IDX_COYOTE)) < 0.18:
             continue
 
-        if color == IDX_OLIVE and creates_new_mass(canvas, mask, color, local_radius=38, max_local_area_ratio=0.76):
+        if creates_new_mass(canvas, mask, color, local_radius=38, max_local_area_ratio=0.74):
             continue
 
         if color == IDX_COYOTE and float(np.mean(cur == IDX_COYOTE)) > 0.90:
@@ -878,13 +966,17 @@ def add_micro_clusters(
     profile: VariantProfile,
     rng: random.Random,
 ) -> None:
+    placement_attempts = 0
     while True:
+        placement_attempts += 1
+        if placement_attempts > MAX_MICRO_CLUSTER_PLACEMENTS:
+            break
         rs = compute_ratios(canvas)
         visible = visible_origin_shares(canvas, origin_map)
 
         enough_gris = rs[IDX_GRIS] >= VISIBLE_TOTAL_GRIS_TARGET
         enough_terre = rs[IDX_TERRE] >= VISIBLE_TOTAL_TERRE_TARGET
-        enough_micro_share = visible["vert_de_gris_micro_share"] >= 0.64
+        enough_micro_share = visible["vert_de_gris_micro_share"] >= MIN_VISIBLE_GRIS_MICRO_SHARE
 
         if enough_gris and enough_terre and enough_micro_share:
             break
@@ -938,9 +1030,9 @@ def add_micro_clusters(
             terre_need = max(0.0, deficits[IDX_TERRE])
 
             if gris_need >= terre_need:
-                color = IDX_GRIS if rng.random() < 0.82 else IDX_TERRE
+                color = IDX_GRIS if rng.random() < 0.88 else IDX_TERRE
             else:
-                color = IDX_GRIS if rng.random() < 0.70 else IDX_TERRE
+                color = IDX_GRIS if rng.random() < 0.82 else IDX_TERRE
 
             apply_mask(canvas, origin_map, mask, color, ORIGIN_MICRO)
             placed_any = True
@@ -1028,6 +1120,259 @@ def center_empty_ratio_upscaled_proxy(canvas_small: np.ndarray) -> float:
 
 
 # ============================================================
+# VALIDATION VISUELLE / PERCEPTIVE
+# ============================================================
+
+def build_silhouette_mask(width: int, height: int) -> np.ndarray:
+    img = Image.new("L", (width, height), 0)
+    draw = ImageDraw.Draw(img)
+
+    head_w = int(width * 0.18)
+    head_h = int(height * 0.12)
+    head_x1 = (width - head_w) // 2
+    head_y1 = int(height * 0.05)
+    draw.ellipse([head_x1, head_y1, head_x1 + head_w, head_y1 + head_h], fill=255)
+
+    torso_w = int(width * 0.34)
+    torso_h = int(height * 0.38)
+    torso_x1 = (width - torso_w) // 2
+    torso_y1 = int(height * 0.16)
+    draw.rounded_rectangle(
+        [torso_x1, torso_y1, torso_x1 + torso_w, torso_y1 + torso_h],
+        radius=int(width * 0.03),
+        fill=255,
+    )
+
+    shoulder_w = int(width * 0.58)
+    shoulder_h = int(height * 0.10)
+    shoulder_x1 = (width - shoulder_w) // 2
+    shoulder_y1 = int(height * 0.14)
+    draw.rounded_rectangle(
+        [shoulder_x1, shoulder_y1, shoulder_x1 + shoulder_w, shoulder_y1 + shoulder_h],
+        radius=int(width * 0.025),
+        fill=255,
+    )
+
+    arm_w = int(width * 0.11)
+    arm_h = int(height * 0.32)
+    left_arm_x1 = int(width * 0.15)
+    right_arm_x1 = width - left_arm_x1 - arm_w
+    arm_y1 = int(height * 0.20)
+    draw.rounded_rectangle(
+        [left_arm_x1, arm_y1, left_arm_x1 + arm_w, arm_y1 + arm_h],
+        radius=int(width * 0.02),
+        fill=255,
+    )
+    draw.rounded_rectangle(
+        [right_arm_x1, arm_y1, right_arm_x1 + arm_w, arm_y1 + arm_h],
+        radius=int(width * 0.02),
+        fill=255,
+    )
+
+    pelvis_w = int(width * 0.30)
+    pelvis_h = int(height * 0.10)
+    pelvis_x1 = (width - pelvis_w) // 2
+    pelvis_y1 = int(height * 0.51)
+    draw.rounded_rectangle(
+        [pelvis_x1, pelvis_y1, pelvis_x1 + pelvis_w, pelvis_y1 + pelvis_h],
+        radius=int(width * 0.02),
+        fill=255,
+    )
+
+    leg_w = int(width * 0.12)
+    leg_h = int(height * 0.32)
+    leg_gap = int(width * 0.04)
+    left_leg_x1 = (width // 2) - leg_gap // 2 - leg_w
+    right_leg_x1 = (width // 2) + leg_gap // 2
+    leg_y1 = int(height * 0.58)
+    draw.rounded_rectangle(
+        [left_leg_x1, leg_y1, left_leg_x1 + leg_w, leg_y1 + leg_h],
+        radius=int(width * 0.018),
+        fill=255,
+    )
+    draw.rounded_rectangle(
+        [right_leg_x1, leg_y1, right_leg_x1 + leg_w, leg_y1 + leg_h],
+        radius=int(width * 0.018),
+        fill=255,
+    )
+
+    return np.array(img, dtype=np.uint8) > 0
+
+
+def silhouette_boundary(mask: np.ndarray) -> np.ndarray:
+    b = np.zeros_like(mask, dtype=bool)
+    b[1:, :] |= mask[1:, :] != mask[:-1, :]
+    b[:-1, :] |= mask[:-1, :] != mask[1:, :]
+    b[:, 1:] |= mask[:, 1:] != mask[:, :-1]
+    b[:, :-1] |= mask[:, :-1] != mask[:, 1:]
+    return b & mask
+
+
+def silhouette_color_diversity_score(index_canvas: np.ndarray) -> float:
+    sil = build_silhouette_mask(index_canvas.shape[1], index_canvas.shape[0])
+    data = index_canvas[sil]
+    if data.size == 0:
+        return 0.0
+    unique_count = len(np.unique(data))
+    hist = np.bincount(data, minlength=4).astype(float)
+    hist /= hist.sum()
+    entropy = -np.sum([p * math.log(p + 1e-12) for p in hist if p > 0])
+    entropy /= math.log(4.0)
+    return clamp01((unique_count / 4.0) * 0.45 + entropy * 0.55)
+
+
+def contour_break_score(index_canvas: np.ndarray) -> Tuple[float, float]:
+    h, w = index_canvas.shape
+    sil = build_silhouette_mask(w, h)
+    bound = silhouette_boundary(sil)
+
+    band = dilate_mask(bound, radius=5) & sil
+    vals = index_canvas[band]
+    if vals.size == 0:
+        return 0.0, 0.0
+
+    hist = np.bincount(vals, minlength=4).astype(float)
+    hist /= hist.sum()
+    entropy = -np.sum([p * math.log(p + 1e-12) for p in hist if p > 0])
+    entropy /= math.log(4.0)
+
+    ys, xs = np.where(bound)
+    varied = 0
+    total = len(xs)
+
+    for y, x in zip(ys, xs):
+        y1, y2 = max(0, y - 3), min(h, y + 4)
+        x1, x2 = max(0, x - 3), min(w, x + 4)
+        neighborhood = index_canvas[y1:y2, x1:x2]
+        if len(np.unique(neighborhood)) >= 2:
+            varied += 1
+
+    local_variation = varied / total if total else 0.0
+    score = clamp01(local_variation * 0.62 + entropy * 0.38)
+    return score, float(entropy)
+
+
+def small_scale_structural_score(index_canvas: np.ndarray) -> float:
+    small = downsample_nearest(index_canvas, 4)
+    olive_ratio = largest_component_ratio(small == IDX_OLIVE)
+    bd = float(np.mean(compute_boundary_mask(small)))
+
+    s1 = clamp01((olive_ratio - 0.08) / 0.18)
+    s2 = 1.0 - min(1.0, abs(bd - 0.11) / 0.12)
+    return clamp01(0.58 * s1 + 0.42 * s2)
+
+
+def ratio_score(rs: np.ndarray) -> float:
+    err = np.abs(rs - TARGET)
+    mae = float(np.mean(err))
+    return clamp01(1.0 - mae / 0.05)
+
+
+def main_metrics_score(metrics: Dict[str, float]) -> float:
+    parts = [
+        clamp01((metrics["largest_olive_component_ratio"] - 0.12) / 0.18),
+        clamp01(1.0 - metrics["center_empty_ratio"] / 0.60),
+        clamp01(1.0 - metrics["mirror_similarity"] / 0.90),
+        clamp01((metrics["olive_multizone_share"] - 0.25) / 0.45),
+        clamp01(1.0 - abs(metrics["boundary_density"] - 0.14) / 0.12),
+        clamp01((metrics["vert_olive_macro_share"] - 0.45) / 0.30),
+        clamp01((metrics["terre_de_france_transition_share"] - 0.20) / 0.30),
+        clamp01((metrics["vert_de_gris_micro_share"] - 0.50) / 0.25),
+    ]
+    return float(np.mean(parts))
+
+
+def evaluate_visual_metrics(index_canvas: np.ndarray, rs: np.ndarray, metrics: Dict[str, float]) -> Dict[str, float]:
+    sil_div = silhouette_color_diversity_score(index_canvas)
+    contour_score, outline_band_div = contour_break_score(index_canvas)
+    small_scale_score = small_scale_structural_score(index_canvas)
+
+    s_ratio = ratio_score(rs)
+    s_main = main_metrics_score(metrics)
+    s_sil = sil_div
+    s_contour = clamp01(0.65 * contour_score + 0.35 * outline_band_div)
+
+    final_score = (
+        0.28 * s_ratio
+        + 0.30 * s_sil
+        + 0.24 * s_contour
+        + 0.18 * s_main
+    )
+
+    visual_valid = (
+        sil_div >= VISUAL_MIN_SILHOUETTE_COLOR_DIVERSITY
+        and contour_score >= VISUAL_MIN_CONTOUR_BREAK_SCORE
+        and outline_band_div >= VISUAL_MIN_OUTLINE_BAND_DIVERSITY
+        and small_scale_score >= VISUAL_MIN_SMALL_SCALE_STRUCTURAL_SCORE
+        and final_score >= VISUAL_MIN_FINAL_SCORE
+    )
+
+    return {
+        "visual_score_final": float(final_score),
+        "visual_score_ratio": float(s_ratio),
+        "visual_score_silhouette": float(s_sil),
+        "visual_score_contour": float(s_contour),
+        "visual_score_main": float(s_main),
+        "visual_silhouette_color_diversity": float(sil_div),
+        "visual_contour_break_score": float(contour_score),
+        "visual_outline_band_diversity": float(outline_band_div),
+        "visual_small_scale_structural_score": float(small_scale_score),
+        "visual_validation_passed": 1.0 if visual_valid else 0.0,
+    }
+
+
+def absolute_origin_color_ratios(canvas: np.ndarray, origin_map: np.ndarray) -> Dict[str, float]:
+    total = float(canvas.size)
+    return {
+        "macro_olive_visible_ratio": float(np.sum((canvas == IDX_OLIVE) & (origin_map == ORIGIN_MACRO)) / total),
+        "macro_terre_visible_ratio": float(np.sum((canvas == IDX_TERRE) & (origin_map == ORIGIN_MACRO)) / total),
+        "macro_gris_visible_ratio": float(np.sum((canvas == IDX_GRIS) & (origin_map == ORIGIN_MACRO)) / total),
+        "transition_terre_visible_ratio": float(np.sum((canvas == IDX_TERRE) & (origin_map == ORIGIN_TRANSITION)) / total),
+        "micro_gris_visible_ratio": float(np.sum((canvas == IDX_GRIS) & (origin_map == ORIGIN_MICRO)) / total),
+    }
+
+
+def spatial_discipline_metrics(canvas: np.ndarray) -> Dict[str, float]:
+    boundary = compute_boundary_mask(canvas)
+    non_coyote = canvas != IDX_COYOTE
+
+    periphery_boundary_density = float(np.mean(boundary[HIGH_DENSITY_ZONE_MASK]))
+    center_boundary_density = float(np.mean(boundary[CENTER_TORSO_MASK]))
+    periphery_boundary_ratio = periphery_boundary_density / max(center_boundary_density, 1e-6)
+
+    periphery_non_coyote = float(np.mean(non_coyote[HIGH_DENSITY_ZONE_MASK]))
+    center_non_coyote = float(np.mean(non_coyote[CENTER_TORSO_MASK]))
+    periphery_non_coyote_ratio = periphery_non_coyote / max(center_non_coyote, 1e-6)
+
+    return {
+        "periphery_boundary_density": periphery_boundary_density,
+        "center_boundary_density": center_boundary_density,
+        "periphery_boundary_density_ratio": float(periphery_boundary_ratio),
+        "periphery_non_coyote_density": periphery_non_coyote,
+        "center_non_coyote_density": center_non_coyote,
+        "periphery_non_coyote_ratio": float(periphery_non_coyote_ratio),
+    }
+
+
+def military_visual_discipline_score(metrics: Dict[str, float]) -> Dict[str, float]:
+    parts = [
+        clamp01((metrics.get("visual_score_final", 0.0) - 0.45) / 0.30),
+        clamp01((metrics.get("periphery_boundary_density_ratio", 0.0) - 0.95) / 0.45),
+        clamp01((metrics.get("periphery_non_coyote_ratio", 0.0) - 0.95) / 0.45),
+        clamp01((metrics.get("macro_olive_visible_ratio", 0.0) - 0.10) / 0.12),
+        clamp01(1.0 - metrics.get("macro_terre_visible_ratio", 1.0) / 0.10),
+        clamp01(1.0 - metrics.get("macro_gris_visible_ratio", 1.0) / 0.03),
+        clamp01((metrics.get("oblique_share", 0.0) - 0.55) / 0.25),
+        clamp01(1.0 - metrics.get("mirror_similarity", 1.0) / 0.85),
+    ]
+    score = float(np.mean(parts))
+    return {
+        "visual_military_score": score,
+        "visual_military_passed": 1.0 if score >= VISUAL_MIN_MILITARY_SCORE else 0.0,
+    }
+
+
+# ============================================================
 # GÉNÉRATION D'UNE VARIANTE
 # ============================================================
 
@@ -1062,8 +1407,12 @@ def generate_one_variant(profile: VariantProfile) -> Tuple[Image.Image, np.ndarr
         "angle_dominance_ratio": orient["dominance_ratio"],
         "olive_multizone_share": multizone_share,
         **visible_shares,
+        **absolute_origin_color_ratios(canvas, origin_map),
+        **spatial_discipline_metrics(canvas),
         **multi,
     }
+    metrics.update(evaluate_visual_metrics(canvas, rs, metrics))
+    metrics.update(military_visual_discipline_score(metrics))
 
     return render_canvas(canvas), rs, metrics
 
@@ -1147,6 +1496,41 @@ def variant_is_valid(rs: np.ndarray, metrics: Dict[str, float]) -> bool:
     if metrics["vert_de_gris_macro_share"] > MAX_VISIBLE_GRIS_MACRO_SHARE:
         return False
 
+    # Validation perceptive optionnelle mais activée automatiquement quand les scores sont présents.
+    if "visual_silhouette_color_diversity" in metrics:
+        if metrics["visual_silhouette_color_diversity"] < VISUAL_MIN_SILHOUETTE_COLOR_DIVERSITY:
+            return False
+    if "visual_contour_break_score" in metrics:
+        if metrics["visual_contour_break_score"] < VISUAL_MIN_CONTOUR_BREAK_SCORE:
+            return False
+    if "visual_outline_band_diversity" in metrics:
+        if metrics["visual_outline_band_diversity"] < VISUAL_MIN_OUTLINE_BAND_DIVERSITY:
+            return False
+    if "visual_small_scale_structural_score" in metrics:
+        if metrics["visual_small_scale_structural_score"] < VISUAL_MIN_SMALL_SCALE_STRUCTURAL_SCORE:
+            return False
+    if "visual_score_final" in metrics:
+        if metrics["visual_score_final"] < VISUAL_MIN_FINAL_SCORE:
+            return False
+    if "periphery_boundary_density_ratio" in metrics:
+        if metrics["periphery_boundary_density_ratio"] < MIN_PERIPHERY_BOUNDARY_DENSITY_RATIO:
+            return False
+    if "periphery_non_coyote_ratio" in metrics:
+        if metrics["periphery_non_coyote_ratio"] < MIN_PERIPHERY_NON_COYOTE_RATIO:
+            return False
+    if "macro_olive_visible_ratio" in metrics:
+        if metrics["macro_olive_visible_ratio"] < MIN_MACRO_OLIVE_VISIBLE_RATIO:
+            return False
+    if "macro_terre_visible_ratio" in metrics:
+        if metrics["macro_terre_visible_ratio"] > MAX_MACRO_TERRE_VISIBLE_RATIO:
+            return False
+    if "macro_gris_visible_ratio" in metrics:
+        if metrics["macro_gris_visible_ratio"] > MAX_MACRO_GRIS_VISIBLE_RATIO:
+            return False
+    if "visual_military_score" in metrics:
+        if metrics["visual_military_score"] < VISUAL_MIN_MILITARY_SCORE:
+            return False
+
     return True
 
 
@@ -1182,7 +1566,7 @@ def candidate_row(
     rs = candidate.ratios
     metrics = candidate.metrics
 
-    return {
+    row = {
         "index": target_index,
         "seed": candidate.seed,
         "attempts_for_this_image": local_attempt,
@@ -1209,6 +1593,34 @@ def candidate_row(
         "gris_macro_share": round(metrics["vert_de_gris_macro_share"], 5),
         "angles": " ".join(map(str, candidate.profile.allowed_angles)),
     }
+    for key in (
+        "visual_score_final",
+        "visual_score_ratio",
+        "visual_score_silhouette",
+        "visual_score_contour",
+        "visual_score_main",
+        "visual_silhouette_color_diversity",
+        "visual_contour_break_score",
+        "visual_outline_band_diversity",
+        "visual_small_scale_structural_score",
+        "visual_validation_passed",
+        "macro_olive_visible_ratio",
+        "macro_terre_visible_ratio",
+        "macro_gris_visible_ratio",
+        "transition_terre_visible_ratio",
+        "micro_gris_visible_ratio",
+        "periphery_boundary_density",
+        "center_boundary_density",
+        "periphery_boundary_density_ratio",
+        "periphery_non_coyote_density",
+        "center_non_coyote_density",
+        "periphery_non_coyote_ratio",
+        "visual_military_score",
+        "visual_military_passed",
+    ):
+        if key in metrics:
+            row[key] = round(float(metrics[key]), 5)
+    return row
 
 
 def write_report(rows: List[Dict[str, object]], output_dir: Path, filename: str = "rapport_camouflages.csv") -> Path:

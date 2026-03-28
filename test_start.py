@@ -21,7 +21,9 @@ Exécution :
 from __future__ import annotations
 
 import csv
+import functools
 import logging
+import sys
 import tempfile
 import time
 import types
@@ -33,6 +35,168 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 from PIL import Image as PILImage
+
+
+
+def _install_fake_kivy() -> None:
+    if "kivy" in sys.modules:
+        return
+
+    class _CanvasCtx:
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class _Canvas:
+        def __init__(self):
+            self.before = _CanvasCtx()
+            self.after = _CanvasCtx()
+        def clear(self):
+            return None
+
+    class _DummyWidget:
+        def __init__(self, **kwargs):
+            self.children = []
+            self.canvas = _Canvas()
+            self.size = kwargs.get("size", (0, 0))
+            self.pos = kwargs.get("pos", (0, 0))
+            self.width = kwargs.get("width", 0)
+            self.height = kwargs.get("height", 0)
+            self.x = kwargs.get("x", 0)
+            self.y = kwargs.get("y", 0)
+            self.text = kwargs.get("text", "")
+            self.texture = kwargs.get("texture", None)
+            self.texture_size = kwargs.get("texture_size", (0, 0))
+            self.size_hint = kwargs.get("size_hint", (1, 1))
+            self.size_hint_x = kwargs.get("size_hint_x", 1)
+            self.size_hint_y = kwargs.get("size_hint_y", 1)
+            self.disabled = kwargs.get("disabled", False)
+            self.state = kwargs.get("state", "normal")
+            self.color = kwargs.get("color", None)
+            self.value = kwargs.get("value", 0)
+            self.max_value = kwargs.get("max_value", 100)
+            self.minimum_height = kwargs.get("minimum_height", 0)
+            self.text_size = kwargs.get("text_size", None)
+        def bind(self, **kwargs):
+            return None
+        def add_widget(self, widget):
+            self.children.append(widget)
+        def clear_widgets(self):
+            self.children.clear()
+        def setter(self, name):
+            def _set(_instance, value):
+                setattr(self, name, value)
+            return _set
+
+    def _prop(default=None):
+        return default
+
+    def _identity_decorator(func):
+        @functools.wraps(func)
+        def _wrapped(*args, **kwargs):
+            return func(*args, **kwargs)
+        return _wrapped
+
+    kivy = types.ModuleType("kivy")
+    config = types.ModuleType("kivy.config")
+    app = types.ModuleType("kivy.app")
+    clock = types.ModuleType("kivy.clock")
+    core_image = types.ModuleType("kivy.core.image")
+    core_window = types.ModuleType("kivy.core.window")
+    graphics = types.ModuleType("kivy.graphics")
+    metrics = types.ModuleType("kivy.metrics")
+    properties = types.ModuleType("kivy.properties")
+    uix_boxlayout = types.ModuleType("kivy.uix.boxlayout")
+    uix_button = types.ModuleType("kivy.uix.button")
+    uix_gridlayout = types.ModuleType("kivy.uix.gridlayout")
+    uix_image = types.ModuleType("kivy.uix.image")
+    uix_label = types.ModuleType("kivy.uix.label")
+    uix_scrollview = types.ModuleType("kivy.uix.scrollview")
+    uix_slider = types.ModuleType("kivy.uix.slider")
+    uix_textinput = types.ModuleType("kivy.uix.textinput")
+    uix_widget = types.ModuleType("kivy.uix.widget")
+
+    class _Config:
+        @staticmethod
+        def set(*args, **kwargs):
+            return None
+
+    class _App:
+        def __init__(self, **kwargs):
+            super().__init__()
+        def run(self):
+            return None
+
+    class _Clock:
+        @staticmethod
+        def schedule_once(*args, **kwargs):
+            return None
+        @staticmethod
+        def schedule_interval(*args, **kwargs):
+            return None
+
+    class _CoreImage:
+        def __init__(self, *args, **kwargs):
+            self.texture = None
+
+    class _Window:
+        clearcolor = None
+        @staticmethod
+        def maximize():
+            return None
+
+    class _Graphic:
+        def __init__(self, *args, **kwargs):
+            return None
+
+    config.Config = _Config
+    app.App = _App
+    clock.Clock = _Clock
+    clock.mainthread = _identity_decorator
+    core_image.Image = _CoreImage
+    core_window.Window = _Window
+    graphics.Color = _Graphic
+    graphics.Line = _Graphic
+    graphics.RoundedRectangle = _Graphic
+    metrics.dp = lambda x: x
+    metrics.sp = lambda x: x
+    properties.NumericProperty = _prop
+    properties.StringProperty = _prop
+    uix_boxlayout.BoxLayout = _DummyWidget
+    uix_button.Button = _DummyWidget
+    uix_gridlayout.GridLayout = _DummyWidget
+    uix_image.Image = _DummyWidget
+    uix_label.Label = _DummyWidget
+    uix_scrollview.ScrollView = _DummyWidget
+    uix_slider.Slider = _DummyWidget
+    uix_textinput.TextInput = _DummyWidget
+    uix_widget.Widget = _DummyWidget
+
+    sys.modules["kivy"] = kivy
+    sys.modules["kivy.config"] = config
+    sys.modules["kivy.app"] = app
+    sys.modules["kivy.clock"] = clock
+    sys.modules["kivy.core.image"] = core_image
+    sys.modules["kivy.core.window"] = core_window
+    sys.modules["kivy.graphics"] = graphics
+    sys.modules["kivy.metrics"] = metrics
+    sys.modules["kivy.properties"] = properties
+    sys.modules["kivy.uix.boxlayout"] = uix_boxlayout
+    sys.modules["kivy.uix.button"] = uix_button
+    sys.modules["kivy.uix.gridlayout"] = uix_gridlayout
+    sys.modules["kivy.uix.image"] = uix_image
+    sys.modules["kivy.uix.label"] = uix_label
+    sys.modules["kivy.uix.scrollview"] = uix_scrollview
+    sys.modules["kivy.uix.slider"] = uix_slider
+    sys.modules["kivy.uix.textinput"] = uix_textinput
+    sys.modules["kivy.uix.widget"] = uix_widget
+
+
+try:
+    import kivy  # type: ignore  # noqa: F401
+except Exception:
+    _install_fake_kivy()
 
 import start as sut
 
@@ -131,7 +295,7 @@ def valid_main_metrics() -> Dict[str, float]:
         "vert_olive_macro_share": 0.75,
         "terre_de_france_transition_share": 0.55,
         "vert_de_gris_micro_share": 0.83,
-        "vert_de_gris_macro_share": 0.07,
+        "vert_de_gris_macro_share": 0.05,
     }
 
 
@@ -709,6 +873,7 @@ class TestCamouflageAppMethods(TempDirMixin, unittest.TestCase):
         self.app.update_attempt_status(
             target_index=2,
             attempt_idx=7,
+            global_attempt=11,
             target_total=10,
             accepted_count=1,
             rs=valid_ratios(),
@@ -721,7 +886,9 @@ class TestCamouflageAppMethods(TempDirMixin, unittest.TestCase):
             metrics=valid_main_metrics(),
         )
         self.assertIn("1 / 10", self.app.progress_text.text)
+        self.assertIn("tentatives 11", self.app.progress_text.text)
         self.assertIn("Image 002", self.app.attempt_text.text)
+        self.assertIn("total 000011", self.app.attempt_text.text)
         self.assertIn("C", self.app.color_text.text)
         self.assertIn("Score 0.880", self.app.score_text.text)
         self.assertIn("Olive conn.", self.app.extra_text.text)

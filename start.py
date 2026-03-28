@@ -1100,6 +1100,8 @@ class CamouflageApp(App):
         self.diag_summary_label: Optional[Label] = None
         self.diag_top_rules_label: Optional[Label] = None
         self.diag_last_fail_label: Optional[Label] = None
+        self.backend_stats_label: Optional[Label] = None
+        self.backend_state_label: Optional[Label] = None
         self.diag_log_view: Optional[LogView] = None
 
         self.diag_total = 0
@@ -1116,7 +1118,7 @@ class CamouflageApp(App):
 
         title_box = BoxLayout(orientation="vertical", spacing=dp(2))
         tiny = Label(
-            text="Image 000 | essai 0000",
+            text="Image 000 | essai 0000 | total 000000 | seed --",
             size_hint_y=None,
             height=dp(20),
             font_size=sp(11),
@@ -1227,7 +1229,7 @@ class CamouflageApp(App):
         self.progress_bar = GlassProgressBar()
         controls.add_widget(self.progress_bar)
 
-        self.progress_text = self._small_label("0 / 0 validé(s)")
+        self.progress_text = self._small_label("0 / 0 validé(s) | tentatives 0 | rejetés 0")
         controls.add_widget(self.progress_text)
 
         controls.add_widget(self._label("Intensité machine"))
@@ -1261,10 +1263,14 @@ class CamouflageApp(App):
         self.diag_summary_label = self._small_label("Tentatives 0 | acceptés 0 | rejetés 0 | taux 0.00%")
         self.diag_top_rules_label = self._small_label("Top règles : --")
         self.diag_last_fail_label = self._small_label("Dernier rejet : --")
+        self.backend_stats_label = self._small_label("Backend : tentative 0 | acceptés 0 | rejetés 0")
+        self.backend_state_label = self._small_label("État backend : attente")
         controls.add_widget(self.diag_enabled_label)
         controls.add_widget(self.diag_summary_label)
         controls.add_widget(self.diag_top_rules_label)
         controls.add_widget(self.diag_last_fail_label)
+        controls.add_widget(self.backend_stats_label)
+        controls.add_widget(self.backend_state_label)
 
         left_content.add_widget(controls)
 
@@ -1710,6 +1716,25 @@ class CamouflageApp(App):
             else:
                 self.diag_last_fail_label.text = "Dernier rejet : --"
 
+        if self.backend_stats_label is not None:
+            self.backend_stats_label.text = (
+                f"Backend : tentative {self.total_attempts} | acceptés {self.diag_accepts} | rejetés {self.diag_rejects}"
+            )
+
+        if self.backend_state_label is not None:
+            if self.running and not self.stopping:
+                self.backend_state_label.text = "État backend : génération active"
+                self.backend_state_label.color = C["success"]
+            elif self.stopping:
+                self.backend_state_label.text = "État backend : arrêt demandé"
+                self.backend_state_label.color = C["warning"]
+            elif self.preflight_running:
+                self.backend_state_label.text = "État backend : préflight actif"
+                self.backend_state_label.color = C["warning"]
+            else:
+                self.backend_state_label.text = "État backend : attente"
+                self.backend_state_label.color = C["text_soft"]
+
     @mainthread
     def diag_log(self, line: str):
         if self.diag_log_view is not None:
@@ -2041,21 +2066,25 @@ class CamouflageApp(App):
                     silhouette_img = await asyncio.to_thread(silhouette_projection_image, idx_canvas)
 
                     self.update_preview(candidate.image, silhouette_img)
-                    self.update_attempt_status(
-                        target_index=target_index,
-                        attempt_idx=local_attempt,
-                        target_total=target_count,
-                        accepted_count=len(rows),
-                        rs=candidate.ratios,
-                        extra_scores=extra_scores,
-                        metrics=candidate.metrics,
-                    )
 
                     await self._register_live_diagnostic_async(
                         candidate=candidate,
                         target_index=target_index,
                         local_attempt=local_attempt,
                         accepted=full_valid,
+                    )
+                    self.update_attempt_status(
+                        target_index=target_index,
+                        attempt_idx=local_attempt,
+                        global_attempt=total_attempts,
+                        seed=candidate.seed,
+                        target_total=target_count,
+                        accepted_count=len(rows) + (1 if full_valid else 0),
+                        rejected_count=self.diag_rejects,
+                        accepted=full_valid,
+                        rs=candidate.ratios,
+                        extra_scores=extra_scores,
+                        metrics=candidate.metrics,
                     )
 
                     if not full_valid:
@@ -2348,16 +2377,26 @@ class CamouflageApp(App):
         self,
         target_index: int,
         attempt_idx: int,
+        global_attempt: int,
+        seed: int,
         target_total: int,
         accepted_count: int,
+        rejected_count: int,
+        accepted: bool,
         rs: np.ndarray,
         extra_scores: Dict[str, float],
         metrics: Dict[str, float],
     ):
         if self.progress_text is not None:
-            self.progress_text.text = f"{accepted_count} / {target_total} validé(s)"
+            self.progress_text.text = (
+                f"{accepted_count} / {target_total} validé(s) | tentatives {global_attempt} | rejetés {rejected_count}"
+            )
         if self.attempt_text is not None:
-            self.attempt_text.text = f"Image {target_index:03d} | essai {attempt_idx:04d}"
+            verdict = "accepté" if accepted else "rejeté"
+            self.attempt_text.text = (
+                f"Image {target_index:03d} | essai {attempt_idx:04d} | total {global_attempt:06d} | "
+                f"seed {seed} | {verdict}"
+            )
 
         if self.color_text is not None:
             self.color_text.text = (
@@ -2376,11 +2415,13 @@ class CamouflageApp(App):
             )
 
         if self.extra_text is not None:
+            military = metrics.get("visual_military_score", float("nan"))
             self.extra_text.text = (
                 f"Olive conn. {metrics['largest_olive_component_ratio']:.3f} | "
                 f"centre {metrics['center_empty_ratio']:.3f} | "
                 f"limites {metrics['boundary_density']:.3f} | "
-                f"miroir {metrics['mirror_similarity']:.3f}"
+                f"miroir {metrics['mirror_similarity']:.3f} | "
+                f"militaire {military:.3f}"
             )
 
     @mainthread
