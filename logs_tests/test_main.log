@@ -1683,3 +1683,303 @@
 2026-03-28 22:39:43 | INFO     | test_main | Nettoyage du répertoire temporaire async : C:\Users\alpha\AppData\Local\Temp\test_main_async_tyu32fi7
 2026-03-28 22:39:43 | INFO     | test_main | Répertoire temporaire async créé : C:\Users\alpha\AppData\Local\Temp\test_main_async_p5w4z_bq
 2026-03-28 22:39:43 | INFO     | test_main | Nettoyage du répertoire temporaire async : C:\Users\alpha\AppData\Local\Temp\test_main_async_p5w4z_bq
+2026-03-28 22:57:52 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_ez8cifd8
+2026-03-28 22:57:52 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_ez8cifd8
+2026-03-28 22:57:52 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_dcv6ux8l
+2026-03-28 22:57:52 | INFO     | test_main | Règles de rejet extraites : ['abs_err_coyote', 'abs_err_gris', 'abs_err_olive', 'center_empty_ratio', 'mean_abs_error', 'oblique_share', 'ratio_coyote', 'ratio_gris', 'ratio_olive']
+2026-03-28 22:57:52 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_dcv6ux8l
+2026-03-28 22:57:52 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_5_i9301o
+2026-03-28 22:57:52 | INFO     | test_main | Profil adaptatif seed=424242 -> angle_pool=(-35, -30, -25, -20, -15, 0, 15, 20, 30, 35, -35, -30, -25, -20, -15, 15, 20, 30, 35, -35, -30, -25, -20, -15, 15, 20, 30, 35, -35, -30, -25, -20, -15, 15, 20, 30, 35, 0, 0, -15, 15, -20, 20, -25, -30, -30, 30, -35, 35)
+2026-03-28 22:57:52 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_5_i9301o
+2026-03-28 22:57:52 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main__l86s7lc
+2026-03-28 22:57:52 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main__l86s7lc
+2026-03-28 22:57:52 | INFO     | test_main | Candidate généré : seed=202603120000 | ratios=(0.3200, 0.2800, 0.2200, 0.1800) | boundary=0.1725 | mirror=0.5000
+2026-03-28 22:57:52 | INFO     | test_main | Async candidate généré : seed=202603120001 | ratios=(0.3200, 0.2800, 0.2200, 0.1800) | boundary=0.1725 | mirror=0.5000
+2026-03-28 22:57:52 | INFO     | test_main | Temps génération async simulée = 0.1378s
+2026-03-28 22:57:52 | INFO     | test_main | Répertoire temporaire async créé : C:\Users\alpha\AppData\Local\Temp\test_main_async_yvkqd36d
+2026-03-28 22:57:53 | INFO     | test_main | Nettoyage du répertoire temporaire async : C:\Users\alpha\AppData\Local\Temp\test_main_async_yvkqd36d
+2026-03-28 22:57:53 | INFO     | test_main | Répertoire temporaire async créé : C:\Users\alpha\AppData\Local\Temp\test_main_async__la05k73
+2026-03-28 22:57:53 | INFO     | test_main | Nettoyage du répertoire temporaire async : C:\Users\alpha\AppData\Local\Temp\test_main_async__la05k73
+2026-03-28 22:57:53 | INFO     | test_main | Répertoire temporaire async créé : C:\Users\alpha\AppData\Local\Temp\test_main_async_njeh3yfp
+2026-03-28 22:57:53 | INFO     | test_main | Nettoyage du répertoire temporaire async : C:\Users\alpha\AppData\Local\Temp\test_main_async_njeh3yfp
+2026-03-28 22:57:53 | INFO     | test_main | Répertoire temporaire async créé : C:\Users\alpha\AppData\Local\Temp\test_main_async_amo_4pqn
+2026-03-28 22:57:53 | INFO     | test_main | Nettoyage du répertoire temporaire async : C:\Users\alpha\AppData\Local\Temp\test_main_async_amo_4pqn
+2026-03-28 22:57:53 | INFO     | test_main | Répertoire temporaire async créé : C:\Users\alpha\AppData\Local\Temp\test_main_async__7y_adb9
+2026-03-28 22:57:53 | INFO     | test_main | Nettoyage du répertoire temporaire async : C:\Users\alpha\AppData\Local\Temp\test_main_async__7y_adb9
+2026-03-28 22:57:53 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_ay97rr8u
+2026-03-28 22:57:53 | INFO     | test_main | Progress sync | idx=1 local=1 total=1 accepted=True seed=101
+2026-03-28 22:57:53 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_ay97rr8u
+2026-03-28 22:57:53 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_svjfk6wc
+2026-03-28 22:57:53 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_svjfk6wc
+2026-03-28 22:57:53 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_wyuoyiox
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_wyuoyiox
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_jovjoo8t
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_jovjoo8t
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_ym70jz1m
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_ym70jz1m
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_cpouhcg8
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_cpouhcg8
+2026-03-28 22:57:54 | INFO     | test_main | macro_zone_count=3
+2026-03-28 22:57:54 | INFO     | test_main | orientation_score={'oblique_share': 0.6666666666666666, 'vertical_share': 0.3333333333333333, 'dominance_ratio': 0.3333333333333333}
+2026-03-28 22:57:54 | INFO     | test_main | visible_origin_shares={'coyote_brown_macro_share': 0.0, 'coyote_brown_transition_share': 0.0, 'coyote_brown_micro_share': 0.0, 'vert_olive_macro_share': 0.6666666666666666, 'vert_olive_transition_share': 0.0, 'vert_olive_micro_share': 0.3333333333333333, 'terre_de_france_macro_share': 0.0, 'terre_de_france_transition_share': 1.0, 'terre_de_france_micro_share': 0.0, 'vert_de_gris_macro_share': 0.0, 'vert_de_gris_transition_share': 0.0, 'vert_de_gris_micro_share': 1.0}
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_9js37yuw
+2026-03-28 22:57:54 | INFO     | test_main | Boundary density uniforme=0.0000 | séparée=0.2000
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_9js37yuw
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_op3nvzb4
+2026-03-28 22:57:54 | INFO     | test_main | Seeds calculés : s1=301007 s2=301007 s3=401007
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_op3nvzb4
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_nkvuq361
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_nkvuq361
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_5nco414t
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_5nco414t
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_v76d9ly9
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_v76d9ly9
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_vuv3d0g_
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_vuv3d0g_
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_cc7ujxwn
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_cc7ujxwn
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_ctyxl5sw
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_ctyxl5sw
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_jo5xddso
+2026-03-28 22:57:54 | INFO     | test_main | Ratios calculés : [0.25 0.25 0.25 0.25]
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_jo5xddso
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_luv_q5dk
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_luv_q5dk
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_iovdki03
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_iovdki03
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_lmb7yv5c
+2026-03-28 22:57:54 | INFO     | test_main | ensure_output_dir -> C:\Users\alpha\AppData\Local\Temp\test_main_lmb7yv5c\a\b\c
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_lmb7yv5c
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_vnoi5vn8
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_vnoi5vn8
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_g3y9fxr2
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_g3y9fxr2
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_oj_ig3_3
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_oj_ig3_3
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_tgrja8l2
+2026-03-28 22:57:54 | INFO     | test_main | Profil seed=424242 -> angles=[-35, -30, -25, -20, -15, 0, 15, 20, 30, 35]
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_tgrja8l2
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_j35cub9v
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_j35cub9v
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_qv9td2nl
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_qv9td2nl
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_jfzpttqa
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_jfzpttqa
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_opg9kv0l
+2026-03-28 22:57:54 | INFO     | test_main | polygon_mask area=651
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_opg9kv0l
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_89rhhj1t
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_89rhhj1t
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_rcyr067x
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_rcyr067x
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_odrxi97m
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_odrxi97m
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_s74tur29
+2026-03-28 22:57:54 | INFO     | test_main | Rotation 90° -> (0.000000, 1.000000)
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_s74tur29
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_n3z6pab3
+2026-03-28 22:57:54 | INFO     | test_main | candidate_row={'index': 1, 'seed': 999, 'attempts_for_this_image': 2, 'global_attempt': 3, 'coyote_brown_pct': 32.0, 'vert_olive_pct': 28.0, 'terre_de_france_pct': 22.0, 'vert_de_gris_pct': 18.0, 'largest_olive_component_ratio': 0.25, 'largest_olive_component_ratio_small': 0.2, 'olive_multizone_share': 0.6, 'center_empty_ratio': 0.35, 'center_empty_ratio_small': 0.35, 'boundary_density': 0.1725, 'boundary_density_small': 0.14, 'boundary_density_tiny': 0.12, 'mirror_similarity': 0.5, 'oblique_share': 0.74, 'vertical_share': 0.15, 'angle_dominance_ratio': 0.2, 'olive_macro_share': 0.72, 'terre_transition_share': 0.6, 'gris_micro_share': 0.92, 'gris_macro_share': 0.01, 'angles': '-35 -25 -20 -15 0 15 20 25 30'}
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_n3z6pab3
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_jeve6r1i
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_jeve6r1i
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_q1eiyi1z
+2026-03-28 22:57:54 | INFO     | test_main | Image sauvegardée : C:\Users\alpha\AppData\Local\Temp\test_main_q1eiyi1z\img\camouflage_test.png
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_q1eiyi1z
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_29a2lmhf
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_29a2lmhf
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_xjnwnn1r
+2026-03-28 22:57:54 | INFO     | test_main | variant_is_valid(fixed business case) -> True
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_xjnwnn1r
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_u6dpmx7e
+2026-03-28 22:57:54 | INFO     | test_main | variant_is_valid(valid) -> True
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_u6dpmx7e
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main__nthdhp5
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main__nthdhp5
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_giqejy2r
+2026-03-28 22:57:54 | INFO     | test_main | Échec attendu | metric=largest_olive_component_ratio | value=0.169 | ok=False
+2026-03-28 22:57:54 | INFO     | test_main | Échec attendu | metric=largest_olive_component_ratio_small | value=0.119 | ok=False
+2026-03-28 22:57:54 | INFO     | test_main | Échec attendu | metric=olive_multizone_share | value=0.419 | ok=False
+2026-03-28 22:57:54 | INFO     | test_main | Échec attendu | metric=center_empty_ratio | value=0.501 | ok=False
+2026-03-28 22:57:54 | INFO     | test_main | Échec attendu | metric=center_empty_ratio_small | value=0.561 | ok=False
+2026-03-28 22:57:54 | INFO     | test_main | Échec attendu | metric=boundary_density | value=0.094 | ok=False
+2026-03-28 22:57:54 | INFO     | test_main | Échec attendu | metric=boundary_density | value=0.251 | ok=False
+2026-03-28 22:57:54 | INFO     | test_main | Échec attendu | metric=boundary_density_small | value=0.059 | ok=False
+2026-03-28 22:57:54 | INFO     | test_main | Échec attendu | metric=boundary_density_small | value=0.221 | ok=False
+2026-03-28 22:57:54 | INFO     | test_main | Échec attendu | metric=mirror_similarity | value=0.761 | ok=False
+2026-03-28 22:57:54 | INFO     | test_main | Échec attendu | metric=oblique_share | value=0.639 | ok=False
+2026-03-28 22:57:54 | INFO     | test_main | Échec attendu | metric=vertical_share | value=0.099 | ok=False
+2026-03-28 22:57:54 | INFO     | test_main | Échec attendu | metric=vertical_share | value=0.301 | ok=False
+2026-03-28 22:57:54 | INFO     | test_main | Échec attendu | metric=angle_dominance_ratio | value=0.321 | ok=False
+2026-03-28 22:57:54 | INFO     | test_main | Échec attendu | metric=vert_olive_macro_share | value=0.599 | ok=False
+2026-03-28 22:57:54 | INFO     | test_main | Échec attendu | metric=terre_de_france_transition_share | value=0.499 | ok=False
+2026-03-28 22:57:54 | INFO     | test_main | Échec attendu | metric=vert_de_gris_micro_share | value=0.819 | ok=False
+2026-03-28 22:57:54 | INFO     | test_main | Échec attendu | metric=vert_de_gris_macro_share | value=0.061 | ok=False
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_giqejy2r
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_aq_0crmq
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_aq_0crmq
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_u350rdfi
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_u350rdfi
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_f9cucrc_
+2026-03-28 22:57:54 | INFO     | test_main | CSV écrit : C:\Users\alpha\AppData\Local\Temp\test_main_f9cucrc_\rapport.csv
+2026-03-28 22:57:54 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_f9cucrc_
+2026-03-28 22:57:54 | INFO     | test_main | Répertoire temporaire async créé : C:\Users\alpha\AppData\Local\Temp\test_main_async_oih3cku4
+2026-03-28 22:57:55 | INFO     | test_main | Temps batch async simulé = 0.1207s
+2026-03-28 22:57:55 | INFO     | test_main | Nettoyage du répertoire temporaire async : C:\Users\alpha\AppData\Local\Temp\test_main_async_oih3cku4
+2026-03-28 22:57:55 | INFO     | test_main | Répertoire temporaire async créé : C:\Users\alpha\AppData\Local\Temp\test_main_async_q5mt7ag0
+2026-03-28 22:57:55 | INFO     | test_main | Nettoyage du répertoire temporaire async : C:\Users\alpha\AppData\Local\Temp\test_main_async_q5mt7ag0
+2026-03-28 22:57:55 | INFO     | test_main | Répertoire temporaire async créé : C:\Users\alpha\AppData\Local\Temp\test_main_async_ogex5yxa
+2026-03-28 22:57:55 | INFO     | test_main | Nettoyage du répertoire temporaire async : C:\Users\alpha\AppData\Local\Temp\test_main_async_ogex5yxa
+2026-03-28 22:57:55 | INFO     | test_main | Répertoire temporaire async créé : C:\Users\alpha\AppData\Local\Temp\test_main_async_cn28rycj
+2026-03-28 22:57:55 | INFO     | test_main | Nettoyage du répertoire temporaire async : C:\Users\alpha\AppData\Local\Temp\test_main_async_cn28rycj
+2026-03-28 22:57:55 | INFO     | test_main | Répertoire temporaire async créé : C:\Users\alpha\AppData\Local\Temp\test_main_async_7qhbqrta
+2026-03-28 22:57:55 | INFO     | test_main | Nettoyage du répertoire temporaire async : C:\Users\alpha\AppData\Local\Temp\test_main_async_7qhbqrta
+2026-03-28 22:57:59 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_tfpmjaml
+2026-03-28 22:57:59 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_tfpmjaml
+2026-03-28 22:57:59 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_jvc2n0n0
+2026-03-28 22:57:59 | INFO     | test_main | Règles de rejet extraites : ['abs_err_coyote', 'abs_err_gris', 'abs_err_olive', 'center_empty_ratio', 'mean_abs_error', 'oblique_share', 'ratio_coyote', 'ratio_gris', 'ratio_olive']
+2026-03-28 22:57:59 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_jvc2n0n0
+2026-03-28 22:57:59 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_pjxgf8zt
+2026-03-28 22:57:59 | INFO     | test_main | Profil adaptatif seed=424242 -> angle_pool=(-35, -30, -25, -20, -15, 0, 15, 20, 30, 35, -35, -30, -25, -20, -15, 15, 20, 30, 35, -35, -30, -25, -20, -15, 15, 20, 30, 35, -35, -30, -25, -20, -15, 15, 20, 30, 35, 0, 0, -15, 15, -20, 20, -25, -30, -30, 30, -35, 35)
+2026-03-28 22:57:59 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_pjxgf8zt
+2026-03-28 22:57:59 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_fewu96a_
+2026-03-28 22:57:59 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_fewu96a_
+2026-03-28 22:57:59 | INFO     | test_main | Candidate généré : seed=202603120000 | ratios=(0.3200, 0.2800, 0.2200, 0.1800) | boundary=0.1725 | mirror=0.5000
+2026-03-28 22:58:00 | INFO     | test_main | Async candidate généré : seed=202603120001 | ratios=(0.3200, 0.2800, 0.2200, 0.1800) | boundary=0.1725 | mirror=0.5000
+2026-03-28 22:58:00 | INFO     | test_main | Temps génération async simulée = 0.1812s
+2026-03-28 22:58:00 | INFO     | test_main | Répertoire temporaire async créé : C:\Users\alpha\AppData\Local\Temp\test_main_async_faowui1o
+2026-03-28 22:58:00 | INFO     | test_main | Nettoyage du répertoire temporaire async : C:\Users\alpha\AppData\Local\Temp\test_main_async_faowui1o
+2026-03-28 22:58:00 | INFO     | test_main | Répertoire temporaire async créé : C:\Users\alpha\AppData\Local\Temp\test_main_async_e0hbt3q5
+2026-03-28 22:58:01 | INFO     | test_main | Nettoyage du répertoire temporaire async : C:\Users\alpha\AppData\Local\Temp\test_main_async_e0hbt3q5
+2026-03-28 22:58:01 | INFO     | test_main | Répertoire temporaire async créé : C:\Users\alpha\AppData\Local\Temp\test_main_async_b4b8vfpu
+2026-03-28 22:58:01 | INFO     | test_main | Nettoyage du répertoire temporaire async : C:\Users\alpha\AppData\Local\Temp\test_main_async_b4b8vfpu
+2026-03-28 22:58:01 | INFO     | test_main | Répertoire temporaire async créé : C:\Users\alpha\AppData\Local\Temp\test_main_async_ctfua8ks
+2026-03-28 22:58:01 | INFO     | test_main | Nettoyage du répertoire temporaire async : C:\Users\alpha\AppData\Local\Temp\test_main_async_ctfua8ks
+2026-03-28 22:58:01 | INFO     | test_main | Répertoire temporaire async créé : C:\Users\alpha\AppData\Local\Temp\test_main_async_hzniwa0i
+2026-03-28 22:58:01 | INFO     | test_main | Nettoyage du répertoire temporaire async : C:\Users\alpha\AppData\Local\Temp\test_main_async_hzniwa0i
+2026-03-28 22:58:01 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_tum_3gx4
+2026-03-28 22:58:01 | INFO     | test_main | Progress sync | idx=1 local=1 total=1 accepted=True seed=101
+2026-03-28 22:58:01 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_tum_3gx4
+2026-03-28 22:58:01 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_m18ilbkx
+2026-03-28 22:58:02 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_m18ilbkx
+2026-03-28 22:58:02 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_52_l1bs6
+2026-03-28 22:58:02 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_52_l1bs6
+2026-03-28 22:58:02 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_texybie1
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_texybie1
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_z1pl3ss8
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_z1pl3ss8
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_lgbrrl1f
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_lgbrrl1f
+2026-03-28 22:58:03 | INFO     | test_main | macro_zone_count=3
+2026-03-28 22:58:03 | INFO     | test_main | orientation_score={'oblique_share': 0.6666666666666666, 'vertical_share': 0.3333333333333333, 'dominance_ratio': 0.3333333333333333}
+2026-03-28 22:58:03 | INFO     | test_main | visible_origin_shares={'coyote_brown_macro_share': 0.0, 'coyote_brown_transition_share': 0.0, 'coyote_brown_micro_share': 0.0, 'vert_olive_macro_share': 0.6666666666666666, 'vert_olive_transition_share': 0.0, 'vert_olive_micro_share': 0.3333333333333333, 'terre_de_france_macro_share': 0.0, 'terre_de_france_transition_share': 1.0, 'terre_de_france_micro_share': 0.0, 'vert_de_gris_macro_share': 0.0, 'vert_de_gris_transition_share': 0.0, 'vert_de_gris_micro_share': 1.0}
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_ukpsf710
+2026-03-28 22:58:03 | INFO     | test_main | Boundary density uniforme=0.0000 | séparée=0.2000
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_ukpsf710
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_1lmn28p9
+2026-03-28 22:58:03 | INFO     | test_main | Seeds calculés : s1=301007 s2=301007 s3=401007
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_1lmn28p9
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main__zcix1z8
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main__zcix1z8
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_pg30h9ed
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_pg30h9ed
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_3p8nuq3t
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_3p8nuq3t
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_8ubjye9g
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_8ubjye9g
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_ro4uk_ay
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_ro4uk_ay
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main__bi45vni
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main__bi45vni
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_4xbxx9ki
+2026-03-28 22:58:03 | INFO     | test_main | Ratios calculés : [0.25 0.25 0.25 0.25]
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_4xbxx9ki
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_8x1nbxwx
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_8x1nbxwx
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_atrijtv6
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_atrijtv6
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main___q2gek8
+2026-03-28 22:58:03 | INFO     | test_main | ensure_output_dir -> C:\Users\alpha\AppData\Local\Temp\test_main___q2gek8\a\b\c
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main___q2gek8
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_ymjuqcim
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_ymjuqcim
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_6jxi4zgd
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_6jxi4zgd
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_j5t2497h
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_j5t2497h
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_w4f_uk4b
+2026-03-28 22:58:03 | INFO     | test_main | Profil seed=424242 -> angles=[-35, -30, -25, -20, -15, 0, 15, 20, 30, 35]
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_w4f_uk4b
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_b_4179b1
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_b_4179b1
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_yff_e5sv
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_yff_e5sv
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_gbsh190t
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_gbsh190t
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_0gjaggry
+2026-03-28 22:58:03 | INFO     | test_main | polygon_mask area=651
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_0gjaggry
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_7i7dqnh3
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_7i7dqnh3
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_4ahglmzr
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_4ahglmzr
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_71elf7mo
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_71elf7mo
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_lg9vjq46
+2026-03-28 22:58:03 | INFO     | test_main | Rotation 90° -> (0.000000, 1.000000)
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_lg9vjq46
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_id76o0c7
+2026-03-28 22:58:03 | INFO     | test_main | candidate_row={'index': 1, 'seed': 999, 'attempts_for_this_image': 2, 'global_attempt': 3, 'coyote_brown_pct': 32.0, 'vert_olive_pct': 28.0, 'terre_de_france_pct': 22.0, 'vert_de_gris_pct': 18.0, 'largest_olive_component_ratio': 0.25, 'largest_olive_component_ratio_small': 0.2, 'olive_multizone_share': 0.6, 'center_empty_ratio': 0.35, 'center_empty_ratio_small': 0.35, 'boundary_density': 0.1725, 'boundary_density_small': 0.14, 'boundary_density_tiny': 0.12, 'mirror_similarity': 0.5, 'oblique_share': 0.74, 'vertical_share': 0.15, 'angle_dominance_ratio': 0.2, 'olive_macro_share': 0.72, 'terre_transition_share': 0.6, 'gris_micro_share': 0.92, 'gris_macro_share': 0.01, 'angles': '-35 -25 -20 -15 0 15 20 25 30'}
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_id76o0c7
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_xazokp23
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_xazokp23
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_vkn405v8
+2026-03-28 22:58:03 | INFO     | test_main | Image sauvegardée : C:\Users\alpha\AppData\Local\Temp\test_main_vkn405v8\img\camouflage_test.png
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_vkn405v8
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_oe5son9w
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_oe5son9w
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_hlrkvub4
+2026-03-28 22:58:03 | INFO     | test_main | variant_is_valid(fixed business case) -> True
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_hlrkvub4
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_ns94tdu_
+2026-03-28 22:58:03 | INFO     | test_main | variant_is_valid(valid) -> True
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_ns94tdu_
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_lrkorcab
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_lrkorcab
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_5dyt2jfb
+2026-03-28 22:58:03 | INFO     | test_main | Échec attendu | metric=largest_olive_component_ratio | value=0.169 | ok=False
+2026-03-28 22:58:03 | INFO     | test_main | Échec attendu | metric=largest_olive_component_ratio_small | value=0.119 | ok=False
+2026-03-28 22:58:03 | INFO     | test_main | Échec attendu | metric=olive_multizone_share | value=0.419 | ok=False
+2026-03-28 22:58:03 | INFO     | test_main | Échec attendu | metric=center_empty_ratio | value=0.501 | ok=False
+2026-03-28 22:58:03 | INFO     | test_main | Échec attendu | metric=center_empty_ratio_small | value=0.561 | ok=False
+2026-03-28 22:58:03 | INFO     | test_main | Échec attendu | metric=boundary_density | value=0.094 | ok=False
+2026-03-28 22:58:03 | INFO     | test_main | Échec attendu | metric=boundary_density | value=0.251 | ok=False
+2026-03-28 22:58:03 | INFO     | test_main | Échec attendu | metric=boundary_density_small | value=0.059 | ok=False
+2026-03-28 22:58:03 | INFO     | test_main | Échec attendu | metric=boundary_density_small | value=0.221 | ok=False
+2026-03-28 22:58:03 | INFO     | test_main | Échec attendu | metric=mirror_similarity | value=0.761 | ok=False
+2026-03-28 22:58:03 | INFO     | test_main | Échec attendu | metric=oblique_share | value=0.639 | ok=False
+2026-03-28 22:58:03 | INFO     | test_main | Échec attendu | metric=vertical_share | value=0.099 | ok=False
+2026-03-28 22:58:03 | INFO     | test_main | Échec attendu | metric=vertical_share | value=0.301 | ok=False
+2026-03-28 22:58:03 | INFO     | test_main | Échec attendu | metric=angle_dominance_ratio | value=0.321 | ok=False
+2026-03-28 22:58:03 | INFO     | test_main | Échec attendu | metric=vert_olive_macro_share | value=0.599 | ok=False
+2026-03-28 22:58:03 | INFO     | test_main | Échec attendu | metric=terre_de_france_transition_share | value=0.499 | ok=False
+2026-03-28 22:58:03 | INFO     | test_main | Échec attendu | metric=vert_de_gris_micro_share | value=0.819 | ok=False
+2026-03-28 22:58:03 | INFO     | test_main | Échec attendu | metric=vert_de_gris_macro_share | value=0.061 | ok=False
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_5dyt2jfb
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_40ec4xn0
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_40ec4xn0
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_yiuw_toq
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_yiuw_toq
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire créé : C:\Users\alpha\AppData\Local\Temp\test_main_029dzgw6
+2026-03-28 22:58:03 | INFO     | test_main | CSV écrit : C:\Users\alpha\AppData\Local\Temp\test_main_029dzgw6\rapport.csv
+2026-03-28 22:58:03 | INFO     | test_main | Nettoyage du répertoire temporaire : C:\Users\alpha\AppData\Local\Temp\test_main_029dzgw6
+2026-03-28 22:58:03 | INFO     | test_main | Répertoire temporaire async créé : C:\Users\alpha\AppData\Local\Temp\test_main_async_4dii_3qi
+2026-03-28 22:58:04 | INFO     | test_main | Temps batch async simulé = 0.1330s
+2026-03-28 22:58:04 | INFO     | test_main | Nettoyage du répertoire temporaire async : C:\Users\alpha\AppData\Local\Temp\test_main_async_4dii_3qi
+2026-03-28 22:58:04 | INFO     | test_main | Répertoire temporaire async créé : C:\Users\alpha\AppData\Local\Temp\test_main_async__ii9q3vo
+2026-03-28 22:58:04 | INFO     | test_main | Nettoyage du répertoire temporaire async : C:\Users\alpha\AppData\Local\Temp\test_main_async__ii9q3vo
+2026-03-28 22:58:04 | INFO     | test_main | Répertoire temporaire async créé : C:\Users\alpha\AppData\Local\Temp\test_main_async_8w9_g0ir
+2026-03-28 22:58:04 | INFO     | test_main | Nettoyage du répertoire temporaire async : C:\Users\alpha\AppData\Local\Temp\test_main_async_8w9_g0ir
+2026-03-28 22:58:04 | INFO     | test_main | Répertoire temporaire async créé : C:\Users\alpha\AppData\Local\Temp\test_main_async_9yiv7mnw
+2026-03-28 22:58:04 | INFO     | test_main | Nettoyage du répertoire temporaire async : C:\Users\alpha\AppData\Local\Temp\test_main_async_9yiv7mnw
+2026-03-28 22:58:04 | INFO     | test_main | Répertoire temporaire async créé : C:\Users\alpha\AppData\Local\Temp\test_main_async_thp362cx
+2026-03-28 22:58:04 | INFO     | test_main | Nettoyage du répertoire temporaire async : C:\Users\alpha\AppData\Local\Temp\test_main_async_thp362cx
