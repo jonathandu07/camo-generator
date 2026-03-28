@@ -1349,3 +1349,119 @@ class TestConstantsAndShapes(unittest.TestCase):
 if __name__ == "__main__":
     LOGGER.info("========== DÉBUT DES TESTS test_main.py ==========")
     unittest.main(verbosity=2)
+
+
+# ============================================================
+# TESTS ADAPTATION PILOTÉE PAR LES REJETS
+# ============================================================
+
+class TestAdaptiveRejectionCorrection(TempDirMixin, unittest.TestCase):
+    def test_make_profile_accepts_adaptive_hint(self) -> None:
+        hint = {
+            "prefer_oblique": 2.0,
+            "prefer_vertical": 1.0,
+            "diversify_angles": 1.5,
+            "micro_cluster_bonus": 2,
+            "olive_macro_target_scale": 1.18,
+            "transition_terre_bias": 0.08,
+            "micro_gris_bias": 0.06,
+            "zone_weight_boosts": (1.8, 1.7, 1.6, 1.5, 1.4, 1.3, 0.5),
+        }
+
+        profile = mut.make_profile(424242, adaptive_hint=hint)
+
+        self.assertIsInstance(profile, mut.VariantProfile)
+        self.assertGreater(len(profile.angle_pool), len(profile.allowed_angles))
+        self.assertGreater(profile.angle_pool.count(0), 1)
+        self.assertEqual(profile.micro_cluster_max >= 6, True)
+        self.assertGreater(profile.olive_macro_target_scale, 1.0)
+        self.assertAlmostEqual(profile.transition_terre_bias, 0.08, places=6)
+        self.assertAlmostEqual(profile.micro_gris_bias, 0.06, places=6)
+        self.assertEqual(len(profile.zone_weight_boosts), len(mut.DENSITY_ZONES))
+        LOGGER.info("Profil adaptatif seed=%s -> angle_pool=%s", profile.seed, profile.angle_pool)
+
+    def test_extract_rejection_failures_returns_expected_rules(self) -> None:
+        metrics = valid_metrics()
+        metrics["oblique_share"] = mut.MIN_OBLIQUE_SHARE - 0.05
+        metrics["center_empty_ratio"] = mut.MAX_COYOTE_CENTER_EMPTY_RATIO + 0.04
+
+        candidate = make_candidate(
+            seed=777,
+            ratios=invalid_ratios_far(),
+            metrics=metrics,
+        )
+
+        failures = mut.extract_rejection_failures(candidate, target_index=1, local_attempt=1)
+        rules = {item["rule"] for item in failures}
+
+        self.assertIn("ratio_coyote", rules)
+        self.assertIn("ratio_olive", rules)
+        self.assertIn("ratio_gris", rules)
+        self.assertIn("oblique_share", rules)
+        self.assertIn("center_empty_ratio", rules)
+        self.assertIn("mean_abs_error", rules)
+        LOGGER.info("Règles de rejet extraites : %s", sorted(rules))
+
+    def test_adaptive_state_builds_and_softens_hint(self) -> None:
+        state = mut.AdaptiveGenerationState()
+        failures = [
+            {
+                "rule": "ratio_olive",
+                "actual": 0.20,
+                "target": None,
+                "min_value": 0.24,
+                "max_value": 0.33,
+                "delta": 0.04,
+            },
+            {
+                "rule": "oblique_share",
+                "actual": 0.40,
+                "target": None,
+                "min_value": mut.MIN_OBLIQUE_SHARE,
+                "max_value": None,
+                "delta": mut.MIN_OBLIQUE_SHARE - 0.40,
+            },
+            {
+                "rule": "center_empty_ratio",
+                "actual": 0.61,
+                "target": None,
+                "min_value": None,
+                "max_value": mut.MAX_COYOTE_CENTER_EMPTY_RATIO,
+                "delta": 0.10,
+            },
+        ]
+
+        state.register_failures(failures)
+        hint_before = state.to_hint()
+
+        self.assertGreater(state.consecutive_rejections, 0)
+        self.assertGreater(hint_before["olive_macro_target_scale"], 1.0)
+        self.assertGreater(hint_before["prefer_oblique"], 0.0)
+        self.assertLess(hint_before["center_torso_overlap_scale"], 1.0)
+
+        state.register_success()
+        hint_after = state.to_hint()
+
+        self.assertEqual(state.consecutive_rejections, 0)
+        self.assertLess(hint_after["olive_macro_target_scale"], hint_before["olive_macro_target_scale"])
+        self.assertLessEqual(hint_after["prefer_oblique"], hint_before["prefer_oblique"])
+
+    def test_update_adaptive_state_after_attempt_returns_failures(self) -> None:
+        state = mut.AdaptiveGenerationState()
+        metrics = valid_metrics()
+        metrics["vert_de_gris_micro_share"] = mut.MIN_VISIBLE_GRIS_MICRO_SHARE - 0.05
+        candidate = make_candidate(seed=31337, ratios=invalid_ratios_far(), metrics=metrics)
+
+        failures = mut.update_adaptive_state_after_attempt(
+            state,
+            candidate,
+            accepted=False,
+            target_index=1,
+            local_attempt=3,
+        )
+
+        rules = {item["rule"] for item in failures}
+        self.assertTrue(failures)
+        self.assertGreater(state.consecutive_rejections, 0)
+        self.assertIn("vert_de_gris_micro_share", rules)
+        self.assertGreater(state.to_hint()["micro_gris_bias"], 0.0)
