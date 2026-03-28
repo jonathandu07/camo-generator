@@ -105,9 +105,9 @@ TRANSITION_WIDTH_CM = (5, 15)
 
 MICRO_SIZE_CM = (2, 8)
 
-VISIBLE_MACRO_OLIVE_TARGET = 0.215
-VISIBLE_MACRO_TERRE_TARGET = 0.075
-VISIBLE_MACRO_GRIS_TARGET = 0.015
+VISIBLE_MACRO_OLIVE_TARGET = 0.205
+VISIBLE_MACRO_TERRE_TARGET = 0.050
+VISIBLE_MACRO_GRIS_TARGET = 0.000
 
 VISIBLE_TOTAL_OLIVE_TARGET = TARGET[IDX_OLIVE]
 VISIBLE_TOTAL_TERRE_TARGET = TARGET[IDX_TERRE]
@@ -123,17 +123,17 @@ MAX_BOUNDARY_DENSITY = 0.250
 MIN_BOUNDARY_DENSITY_SMALL = 0.060
 MAX_BOUNDARY_DENSITY_SMALL = 0.220
 
-MAX_MIRROR_SIMILARITY = 0.79
+MAX_MIRROR_SIMILARITY = 0.76
 
 MIN_VISIBLE_OLIVE_MACRO_SHARE = 0.60
-MIN_VISIBLE_TERRE_TRANS_SHARE = 0.36
-MIN_VISIBLE_GRIS_MICRO_SHARE = 0.70
-MAX_VISIBLE_GRIS_MACRO_SHARE = 0.18
+MIN_VISIBLE_TERRE_TRANS_SHARE = 0.50
+MIN_VISIBLE_GRIS_MICRO_SHARE = 0.82
+MAX_VISIBLE_GRIS_MACRO_SHARE = 0.06
 
-MIN_OBLIQUE_SHARE = 0.58
-MIN_VERTICAL_SHARE = 0.08
-MAX_VERTICAL_SHARE = 0.34
-MAX_ANGLE_DOMINANCE_RATIO = 0.34
+MIN_OBLIQUE_SHARE = 0.64
+MIN_VERTICAL_SHARE = 0.10
+MAX_VERTICAL_SHARE = 0.30
+MAX_ANGLE_DOMINANCE_RATIO = 0.32
 
 BOUNDARY_NUDGE_PASSES = 10
 BOUNDARY_NUDGE_SAMPLE_RATIO = 0.0035
@@ -141,6 +141,13 @@ BOUNDARY_NUDGE_SAMPLE_RATIO = 0.0035
 MIN_TRANSITION_TOUCH_PIXELS = 22
 MIN_MICRO_BOUNDARY_COVERAGE = 0.24
 MAX_LOCAL_MASS_RATIO_TRANSITION = 0.72
+MAX_CENTER_TORSO_OVERLAP_MACRO = 0.34
+MAX_CENTER_TORSO_OVERLAP_TERRAIN_MACRO = 0.22
+MAX_MACRO_PLACEMENT_ATTEMPTS_OLIVE = 420
+MAX_MACRO_PLACEMENT_ATTEMPTS_TERRE = 240
+MAX_MACRO_PLACEMENT_ATTEMPTS_GRIS = 40
+MAX_TRANSITION_PLACEMENTS = 900
+MAX_MICRO_CLUSTER_PLACEMENTS = 1200
 
 # Accélération contrôlée
 CPU_COUNT = max(1, os.cpu_count() or 1)
@@ -445,6 +452,13 @@ def macro_zone_count(mask: np.ndarray) -> int:
     return count
 
 
+def zone_overlap_ratio(mask: np.ndarray, zone_mask: np.ndarray) -> float:
+    area = int(mask.sum())
+    if area <= 0:
+        return 0.0
+    return float(np.mean(zone_mask[mask]))
+
+
 def center_empty_ratio(canvas: np.ndarray) -> float:
     zone = ANATOMY_ZONES["center_torso"]
     return float(np.mean(canvas[zone] == IDX_COYOTE))
@@ -575,7 +589,8 @@ def jagged_spine_poly(
         right.append((axis_dx + local_half_w + ejr, y))
 
     poly = left + right[::-1]
-    rot = [rotate(x, y, angle_from_vertical_deg - 90) for x, y in poly]
+    # Le repère local est construit avec l'axe de longueur sur Y : 0° doit donc rester vertical.
+    rot = [rotate(x, y, angle_from_vertical_deg) for x, y in poly]
     return [(cx + x, cy + y) for x, y in rot]
 
 
@@ -710,9 +725,14 @@ def add_macros(
 
     target_macro_olive_pixels = int(VISIBLE_MACRO_OLIVE_TARGET * canvas.size)
     target_macro_terre_pixels = int(VISIBLE_MACRO_TERRE_TARGET * canvas.size)
+    # Le vert-de-gris ne doit pas constituer une vraie masse macro par défaut.
     target_macro_gris_pixels = int(VISIBLE_MACRO_GRIS_TARGET * canvas.size)
 
+    olive_attempts = 0
     while int(np.sum((canvas == IDX_OLIVE) & (origin_map == ORIGIN_MACRO))) < target_macro_olive_pixels:
+        olive_attempts += 1
+        if olive_attempts > MAX_MACRO_PLACEMENT_ATTEMPTS_OLIVE:
+            break
         cx, cy = choose_biased_center(rng)
         angle = rng.choice(profile.allowed_angles)
 
@@ -743,10 +763,17 @@ def add_macros(
         if zc < 2 and rng.random() < 0.75:
             continue
 
+        if zone_overlap_ratio(mask, ANATOMY_ZONES["center_torso"]) > MAX_CENTER_TORSO_OVERLAP_MACRO:
+            continue
+
         apply_mask(canvas, origin_map, mask, IDX_OLIVE, ORIGIN_MACRO)
         macros.append(MacroRecord(IDX_OLIVE, poly, angle, (cx, cy), mask, zc))
 
+    terre_attempts = 0
     while int(np.sum((canvas == IDX_TERRE) & (origin_map == ORIGIN_MACRO))) < target_macro_terre_pixels:
+        terre_attempts += 1
+        if terre_attempts > MAX_MACRO_PLACEMENT_ATTEMPTS_TERRE:
+            break
         cx, cy = choose_biased_center(rng)
         angle = rng.choice(profile.allowed_angles)
 
@@ -757,8 +784,8 @@ def add_macros(
             rng=rng,
             cx=cx,
             cy=cy,
-            length_px=cm_to_px(rng.uniform(42, 70)),
-            width_px=cm_to_px(rng.uniform(12, 26)),
+            length_px=cm_to_px(rng.uniform(40, 66)),
+            width_px=cm_to_px(rng.uniform(12, 24)),
             angle_from_vertical_deg=angle,
             segments=rng.randint(6, 9),
             width_variation=max(0.18, profile.macro_width_variation - 0.03),
@@ -771,14 +798,24 @@ def add_macros(
             continue
 
         cur = canvas[mask]
-        if float(np.mean(np.isin(cur, [IDX_COYOTE, IDX_OLIVE]))) < 0.60:
+        if float(np.mean(np.isin(cur, [IDX_COYOTE, IDX_OLIVE]))) < 0.65:
+            continue
+
+        if zone_overlap_ratio(mask, ANATOMY_ZONES["center_torso"]) > MAX_CENTER_TORSO_OVERLAP_TERRAIN_MACRO:
             continue
 
         zc = macro_zone_count(mask)
+        if zc < 1 and rng.random() < 0.65:
+            continue
+
         apply_mask(canvas, origin_map, mask, IDX_TERRE, ORIGIN_MACRO)
         macros.append(MacroRecord(IDX_TERRE, poly, angle, (cx, cy), mask, zc))
 
+    gris_attempts = 0
     while int(np.sum((canvas == IDX_GRIS) & (origin_map == ORIGIN_MACRO))) < target_macro_gris_pixels:
+        gris_attempts += 1
+        if gris_attempts > MAX_MACRO_PLACEMENT_ATTEMPTS_GRIS:
+            break
         cx, cy = choose_biased_center(rng)
         angle = rng.choice(profile.allowed_angles)
 
@@ -786,11 +823,11 @@ def add_macros(
             rng=rng,
             cx=cx,
             cy=cy,
-            length_px=cm_to_px(rng.uniform(35, 55)),
-            width_px=cm_to_px(rng.uniform(10, 18)),
+            length_px=cm_to_px(rng.uniform(34, 46)),
+            width_px=cm_to_px(rng.uniform(9, 14)),
             angle_from_vertical_deg=angle,
-            segments=rng.randint(5, 8),
-            width_variation=max(0.16, profile.macro_width_variation - 0.08),
+            segments=rng.randint(5, 7),
+            width_variation=max(0.15, profile.macro_width_variation - 0.08),
             lateral_jitter=max(0.10, profile.macro_lateral_jitter - 0.05),
             tip_taper=profile.macro_tip_taper,
             edge_break=profile.macro_edge_break,
@@ -800,7 +837,10 @@ def add_macros(
             continue
 
         cur = canvas[mask]
-        if float(np.mean(np.isin(cur, [IDX_OLIVE, IDX_TERRE]))) < 0.48:
+        if float(np.mean(np.isin(cur, [IDX_OLIVE, IDX_TERRE]))) < 0.55:
+            continue
+
+        if zone_overlap_ratio(mask, ANATOMY_ZONES["center_torso"]) > 0.18:
             continue
 
         zc = macro_zone_count(mask)
@@ -816,18 +856,23 @@ def add_transitions(
     macros: Sequence[MacroRecord],
     rng: random.Random,
 ) -> None:
+    placement_attempts = 0
     while True:
+        placement_attempts += 1
+        if placement_attempts > MAX_TRANSITION_PLACEMENTS:
+            break
         rs = compute_ratios(canvas)
         visible = visible_origin_shares(canvas, origin_map)
 
         enough_terre = rs[IDX_TERRE] >= VISIBLE_TOTAL_TERRE_TARGET
         enough_olive = rs[IDX_OLIVE] >= VISIBLE_TOTAL_OLIVE_TARGET * 0.985
-        enough_trans_share = visible["terre_de_france_transition_share"] >= 0.30
+        enough_trans_share = visible["terre_de_france_transition_share"] >= MIN_VISIBLE_TERRE_TRANS_SHARE
 
         if enough_terre and enough_olive and enough_trans_share:
             break
 
-        parent = rng.choice(macros)
+        parent_pool = [m for m in macros if m.color_idx in (IDX_OLIVE, IDX_TERRE)]
+        parent = rng.choice(parent_pool or list(macros))
 
         poly = attached_transition(
             rng=rng,
@@ -846,11 +891,18 @@ def add_transitions(
         deficits = TARGET - rs
         terre_need = max(0.0, deficits[IDX_TERRE])
         olive_need = max(0.0, deficits[IDX_OLIVE])
+        coyote_need = max(0.0, deficits[IDX_COYOTE])
 
+        # Terre de France doit rester la couleur dominante des transitions.
         if terre_need >= olive_need:
             p_terre, p_olive, p_coyote = 0.74, 0.18, 0.08
         else:
-            p_terre, p_olive, p_coyote = 0.62, 0.28, 0.10
+            p_terre, p_olive, p_coyote = 0.68, 0.22, 0.10
+
+        if coyote_need > max(terre_need, olive_need) * 1.4:
+            p_coyote += 0.06
+            p_terre -= 0.04
+            p_olive -= 0.02
 
         r = rng.random()
         if r < p_terre:
@@ -863,7 +915,7 @@ def add_transitions(
         if color == IDX_TERRE and float(np.mean(cur != IDX_COYOTE)) < 0.18:
             continue
 
-        if color == IDX_OLIVE and creates_new_mass(canvas, mask, color, local_radius=38, max_local_area_ratio=0.76):
+        if creates_new_mass(canvas, mask, color, local_radius=38, max_local_area_ratio=0.74):
             continue
 
         if color == IDX_COYOTE and float(np.mean(cur == IDX_COYOTE)) > 0.90:
@@ -878,13 +930,17 @@ def add_micro_clusters(
     profile: VariantProfile,
     rng: random.Random,
 ) -> None:
+    placement_attempts = 0
     while True:
+        placement_attempts += 1
+        if placement_attempts > MAX_MICRO_CLUSTER_PLACEMENTS:
+            break
         rs = compute_ratios(canvas)
         visible = visible_origin_shares(canvas, origin_map)
 
         enough_gris = rs[IDX_GRIS] >= VISIBLE_TOTAL_GRIS_TARGET
         enough_terre = rs[IDX_TERRE] >= VISIBLE_TOTAL_TERRE_TARGET
-        enough_micro_share = visible["vert_de_gris_micro_share"] >= 0.64
+        enough_micro_share = visible["vert_de_gris_micro_share"] >= MIN_VISIBLE_GRIS_MICRO_SHARE
 
         if enough_gris and enough_terre and enough_micro_share:
             break
@@ -938,9 +994,9 @@ def add_micro_clusters(
             terre_need = max(0.0, deficits[IDX_TERRE])
 
             if gris_need >= terre_need:
-                color = IDX_GRIS if rng.random() < 0.82 else IDX_TERRE
+                color = IDX_GRIS if rng.random() < 0.88 else IDX_TERRE
             else:
-                color = IDX_GRIS if rng.random() < 0.70 else IDX_TERRE
+                color = IDX_GRIS if rng.random() < 0.82 else IDX_TERRE
 
             apply_mask(canvas, origin_map, mask, color, ORIGIN_MICRO)
             placed_any = True
