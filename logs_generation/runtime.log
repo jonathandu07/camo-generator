@@ -472,3 +472,4 @@
 2026-03-28 21:43:46 | ERROR    | camo_log | [tests] Fin module de test | payload={"completed": true, "duration_s": 5.195678, "module": "test_start", "ok": false, "returncode": 1, "timed_out": false}
 2026-03-28 21:43:46 | ERROR    | camo_log | [tests] Fin préflight asynchrone | payload={"completed": true, "duration_s": 5.232218, "errors": 1, "failures": 0, "ok": false, "parallel": true, "timed_out": false, "timed_out_modules": [], "total": 185}
 2026-03-28 21:43:46 | ERROR    | camo_log | [start_preflight] Préflight en échec | payload={"blocking": false, "ok": false, "summary": "185 tests exécutés | 0 échec(s) | 1 erreur(s)"}
+2026-03-28 21:46:41 | ERROR    | camo_log | [start_worker] Erreur de génération | payload={"accepted_count": 0, "error_message": "cannot schedule new futures after shutdown", "total_attempts": 5}
