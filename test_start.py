@@ -874,8 +874,11 @@ class TestCamouflageAppMethods(TempDirMixin, unittest.TestCase):
             target_index=2,
             attempt_idx=7,
             global_attempt=11,
+            seed=123456,
             target_total=10,
             accepted_count=1,
+            rejected_count=10,
+            accepted=False,
             rs=valid_ratios(),
             extra_scores={
                 "score_final": 0.88,
@@ -887,8 +890,11 @@ class TestCamouflageAppMethods(TempDirMixin, unittest.TestCase):
         )
         self.assertIn("1 / 10", self.app.progress_text.text)
         self.assertIn("tentatives 11", self.app.progress_text.text)
+        self.assertIn("rejetés 10", self.app.progress_text.text)
         self.assertIn("Image 002", self.app.attempt_text.text)
         self.assertIn("total 000011", self.app.attempt_text.text)
+        self.assertIn("seed 123456", self.app.attempt_text.text)
+        self.assertIn("rejeté", self.app.attempt_text.text)
         self.assertIn("C", self.app.color_text.text)
         self.assertIn("Score 0.880", self.app.score_text.text)
         self.assertIn("Olive conn.", self.app.extra_text.text)
