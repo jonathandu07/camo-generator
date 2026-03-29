@@ -255,6 +255,19 @@ class RuntimeTuning:
         )
 
 
+@dataclass
+class RejectionAnalysis:
+    target_index: int
+    local_attempt: int
+    seed: int
+    reject_streak: int
+    fail_count: int
+    severity: float
+    failure_names: List[str]
+    notes: List[str]
+    corrections: Dict[str, Any]
+
+
 ProgressCallback = Callable[[int, int, int, int, CandidateResult, bool], None]
 AsyncProgressCallback = Callable[[int, int, int, int, CandidateResult, bool], Awaitable[None]]
 StopCallback = Callable[[], bool]
@@ -1665,6 +1678,342 @@ def military_visual_discipline_score(metrics: Dict[str, float]) -> Dict[str, flo
 
 
 # ============================================================
+# ANALYSE PROFONDE DES REJETS / GUIDAGE ADAPTATIF
+# ============================================================
+
+def _guided_state_init() -> Dict[str, Any]:
+    return {
+        "reject_streak": 0,
+        "total_rejects": 0,
+        "olive_scale_delta": 0.0,
+        "terre_scale_delta": 0.0,
+        "gris_scale_delta": 0.0,
+        "center_overlap_delta": 0.0,
+        "extra_macro_attempts": 0,
+        "zone_boost_deltas": [0.0 for _ in DENSITY_ZONES],
+        "width_variation_delta": 0.0,
+        "lateral_jitter_delta": 0.0,
+        "tip_taper_delta": 0.0,
+        "edge_break_delta": 0.0,
+        "force_vertical": False,
+        "avoid_vertical": False,
+        "expand_angle_pool": False,
+        "prefer_sequential_repair": False,
+        "last_analysis": None,
+    }
+
+
+def _left_zone_indexes() -> List[int]:
+    return [0, 2, 4]
+
+
+
+def _right_zone_indexes() -> List[int]:
+    return [1, 3, 5]
+
+
+
+def _failure_name(item: Any) -> str:
+    if isinstance(item, dict):
+        return str(item.get("rule", "")).strip()
+    rule = getattr(item, "rule", "")
+    return str(rule).strip()
+
+
+
+def extract_rejection_failures(candidate: CandidateResult, target_index: int = 0, local_attempt: int = 0) -> List[Dict[str, Any]]:
+    mod = _get_log_module()
+    fn = getattr(mod, "analyze_candidate", None) if mod is not None else None
+    if callable(fn):
+        try:
+            diag = fn(candidate, target_index, local_attempt)
+            failures = getattr(diag, "failures", None) or []
+            out: List[Dict[str, Any]] = []
+            for item in failures:
+                if hasattr(item, "to_dict"):
+                    try:
+                        out.append(dict(item.to_dict()))
+                        continue
+                    except Exception:
+                        pass
+                if isinstance(item, dict):
+                    out.append(dict(item))
+                    continue
+                out.append({"rule": _failure_name(item)})
+            return out
+        except Exception:
+            pass
+    return []
+
+
+
+def _add_zone_boost(corrections: Dict[str, Any], indexes: Sequence[int], value: float) -> None:
+    boosts = corrections.setdefault("zone_boost_deltas", [0.0 for _ in DENSITY_ZONES])
+    for idx in indexes:
+        boosts[idx] = boosts[idx] + float(value)
+
+
+
+def deep_rejection_analysis(
+    candidate: CandidateResult,
+    target_index: int,
+    local_attempt: int,
+    reject_streak: int = 0,
+) -> RejectionAnalysis:
+    failures = extract_rejection_failures(candidate, target_index=target_index, local_attempt=local_attempt)
+    failure_names = [name for name in (_failure_name(item) for item in failures) if name]
+    metrics = dict(candidate.metrics)
+    ratios = np.asarray(candidate.ratios, dtype=float)
+
+    corrections: Dict[str, Any] = {
+        "olive_scale_delta": 0.0,
+        "terre_scale_delta": 0.0,
+        "gris_scale_delta": 0.0,
+        "center_overlap_delta": 0.0,
+        "extra_macro_attempts": 0,
+        "zone_boost_deltas": [0.0 for _ in DENSITY_ZONES],
+        "width_variation_delta": 0.0,
+        "lateral_jitter_delta": 0.0,
+        "tip_taper_delta": 0.0,
+        "edge_break_delta": 0.0,
+        "force_vertical": False,
+        "avoid_vertical": False,
+        "expand_angle_pool": False,
+        "prefer_sequential_repair": reject_streak >= 1,
+    }
+    notes: List[str] = []
+    severity = float(max(1, len(failure_names)))
+
+    def boost_note(text: str) -> None:
+        if text not in notes:
+            notes.append(text)
+
+    left_bias = ((candidate.seed + local_attempt + target_index) % 2 == 0)
+    asym_indexes = _left_zone_indexes() if left_bias else _right_zone_indexes()
+
+    olive_low = any(name in failure_names for name in [
+        "abs_err_olive", "ratio_olive", "macro_olive_visible_ratio",
+        "macro_olive_count", "largest_olive_component_ratio",
+        "largest_olive_component_ratio_small", "olive_multizone_share",
+    ]) or ratios[IDX_OLIVE] < TARGET[IDX_OLIVE]
+    terre_low = any(name in failure_names for name in [
+        "abs_err_terre", "ratio_terre", "macro_terre_visible_ratio", "macro_terre_count",
+    ]) or ratios[IDX_TERRE] < TARGET[IDX_TERRE]
+    gris_low = any(name in failure_names for name in [
+        "abs_err_gris", "ratio_gris", "macro_gris_visible_ratio", "macro_gris_count",
+    ]) or ratios[IDX_GRIS] < TARGET[IDX_GRIS]
+
+    if olive_low:
+        corrections["olive_scale_delta"] += 0.08
+        corrections["extra_macro_attempts"] += 60
+        _add_zone_boost(corrections, [0, 1, 2, 3, 4, 5], 0.06)
+        boost_note("Renforcement des macros olive et allongement des tentatives structurelles.")
+        severity += 1.0
+
+    if terre_low:
+        corrections["terre_scale_delta"] += 0.06
+        corrections["extra_macro_attempts"] += 35
+        _add_zone_boost(corrections, [0, 1, 2, 3, 4, 5], 0.04)
+        boost_note("Hausse ciblée des macros terre pour rétablir le volume intermédiaire.")
+        severity += 0.7
+
+    if gris_low:
+        corrections["gris_scale_delta"] += 0.05
+        corrections["extra_macro_attempts"] += 25
+        _add_zone_boost(corrections, asym_indexes, 0.08)
+        boost_note("Injection de macros gris asymétriques pour casser les masses restantes.")
+        severity += 0.5
+
+    if any(name in failure_names for name in ["center_empty_ratio", "center_empty_ratio_small"]):
+        corrections["center_overlap_delta"] += 0.10
+        corrections["extra_macro_attempts"] += 45
+        corrections["zone_boost_deltas"][6] += 0.28
+        boost_note("Remplissage plus agressif du torse central pour résorber le vide coyote.")
+        severity += 0.8
+
+    if any(name in failure_names for name in ["periphery_boundary_density_ratio", "periphery_non_coyote_ratio"]):
+        _add_zone_boost(corrections, [0, 1, 2, 3, 4, 5], 0.14)
+        corrections["extra_macro_attempts"] += 40
+        boost_note("Accentuation de la périphérie pour durcir la rupture de silhouette.")
+        severity += 0.8
+
+    if any(name in failure_names for name in ["oblique_share", "angle_dominance_ratio"]):
+        corrections["expand_angle_pool"] = True
+        corrections["avoid_vertical"] = True
+        boost_note("Diversification angulaire forcée pour casser la dominance directionnelle.")
+        severity += 0.6
+
+    if "vertical_share" in failure_names:
+        vertical_share = float(metrics.get("vertical_share", 0.0))
+        if vertical_share < MIN_VERTICAL_SHARE:
+            corrections["force_vertical"] = True
+            boost_note("Réintroduction contrôlée de verticales pour retrouver la discipline angulaire.")
+        elif vertical_share > MAX_VERTICAL_SHARE:
+            corrections["avoid_vertical"] = True
+            boost_note("Réduction immédiate des verticales pour restaurer l'oblique dominant.")
+        severity += 0.4
+
+    if any(name in failure_names for name in ["boundary_density", "boundary_density_small", "visual_contour_break_score", "visual_outline_band_diversity"]):
+        target_bd = float(metrics.get("boundary_density", 0.0))
+        if target_bd < MIN_BOUNDARY_DENSITY:
+            corrections["edge_break_delta"] += 0.05
+            corrections["lateral_jitter_delta"] += 0.03
+            corrections["width_variation_delta"] += 0.02
+            boost_note("Augmentation des cassures d'arête et du jitter pour enrichir la texture de contour.")
+        else:
+            corrections["edge_break_delta"] -= 0.02
+            corrections["width_variation_delta"] -= 0.01
+            boost_note("Lissage partiel des arêtes pour réduire une densité de contour excessive.")
+        severity += 0.5
+
+    if any(name in failure_names for name in ["largest_olive_component_ratio", "largest_olive_component_ratio_small", "olive_multizone_share"]):
+        corrections["olive_scale_delta"] += 0.06
+        corrections["extra_macro_attempts"] += 50
+        corrections["lateral_jitter_delta"] -= 0.02
+        corrections["width_variation_delta"] -= 0.01
+        boost_note("Recherche de macros olive plus longues et plus cohérentes pour reconnecter les masses principales.")
+        severity += 0.7
+
+    if any(name in failure_names for name in ["macro_total_count", "macro_multizone_ratio", "largest_macro_mask_ratio"]):
+        corrections["extra_macro_attempts"] += 70
+        corrections["expand_angle_pool"] = True
+        _add_zone_boost(corrections, [0, 1, 2, 3, 4, 5], 0.05)
+        boost_note("Réparation structurelle du système macro avec diversification et budget de pose accru.")
+        severity += 0.9
+
+    if any(name in failure_names for name in ["mirror_similarity", "visual_military_score", "visual_score_final"]):
+        _add_zone_boost(corrections, asym_indexes, 0.12)
+        corrections["edge_break_delta"] += 0.02
+        corrections["expand_angle_pool"] = True
+        boost_note("Asymétrie latérale forcée pour améliorer la discipline visuelle militaire globale.")
+        severity += 0.8
+
+    if reject_streak >= 2:
+        corrections["prefer_sequential_repair"] = True
+        corrections["extra_macro_attempts"] += 80
+        corrections["expand_angle_pool"] = True
+        boost_note("Passage en mode réparation lourde après série de rejets consécutifs.")
+        severity += 1.0
+
+    return RejectionAnalysis(
+        target_index=int(target_index),
+        local_attempt=int(local_attempt),
+        seed=int(candidate.seed),
+        reject_streak=int(reject_streak),
+        fail_count=int(len(failure_names)),
+        severity=float(round(severity, 4)),
+        failure_names=list(failure_names),
+        notes=list(notes),
+        corrections=corrections,
+    )
+
+
+
+def _merge_guided_generation_state(state: Dict[str, Any], analysis: RejectionAnalysis) -> Dict[str, Any]:
+    merged = dict(state or _guided_state_init())
+    merged.setdefault("zone_boost_deltas", [0.0 for _ in DENSITY_ZONES])
+    merged["reject_streak"] = int(merged.get("reject_streak", 0)) + 1
+    merged["total_rejects"] = int(merged.get("total_rejects", 0)) + 1
+    merged["olive_scale_delta"] = float(merged.get("olive_scale_delta", 0.0)) + float(analysis.corrections.get("olive_scale_delta", 0.0))
+    merged["terre_scale_delta"] = float(merged.get("terre_scale_delta", 0.0)) + float(analysis.corrections.get("terre_scale_delta", 0.0))
+    merged["gris_scale_delta"] = float(merged.get("gris_scale_delta", 0.0)) + float(analysis.corrections.get("gris_scale_delta", 0.0))
+    merged["center_overlap_delta"] = float(merged.get("center_overlap_delta", 0.0)) + float(analysis.corrections.get("center_overlap_delta", 0.0))
+    merged["extra_macro_attempts"] = int(merged.get("extra_macro_attempts", 0)) + int(analysis.corrections.get("extra_macro_attempts", 0))
+    merged["width_variation_delta"] = float(merged.get("width_variation_delta", 0.0)) + float(analysis.corrections.get("width_variation_delta", 0.0))
+    merged["lateral_jitter_delta"] = float(merged.get("lateral_jitter_delta", 0.0)) + float(analysis.corrections.get("lateral_jitter_delta", 0.0))
+    merged["tip_taper_delta"] = float(merged.get("tip_taper_delta", 0.0)) + float(analysis.corrections.get("tip_taper_delta", 0.0))
+    merged["edge_break_delta"] = float(merged.get("edge_break_delta", 0.0)) + float(analysis.corrections.get("edge_break_delta", 0.0))
+    merged["force_vertical"] = bool(merged.get("force_vertical", False) or analysis.corrections.get("force_vertical", False))
+    merged["avoid_vertical"] = bool(merged.get("avoid_vertical", False) or analysis.corrections.get("avoid_vertical", False))
+    merged["expand_angle_pool"] = bool(merged.get("expand_angle_pool", False) or analysis.corrections.get("expand_angle_pool", False))
+    merged["prefer_sequential_repair"] = bool(merged.get("prefer_sequential_repair", False) or analysis.corrections.get("prefer_sequential_repair", False))
+    boosts = list(merged.get("zone_boost_deltas", [0.0 for _ in DENSITY_ZONES]))
+    incoming = list(analysis.corrections.get("zone_boost_deltas", [0.0 for _ in DENSITY_ZONES]))
+    if len(boosts) < len(DENSITY_ZONES):
+        boosts.extend([0.0] * (len(DENSITY_ZONES) - len(boosts)))
+    if len(incoming) < len(DENSITY_ZONES):
+        incoming.extend([0.0] * (len(DENSITY_ZONES) - len(incoming)))
+    merged["zone_boost_deltas"] = [float(a) + float(b) for a, b in zip(boosts, incoming)]
+    merged["last_analysis"] = {
+        "seed": analysis.seed,
+        "fail_count": analysis.fail_count,
+        "severity": analysis.severity,
+        "failure_names": list(analysis.failure_names),
+        "notes": list(analysis.notes),
+    }
+    return merged
+
+
+
+def _apply_guided_generation_state(profile: VariantProfile, state: Optional[Dict[str, Any]]) -> VariantProfile:
+    if not state:
+        return profile
+
+    profile.olive_macro_target_scale = _clip_float(profile.olive_macro_target_scale + float(state.get("olive_scale_delta", 0.0)), 0.88, 1.55)
+    profile.terre_macro_target_scale = _clip_float(profile.terre_macro_target_scale + float(state.get("terre_scale_delta", 0.0)), 0.88, 1.45)
+    profile.gris_macro_target_scale = _clip_float(profile.gris_macro_target_scale + float(state.get("gris_scale_delta", 0.0)), 0.88, 1.40)
+    profile.center_torso_overlap_scale = _clip_float(profile.center_torso_overlap_scale + float(state.get("center_overlap_delta", 0.0)), 0.82, 1.28)
+    profile.extra_macro_attempts = int(max(profile.extra_macro_attempts, 0) + int(state.get("extra_macro_attempts", 0)))
+
+    boosts = list(profile.zone_weight_boosts)
+    incoming = list(state.get("zone_boost_deltas", []))
+    for idx in range(min(len(boosts), len(incoming))):
+        boosts[idx] = _clip_float(boosts[idx] + float(incoming[idx]), 0.35, 2.60)
+    profile.zone_weight_boosts = tuple(boosts)
+
+    profile.macro_width_variation = _clip_float(profile.macro_width_variation + float(state.get("width_variation_delta", 0.0)), 0.12, 0.42)
+    profile.macro_lateral_jitter = _clip_float(profile.macro_lateral_jitter + float(state.get("lateral_jitter_delta", 0.0)), 0.08, 0.30)
+    profile.macro_tip_taper = _clip_float(profile.macro_tip_taper + float(state.get("tip_taper_delta", 0.0)), 0.28, 0.56)
+    profile.macro_edge_break = _clip_float(profile.macro_edge_break + float(state.get("edge_break_delta", 0.0)), 0.06, 0.24)
+
+    allowed = list(profile.allowed_angles)
+    if bool(state.get("expand_angle_pool", False)):
+        allowed = sorted(set(BASE_ANGLES))
+    if bool(state.get("force_vertical", False)) and 0 not in allowed:
+        allowed = sorted(set(allowed + [0]))
+    if bool(state.get("avoid_vertical", False)) and len([a for a in allowed if a != 0]) >= 4:
+        allowed = [a for a in allowed if a != 0]
+    if not allowed:
+        allowed = BASE_ANGLES[:]
+    profile.allowed_angles = list(allowed)
+
+    angle_pool: List[int] = list(allowed)
+    obliques = [a for a in allowed if a != 0]
+    if obliques:
+        angle_pool.extend(obliques * 3)
+    if 0 in allowed and not bool(state.get("avoid_vertical", False)):
+        angle_pool.extend([0] * (1 if bool(state.get("force_vertical", False)) else 0))
+    profile.angle_pool = tuple(int(a) for a in angle_pool)
+    return profile
+
+
+
+def _guided_state_snapshot(state: Dict[str, Any]) -> Dict[str, Any]:
+    snap = dict(state or {})
+    if "zone_boost_deltas" in snap:
+        snap["zone_boost_deltas"] = [round(float(v), 4) for v in list(snap["zone_boost_deltas"])]
+    return snap
+
+
+
+def _guided_state_has_effects(state: Optional[Dict[str, Any]]) -> bool:
+    if not state:
+        return False
+    if any(bool(state.get(name, False)) for name in ("force_vertical", "avoid_vertical", "expand_angle_pool", "prefer_sequential_repair")):
+        return True
+    if any(abs(float(state.get(name, 0.0))) > 1e-12 for name in (
+        "olive_scale_delta", "terre_scale_delta", "gris_scale_delta",
+        "center_overlap_delta", "width_variation_delta", "lateral_jitter_delta",
+        "tip_taper_delta", "edge_break_delta",
+    )):
+        return True
+    if int(state.get("extra_macro_attempts", 0)) != 0:
+        return True
+    boosts = list(state.get("zone_boost_deltas", []))
+    return any(abs(float(v)) > 1e-12 for v in boosts)
+
+
+# ============================================================
 # GÉNÉRATION D'UNE VARIANTE
 # ============================================================
 
@@ -1710,14 +2059,15 @@ def generate_one_variant(profile: VariantProfile) -> Tuple[Image.Image, np.ndarr
     return render_canvas(canvas), rs, metrics
 
 
-def generate_candidate_from_seed(seed: int) -> CandidateResult:
+def generate_candidate_from_seed(seed: int, correction_state: Optional[Dict[str, Any]] = None) -> CandidateResult:
     profile = make_profile(seed)
+    profile = _apply_guided_generation_state(profile, correction_state)
     image, ratios, metrics = generate_one_variant(profile)
     return CandidateResult(seed=seed, profile=profile, image=image, ratios=ratios, metrics=metrics)
 
 
-async def async_generate_candidate_from_seed(seed: int) -> CandidateResult:
-    return await asyncio.to_thread(generate_candidate_from_seed, seed)
+async def async_generate_candidate_from_seed(seed: int, correction_state: Optional[Dict[str, Any]] = None) -> CandidateResult:
+    return await asyncio.to_thread(generate_candidate_from_seed, seed, correction_state)
 
 
 # ============================================================
@@ -1903,8 +2253,11 @@ async def async_write_report(rows: List[Dict[str, object]], output_dir: Path, fi
 # AIDES PARALLÉLISATION
 # ============================================================
 
-def generate_and_validate_from_seed(seed: int) -> Tuple[CandidateResult, bool]:
-    candidate = generate_candidate_from_seed(seed)
+def generate_and_validate_from_seed(seed: int, correction_state: Optional[Dict[str, Any]] = None) -> Tuple[CandidateResult, bool]:
+    if _guided_state_has_effects(correction_state):
+        candidate = generate_candidate_from_seed(seed, correction_state=correction_state)
+    else:
+        candidate = generate_candidate_from_seed(seed)
     accepted = validate_candidate_result(candidate)
     return candidate, accepted
 
@@ -1966,6 +2319,7 @@ def generate_all(
 
     for target_index in range(1, target_count + 1):
         local_attempt = 1
+        guided_state = _guided_state_init()
 
         while True:
             if stop_requested is not None and stop_requested():
@@ -1993,8 +2347,12 @@ def generate_all(
                 pool = get_process_pool(tuning.max_workers)
                 batch = _batch_attempt_seeds(target_index, local_attempt, tuning.attempt_batch_size, base_seed)
                 submitted: Dict[Any, Tuple[int, int, float]] = {}
+                state_snapshot = _guided_state_snapshot(guided_state)
                 for attempt_no, seed in batch:
-                    fut = pool.submit(generate_and_validate_from_seed, seed)
+                    if _guided_state_has_effects(state_snapshot):
+                        fut = pool.submit(generate_and_validate_from_seed, seed, state_snapshot)
+                    else:
+                        fut = pool.submit(generate_and_validate_from_seed, seed)
                     submitted[fut] = (attempt_no, seed, time.time())
 
                 batch_results: List[Tuple[int, CandidateResult, bool]] = []
@@ -2024,8 +2382,39 @@ def generate_all(
                         tuning = _merge_supervisor_tuning(tuning, advice)
 
                 accepted_result = next(((a, c) for a, c, ok in sorted(batch_results, key=lambda x: x[0]) if ok), None)
+                rejected_results = [(a, c) for a, c, ok in sorted(batch_results, key=lambda x: x[0]) if not ok]
+                for rejected_attempt, rejected_candidate in rejected_results:
+                    analysis = deep_rejection_analysis(
+                        rejected_candidate,
+                        target_index=target_index,
+                        local_attempt=rejected_attempt,
+                        reject_streak=int(guided_state.get("reject_streak", 0)) + 1,
+                    )
+                    guided_state = _merge_guided_generation_state(guided_state, analysis)
+                    _runtime_log(
+                        "WARNING",
+                        "main_rejection_analysis",
+                        "Candidat rejeté - analyse profonde",
+                        target_index=target_index,
+                        local_attempt=rejected_attempt,
+                        seed=rejected_candidate.seed,
+                        fail_count=analysis.fail_count,
+                        severity=analysis.severity,
+                        failure_names=analysis.failure_names[:12],
+                        notes=analysis.notes,
+                        corrections=_guided_state_snapshot(guided_state),
+                    )
+
                 if accepted_result is None:
                     local_attempt += tuning.attempt_batch_size
+                    if guided_state.get("prefer_sequential_repair"):
+                        tuning = RuntimeTuning(
+                            max_workers=1,
+                            attempt_batch_size=1,
+                            parallel_attempts=False,
+                            machine_intensity=tuning.machine_intensity,
+                            reason="guided_repair_after_batch_reject",
+                        ).normalized()
                     if enable_live_supervisor:
                         advice = _supervisor_feedback(
                             "batch_finished",
@@ -2033,6 +2422,7 @@ def generate_all(
                             accepted=False,
                             tuning=tuning.__dict__,
                             next_local_attempt=local_attempt,
+                            rejection_analysis=_guided_state_snapshot(guided_state),
                         )
                         tuning = _merge_supervisor_tuning(tuning, advice)
                     continue
@@ -2042,13 +2432,39 @@ def generate_all(
             else:
                 seed = build_seed(target_index, local_attempt, base_seed=base_seed)
                 started_at = time.time()
-                accepted_candidate = generate_candidate_from_seed(seed)
+                state_snapshot = _guided_state_snapshot(guided_state)
+                if _guided_state_has_effects(state_snapshot):
+                    accepted_candidate = generate_candidate_from_seed(seed, correction_state=state_snapshot)
+                else:
+                    accepted_candidate = generate_candidate_from_seed(seed)
                 accepted = validate_candidate_result(accepted_candidate)
                 duration_s = time.time() - started_at
                 total_attempts += 1
 
                 if progress_callback is not None:
                     progress_callback(target_index, local_attempt, total_attempts, target_count, accepted_candidate, accepted)
+
+                if not accepted:
+                    analysis = deep_rejection_analysis(
+                        accepted_candidate,
+                        target_index=target_index,
+                        local_attempt=local_attempt,
+                        reject_streak=int(guided_state.get("reject_streak", 0)) + 1,
+                    )
+                    guided_state = _merge_guided_generation_state(guided_state, analysis)
+                    _runtime_log(
+                        "WARNING",
+                        "main_rejection_analysis",
+                        "Candidat rejeté - analyse profonde",
+                        target_index=target_index,
+                        local_attempt=local_attempt,
+                        seed=seed,
+                        fail_count=analysis.fail_count,
+                        severity=analysis.severity,
+                        failure_names=analysis.failure_names[:12],
+                        notes=analysis.notes,
+                        corrections=_guided_state_snapshot(guided_state),
+                    )
 
                 if enable_live_supervisor:
                     advice = _supervisor_feedback(
@@ -2062,10 +2478,19 @@ def generate_all(
                         tuning=tuning.__dict__,
                         ratios={COLOR_NAMES[i]: float(accepted_candidate.ratios[i]) for i in range(4)},
                         metrics={k: float(v) for k, v in accepted_candidate.metrics.items()},
+                        rejection_analysis=_guided_state_snapshot(guided_state) if not accepted else None,
                     )
                     tuning = _merge_supervisor_tuning(tuning, advice)
 
                 if not accepted:
+                    if guided_state.get("prefer_sequential_repair"):
+                        tuning = RuntimeTuning(
+                            max_workers=1,
+                            attempt_batch_size=1,
+                            parallel_attempts=False,
+                            machine_intensity=tuning.machine_intensity,
+                            reason="guided_repair",
+                        ).normalized()
                     local_attempt += 1
                     continue
                 accepted_attempt = local_attempt
@@ -2163,6 +2588,7 @@ async def async_generate_all(
 
     for target_index in range(1, target_count + 1):
         local_attempt = 1
+        guided_state = _guided_state_init()
 
         while True:
             if stop_requested is not None and await stop_requested():
@@ -2189,8 +2615,12 @@ async def async_generate_all(
                 batch = _batch_attempt_seeds(target_index, local_attempt, tuning.attempt_batch_size, base_seed)
 
                 wrapped_tasks: List[asyncio.Task] = []
+                state_snapshot = _guided_state_snapshot(guided_state)
                 for attempt_no, seed in batch:
-                    fut = loop.run_in_executor(pool, generate_and_validate_from_seed, seed)
+                    if _guided_state_has_effects(state_snapshot):
+                        fut = loop.run_in_executor(pool, generate_and_validate_from_seed, seed, state_snapshot)
+                    else:
+                        fut = loop.run_in_executor(pool, generate_and_validate_from_seed, seed)
                     wrapped_tasks.append(
                         asyncio.create_task(_wrap_async_attempt(fut, attempt_no, seed, time.time()))
                     )
@@ -2221,8 +2651,39 @@ async def async_generate_all(
                         tuning = _merge_supervisor_tuning(tuning, advice)
 
                 accepted_result = next(((a, c) for a, c, ok in sorted(batch_results, key=lambda x: x[0]) if ok), None)
+                rejected_results = [(a, c) for a, c, ok in sorted(batch_results, key=lambda x: x[0]) if not ok]
+                for rejected_attempt, rejected_candidate in rejected_results:
+                    analysis = deep_rejection_analysis(
+                        rejected_candidate,
+                        target_index=target_index,
+                        local_attempt=rejected_attempt,
+                        reject_streak=int(guided_state.get("reject_streak", 0)) + 1,
+                    )
+                    guided_state = _merge_guided_generation_state(guided_state, analysis)
+                    _runtime_log(
+                        "WARNING",
+                        "main_async_rejection_analysis",
+                        "Candidat rejeté - analyse profonde",
+                        target_index=target_index,
+                        local_attempt=rejected_attempt,
+                        seed=rejected_candidate.seed,
+                        fail_count=analysis.fail_count,
+                        severity=analysis.severity,
+                        failure_names=analysis.failure_names[:12],
+                        notes=analysis.notes,
+                        corrections=_guided_state_snapshot(guided_state),
+                    )
+
                 if accepted_result is None:
                     local_attempt += tuning.attempt_batch_size
+                    if guided_state.get("prefer_sequential_repair"):
+                        tuning = RuntimeTuning(
+                            max_workers=1,
+                            attempt_batch_size=1,
+                            parallel_attempts=False,
+                            machine_intensity=tuning.machine_intensity,
+                            reason="guided_repair_after_batch_reject",
+                        ).normalized()
                     if enable_live_supervisor:
                         advice = _supervisor_feedback(
                             "batch_finished",
@@ -2230,6 +2691,7 @@ async def async_generate_all(
                             accepted=False,
                             tuning=tuning.__dict__,
                             next_local_attempt=local_attempt,
+                            rejection_analysis=_guided_state_snapshot(guided_state),
                         )
                         tuning = _merge_supervisor_tuning(tuning, advice)
                     continue
@@ -2239,13 +2701,39 @@ async def async_generate_all(
             else:
                 seed = build_seed(target_index, local_attempt, base_seed=base_seed)
                 started_at = time.time()
-                accepted_candidate = await async_generate_candidate_from_seed(seed)
+                state_snapshot = _guided_state_snapshot(guided_state)
+                if _guided_state_has_effects(state_snapshot):
+                    accepted_candidate = await async_generate_candidate_from_seed(seed, correction_state=state_snapshot)
+                else:
+                    accepted_candidate = await async_generate_candidate_from_seed(seed)
                 accepted = await async_validate_candidate_result(accepted_candidate)
                 duration_s = time.time() - started_at
                 total_attempts += 1
 
                 if progress_callback is not None:
                     await progress_callback(target_index, local_attempt, total_attempts, target_count, accepted_candidate, accepted)
+
+                if not accepted:
+                    analysis = deep_rejection_analysis(
+                        accepted_candidate,
+                        target_index=target_index,
+                        local_attempt=local_attempt,
+                        reject_streak=int(guided_state.get("reject_streak", 0)) + 1,
+                    )
+                    guided_state = _merge_guided_generation_state(guided_state, analysis)
+                    _runtime_log(
+                        "WARNING",
+                        "main_async_rejection_analysis",
+                        "Candidat rejeté - analyse profonde",
+                        target_index=target_index,
+                        local_attempt=local_attempt,
+                        seed=seed,
+                        fail_count=analysis.fail_count,
+                        severity=analysis.severity,
+                        failure_names=analysis.failure_names[:12],
+                        notes=analysis.notes,
+                        corrections=_guided_state_snapshot(guided_state),
+                    )
 
                 if enable_live_supervisor:
                     advice = _supervisor_feedback(
@@ -2259,10 +2747,19 @@ async def async_generate_all(
                         tuning=tuning.__dict__,
                         ratios={COLOR_NAMES[i]: float(accepted_candidate.ratios[i]) for i in range(4)},
                         metrics={k: float(v) for k, v in accepted_candidate.metrics.items()},
+                        rejection_analysis=_guided_state_snapshot(guided_state) if not accepted else None,
                     )
                     tuning = _merge_supervisor_tuning(tuning, advice)
 
                 if not accepted:
+                    if guided_state.get("prefer_sequential_repair"):
+                        tuning = RuntimeTuning(
+                            max_workers=1,
+                            attempt_batch_size=1,
+                            parallel_attempts=False,
+                            machine_intensity=tuning.machine_intensity,
+                            reason="guided_repair",
+                        ).normalized()
                     local_attempt += 1
                     continue
 
