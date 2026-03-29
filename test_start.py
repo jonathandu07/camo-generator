@@ -880,6 +880,28 @@ class TestCamouflageAppAsync(AppMixin, unittest.IsolatedAsyncioTestCase):
         self.assertTrue(ok)
         self.assertIn("10 tests", summary)
 
+    async def test_async_run_preflight_with_module_summary_fallback(self):
+        fake_log = types.SimpleNamespace(
+            async_run_preflight_tests=AsyncMock(return_value={
+                "ok": True,
+                "modules": [
+                    {
+                        "module": "test_start",
+                        "stdout": "",
+                        "stderr": "Ran 61 tests in 2.521s\n\nOK\n",
+                    }
+                ],
+                "count": 1,
+                "failed_modules": [],
+            })
+        )
+        with patch.object(sut, "camo_log", fake_log):
+            ok, summary = await self.app._async_run_preflight()
+        self.assertTrue(ok)
+        self.assertIn("61 tests", summary)
+        self.assertIn("0 échec", summary)
+        self.assertIn("0 erreur", summary)
+
     async def test_extract_failure_rules(self):
         candidate = make_candidate()
         with patch.object(sut.camo, "extract_rejection_failures", return_value=[{"rule": "r1"}, {"rule": "r2"}], create=True):
