@@ -13,12 +13,12 @@ Rôles principaux :
 - permettre un suivi console en direct des tests et des diagnostics.
 
 Sorties principales :
-- logs_generation/diagnostic_candidates.csv
-- logs_generation/diagnostic_summary.json
-- logs_generation/diagnostic_summary.txt
-- logs_generation/runtime.log
-- logs_generation/tests_summary.json
-- logs_generation/runtime_snapshot.json
+- logs/diagnostic_candidates.csv
+- logs/diagnostic_summary.json
+- logs/diagnostic_summary.txt
+- logs/runtime.log
+- logs/tests_summary.json
+- logs/runtime_snapshot.json
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ import main as camo
 # ============================================================
 
 DEFAULT_ANALYSIS_COUNT = 20
-DEFAULT_OUTPUT_DIR = Path("logs_generation")
+DEFAULT_OUTPUT_DIR = Path(os.getenv("LOG_OUTPUT_DIR", "logs"))
 DEFAULT_TEST_MODULES: tuple[str, ...] = ("test_main", "test_start")
 DEFAULT_RUNTIME_LOG_FILE = "runtime.log"
 DEFAULT_TEST_SUMMARY_FILE = "tests_summary.json"
@@ -65,6 +65,7 @@ DEFAULT_LIVE_CONSOLE = True
 DEFAULT_CONSOLE_LEVEL = "INFO"
 
 LOGGER_NAME = "camo_log"
+os.environ.setdefault("LOG_OUTPUT_DIR", str(DEFAULT_OUTPUT_DIR.resolve()))
 
 
 # ============================================================
@@ -282,9 +283,11 @@ def _should_block_on_tests(summary: TestRunSummary) -> bool:
     return (not summary.ok) or (not summary.completed) or summary.timed_out
 
 
-def _subprocess_env() -> Dict[str, str]:
+def _subprocess_env(output_dir: Path | None = None) -> Dict[str, str]:
     env = os.environ.copy()
     env["KIVY_NO_ARGS"] = "1"
+    out = Path(output_dir or DEFAULT_OUTPUT_DIR).resolve()
+    env["LOG_OUTPUT_DIR"] = str(out)
     return env
 
 
@@ -1098,7 +1101,7 @@ def _read_declared_test_log_file(module_name: str) -> str | None:
     return None
 
 
-def _run_test_module_subprocess(module_name: str, timeout_s: float | None = None) -> TestModuleSummary:
+def _run_test_module_subprocess(module_name: str, timeout_s: float | None = None, output_dir: Path = DEFAULT_OUTPUT_DIR) -> TestModuleSummary:
     timeout_s = _normalize_timeout(timeout_s)
     cmd = _build_test_command(module_name)
     t0 = time.perf_counter()
@@ -1120,7 +1123,7 @@ def _run_test_module_subprocess(module_name: str, timeout_s: float | None = None
             text=True,
             encoding="utf-8",
             errors="replace",
-            env=_subprocess_env(),
+            env=_subprocess_env(output_dir),
             timeout=timeout_s,
         )
         dt = time.perf_counter() - t0
@@ -1195,6 +1198,7 @@ def _run_test_module_subprocess(module_name: str, timeout_s: float | None = None
 async def _async_run_test_module_subprocess(
     module_name: str,
     timeout_s: float | None = None,
+    output_dir: Path = DEFAULT_OUTPUT_DIR,
 ) -> TestModuleSummary:
     timeout_s = _normalize_timeout(timeout_s)
     cmd = _build_test_command(module_name)
@@ -1216,7 +1220,7 @@ async def _async_run_test_module_subprocess(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=_subprocess_env(),
+            env=_subprocess_env(output_dir),
         )
 
         if timeout_s is None:
@@ -1406,7 +1410,8 @@ def run_preflight_tests(
 ) -> TestRunSummary:
     timeout_s = _normalize_timeout(timeout_s)
     module_names = _normalize_module_names(module_names)
-    ensure_dir(Path(output_dir))
+    output_dir = ensure_dir(Path(output_dir))
+    os.environ["LOG_OUTPUT_DIR"] = str(output_dir.resolve())
     log_event(
         "INFO",
         "tests",
@@ -1420,7 +1425,7 @@ def run_preflight_tests(
     importlib.invalidate_caches()
 
     module_summaries = [
-        _run_test_module_subprocess(module_name, timeout_s=timeout_s)
+        _run_test_module_subprocess(module_name, timeout_s=timeout_s, output_dir=output_dir)
         for module_name in module_names
     ]
 
@@ -1452,7 +1457,8 @@ async def async_run_preflight_tests(
     timeout_s: float | None = DEFAULT_TEST_TIMEOUT_S,
 ) -> TestRunSummary:
     timeout_s = _normalize_timeout(timeout_s)
-    ensure_dir(Path(output_dir))
+    output_dir = ensure_dir(Path(output_dir))
+    os.environ["LOG_OUTPUT_DIR"] = str(output_dir.resolve())
     module_names = tuple(_normalize_module_names(module_names))
 
     await async_log_event(
@@ -1466,7 +1472,7 @@ async def async_run_preflight_tests(
     t0 = time.perf_counter()
 
     module_summaries = await asyncio.gather(
-        *[_async_run_test_module_subprocess(module_name, timeout_s=timeout_s) for module_name in module_names]
+        *[_async_run_test_module_subprocess(module_name, timeout_s=timeout_s, output_dir=output_dir) for module_name in module_names]
     )
 
     summary = _merge_parallel_module_summaries(module_summaries)
