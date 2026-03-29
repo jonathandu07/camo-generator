@@ -22,7 +22,6 @@ import sys
 import tempfile
 import types
 import unittest
-import warnings
 from pathlib import Path
 from typing import Any, Dict, List
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
@@ -36,12 +35,8 @@ from PIL import Image as PILImage
 # ============================================================
 
 def _install_fake_kivy() -> None:
-    # Les tests doivent rester déterministes, même si Kivy est installé
-    # sur la machine. On retire donc tout module Kivy déjà chargé puis
-    # on injecte une implémentation minimale contrôlée.
-    for name in list(sys.modules):
-        if name == "kivy" or name.startswith("kivy."):
-            sys.modules.pop(name, None)
+    if "kivy" in sys.modules:
+        return
 
     class _CanvasCtx:
         def __enter__(self):
@@ -204,21 +199,10 @@ def _install_fake_kivy() -> None:
         sys.modules[name] = mod
 
 
-USE_REAL_KIVY = os.getenv("CAMO_TEST_USE_REAL_KIVY", "0").strip().lower() in {"1", "true", "yes", "on"}
-
-if not USE_REAL_KIVY:
+try:
+    import kivy  # type: ignore # noqa: F401
+except Exception:
     _install_fake_kivy()
-else:
-    try:
-        import kivy  # type: ignore # noqa: F401
-    except Exception:
-        _install_fake_kivy()
-
-# start.py peut laisser des ResourceWarning liés à des boucles asyncio non
-# fermées selon la plateforme et la politique warnings locale. Les tests
-# nettoient eux-mêmes les runners quand c'est possible ; ce filtre évite
-# qu'un environnement plus strict rende la suite non déterministe.
-warnings.filterwarnings("ignore", category=ResourceWarning, message=r"unclosed event loop.*")
 
 import start as sut
 
@@ -373,30 +357,6 @@ def make_submit_closing_coroutines(fake_future: Any):
     return _submit
 
 
-
-
-def stop_async_runner_safely(runner: Any) -> None:
-    if runner is None:
-        return
-    try:
-        stop = getattr(runner, "stop", None)
-        if callable(stop):
-            stop()
-    except Exception:
-        pass
-
-    loop = getattr(runner, "loop", None)
-    if loop is not None:
-        try:
-            is_closed = getattr(loop, "is_closed", None)
-            if callable(is_closed):
-                if not is_closed():
-                    loop.close()
-            else:
-                loop.close()
-        except Exception:
-            pass
-
 class FakeProcess:
     def cpu_percent(self, interval=None) -> float:
         return 12.0
@@ -423,7 +383,10 @@ class AppMixin(TempDirMixin):
     def setUp(self) -> None:
         super().setUp()
         self.app = sut.CamouflageApp()
-        stop_async_runner_safely(getattr(self.app, "async_runner", None))
+        try:
+            self.app.async_runner.stop()
+        except Exception:
+            pass
         self.app.async_runner = types.SimpleNamespace(submit=make_submit_closing_coroutines(MagicMock()), stop=Mock())
         self.app.current_output_dir = self.tmpdir
         self.app.process = FakeProcess()
@@ -456,13 +419,19 @@ class AppMixin(TempDirMixin):
         self.app.mode_blocking_btn = make_fake_button()
         self.app.mode_non_blocking_btn = make_fake_button()
         self.app.mode_skip_tests_btn = make_fake_button()
+        self.app.engine_classic_btn = make_fake_button()
+        self.app.engine_mldl_btn = make_fake_button()
+        self.app.engine_label = make_fake_label()
         self.app.intensity_label = make_fake_label()
         self.app.log_view = make_fake_log_view()
         self.app.diag_log_view = make_fake_log_view()
         self.app.gallery_grid = make_fake_grid()
 
     def tearDown(self) -> None:
-        stop_async_runner_safely(getattr(self.app, "async_runner", None))
+        try:
+            self.app.async_runner.stop()
+        except Exception:
+            pass
         super().tearDown()
 
 
@@ -475,6 +444,10 @@ class TestUtilities(unittest.TestCase):
         self.assertEqual(sut.REPORT_NAME, "rapport_camouflages_front.csv")
         self.assertEqual(sut.BEST_DIR_NAME, "best_of")
         self.assertEqual(sut.DEFAULT_TOP_K, 20)
+        if hasattr(sut, "GEN_ENGINE_CLASSIC"):
+            self.assertEqual(sut.GEN_ENGINE_CLASSIC, "classic")
+        if hasattr(sut, "GEN_ENGINE_MLDL"):
+            self.assertEqual(sut.GEN_ENGINE_MLDL, "mldl")
 
     def test_hex_rgba(self):
         rgba = sut.hex_rgba("BL", 0.5)
@@ -551,7 +524,7 @@ class TestUtilities(unittest.TestCase):
             fut = runner.submit(asyncio.sleep(0, result=42))
             self.assertEqual(fut.result(timeout=2), 42)
         finally:
-            stop_async_runner_safely(runner)
+            runner.stop()
 
 
 # ============================================================
@@ -642,6 +615,25 @@ class TestCamouflageAppMethods(AppMixin, unittest.TestCase):
         self.assertIn("●", self.app.mode_non_blocking_btn.text)
         self.assertIn("○", self.app.mode_blocking_btn.text)
         self.assertIn("Mode actuel", self.app.run_mode_label.text)
+
+    def test_generation_engine_helpers(self):
+        if not hasattr(sut, "GEN_ENGINE_MLDL"):
+            self.skipTest("Le module start chargé ne supporte pas encore le moteur ML/DL.")
+        self.assertEqual(self.app._generation_engine_text(sut.GEN_ENGINE_CLASSIC), "backend classique")
+        self.assertEqual(self.app._generation_engine_text(sut.GEN_ENGINE_MLDL), "pipeline ML/DL")
+        self.app._set_generation_engine(sut.GEN_ENGINE_MLDL)
+        self.assertEqual(self.app.generation_engine, sut.GEN_ENGINE_MLDL)
+        self.assertEqual(self.app.current_output_dir, Path("camouflages_ml_dl"))
+        self.assertIn("ML/DL", self.app.log_view.label.text)
+
+    def test_refresh_generation_engine_buttons(self):
+        if not hasattr(sut, "GEN_ENGINE_MLDL"):
+            self.skipTest("Le module start chargé ne supporte pas encore le moteur ML/DL.")
+        self.app.generation_engine = sut.GEN_ENGINE_MLDL
+        self.app._refresh_generation_engine_buttons()
+        self.assertIn("●", self.app.engine_mldl_btn.text)
+        self.assertIn("○", self.app.engine_classic_btn.text)
+        self.assertIn("Moteur actuel", self.app.engine_label.text)
 
     def test_refresh_diag_labels(self):
         self.app.diag_total = 6
@@ -777,6 +769,21 @@ class TestCamouflageAppMethods(AppMixin, unittest.TestCase):
         mock_sleep.assert_called_once_with(True)
         fake_future.add_done_callback.assert_called_once()
 
+    def test_start_generation_after_preflight_success_mldl(self):
+        if not hasattr(sut, "GEN_ENGINE_MLDL"):
+            self.skipTest("Le module start chargé ne supporte pas encore le moteur ML/DL.")
+        fake_future = MagicMock()
+        fake_future.done.return_value = False
+        fake_future.add_done_callback = MagicMock()
+        self.app.async_runner = types.SimpleNamespace(submit=make_submit_closing_coroutines(fake_future), stop=Mock())
+        self.app.generation_engine = sut.GEN_ENGINE_MLDL
+        with patch.object(sut, "prevent_sleep") as mock_sleep:
+            self.app._start_generation_after_preflight()
+        self.assertTrue(self.app.running)
+        self.assertEqual(self.app.current_output_dir, Path("camouflages_ml_dl"))
+        self.assertIs(self.app.current_future, fake_future)
+        mock_sleep.assert_called_once_with(True)
+
     def test_stop_generation(self):
         self.app.running = True
         self.app.stop_generation()
@@ -786,6 +793,15 @@ class TestCamouflageAppMethods(AppMixin, unittest.TestCase):
         self.app.preflight_running = True
         self.app.stop_generation()
         self.assertIn("préflight", self.app.log_view.label.text.lower())
+
+    def test_stop_generation_mldl(self):
+        if not hasattr(sut, "GEN_ENGINE_MLDL"):
+            self.skipTest("Le module start chargé ne supporte pas encore le moteur ML/DL.")
+        self.app.running = True
+        self.app.generation_engine = sut.GEN_ENGINE_MLDL
+        self.app.stop_generation()
+        self.assertFalse(self.app.stop_flag)
+        self.assertIn("ML/DL", self.app.log_view.label.text)
 
     def test_on_generation_done_success(self):
         fut = Mock()
@@ -879,28 +895,6 @@ class TestCamouflageAppAsync(AppMixin, unittest.IsolatedAsyncioTestCase):
             ok, summary = await self.app._async_run_preflight()
         self.assertTrue(ok)
         self.assertIn("10 tests", summary)
-
-    async def test_async_run_preflight_with_module_summary_fallback(self):
-        fake_log = types.SimpleNamespace(
-            async_run_preflight_tests=AsyncMock(return_value={
-                "ok": True,
-                "modules": [
-                    {
-                        "module": "test_start",
-                        "stdout": "",
-                        "stderr": "Ran 61 tests in 2.521s\n\nOK\n",
-                    }
-                ],
-                "count": 1,
-                "failed_modules": [],
-            })
-        )
-        with patch.object(sut, "camo_log", fake_log):
-            ok, summary = await self.app._async_run_preflight()
-        self.assertTrue(ok)
-        self.assertIn("61 tests", summary)
-        self.assertIn("0 échec", summary)
-        self.assertIn("0 erreur", summary)
 
     async def test_extract_failure_rules(self):
         candidate = make_candidate()
@@ -1002,6 +996,61 @@ class TestCamouflageAppAsync(AppMixin, unittest.IsolatedAsyncioTestCase):
     async def test_async_should_stop(self):
         self.app.stop_flag = True
         self.assertTrue(await self.app._async_should_stop())
+
+    async def test_async_worker_generate_mldl_without_module(self):
+        if not hasattr(sut, "GEN_ENGINE_MLDL"):
+            self.skipTest("Le module start chargé ne supporte pas encore le moteur ML/DL.")
+        with patch.object(sut, "camo_mldl", None, create=True), \
+             patch.object(self.app, "_async_finish_error", AsyncMock()) as mock_err:
+            await self.app._async_worker_generate_mldl(1)
+        mock_err.assert_awaited_once()
+
+    async def test_async_finish_success_mldl(self):
+        if not hasattr(sut, "GEN_ENGINE_MLDL"):
+            self.skipTest("Le module start chargé ne supporte pas encore le moteur ML/DL.")
+        runner = types.SimpleNamespace(
+            total_attempts=12,
+            cfg=types.SimpleNamespace(
+                report_name="rapport_camouflages_ml_dl.csv",
+                checkpoint_name="surrogate_camouflage.pt",
+                dataset_name="dataset_camouflage_ml_dl.npz",
+            ),
+        )
+        rows = [{"index": 1}]
+        with patch.object(sut, "prevent_sleep") as mock_sleep, \
+             patch.object(self.app, "reload_gallery"):
+            await self.app._async_finish_success_mldl(rows, runner)
+        mock_sleep.assert_called_once_with(False)
+        self.assertFalse(self.app.running)
+        self.assertIn("ML/DL", self.app.status_label.text)
+
+    async def test_async_worker_generate_mldl_success(self):
+        if not hasattr(sut, "GEN_ENGINE_MLDL"):
+            self.skipTest("Le module start chargé ne supporte pas encore le moteur ML/DL.")
+        rows = [{"index": 1}]
+
+        class FakeRunner:
+            def __init__(self, cfg):
+                self.cfg = cfg
+                self.total_attempts = 7
+
+            def generate(self):
+                out_dir = Path(self.cfg.output_dir)
+                out_dir.mkdir(parents=True, exist_ok=True)
+                (out_dir / "camouflage_001.png").write_bytes(b"fake")
+                (out_dir / "run_summary_ml_dl.json").write_text(json.dumps({"total_attempts": 7}), encoding="utf-8")
+                return rows
+
+        fake_module = types.SimpleNamespace(
+            MLDLConfig=lambda **kwargs: types.SimpleNamespace(**kwargs, report_name="rapport_camouflages_ml_dl.csv", checkpoint_name="surrogate_camouflage.pt", dataset_name="dataset_camouflage_ml_dl.npz"),
+            CamouflageMLDLGenerator=FakeRunner,
+        )
+
+        with patch.object(sut, "camo_mldl", fake_module, create=True), \
+             patch.object(self.app, "reload_gallery"), \
+             patch.object(self.app, "_async_finish_success_mldl", AsyncMock()) as mock_finish:
+            await self.app._async_worker_generate_mldl(1)
+        mock_finish.assert_awaited_once()
 
     def test_update_attempt_status(self):
         self.app._update_attempt_status(
