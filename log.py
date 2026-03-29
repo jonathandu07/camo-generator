@@ -20,6 +20,7 @@ import csv
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import shutil
@@ -269,6 +270,13 @@ class ContinuousLogManager:
         with self._lock:
             if callback not in self._subscribers:
                 self._subscribers.append(callback)
+
+    def unsubscribe(self, callback: Callable[[RuntimeEvent], None]) -> None:
+        with self._lock:
+            try:
+                self._subscribers.remove(callback)
+            except ValueError:
+                pass
 
     def emit(self, level: str, source: str, message: str, **payload: Any) -> RuntimeEvent:
         event = RuntimeEvent(
@@ -672,6 +680,60 @@ def _run_test_module(module_name: str, timeout_s: float | None, output_dir: Path
         )
 
 
+def _parse_unittest_counts(text: str) -> Dict[str, int]:
+    raw = str(text or "")
+    if not raw:
+        return {"total": 0, "failures": 0, "errors": 0}
+
+    clean = raw.replace("\r", "\n")
+    total = 0
+    failures = 0
+    errors = 0
+
+    ran_matches = re.findall(r"Ran\s+(\d+)\s+tests?\s+in", clean, flags=re.IGNORECASE)
+    if ran_matches:
+        total = max(int(x) for x in ran_matches)
+
+    failed_match = re.search(r"FAILED\s*\((.*?)\)", clean, flags=re.IGNORECASE | re.DOTALL)
+    if failed_match:
+        details = failed_match.group(1)
+        fail_match = re.search(r"failures\s*=\s*(\d+)", details, flags=re.IGNORECASE)
+        err_match = re.search(r"errors\s*=\s*(\d+)", details, flags=re.IGNORECASE)
+        if fail_match:
+            failures = int(fail_match.group(1))
+        if err_match:
+            errors = int(err_match.group(1))
+
+    return {"total": int(total), "failures": int(failures), "errors": int(errors)}
+
+
+def _collect_preflight_counts(results: Sequence[TestModuleSummary]) -> Dict[str, Any]:
+    total = 0
+    failures = 0
+    errors = 0
+    per_module: List[Dict[str, Any]] = []
+
+    for item in results:
+        parsed = _parse_unittest_counts("\n".join([str(item.stdout or ""), str(item.stderr or "")]))
+        total += int(parsed["total"])
+        failures += int(parsed["failures"])
+        errors += int(parsed["errors"])
+        per_module.append({
+            "module": item.module,
+            "total": int(parsed["total"]),
+            "failures": int(parsed["failures"]),
+            "errors": int(parsed["errors"]),
+            "ok": bool(item.ok),
+        })
+
+    return {
+        "total": int(total),
+        "failures": int(failures),
+        "errors": int(errors),
+        "per_module": per_module,
+    }
+
+
 def run_preflight_tests(
     module_names: Sequence[str] | None = None,
     *,
@@ -681,11 +743,18 @@ def run_preflight_tests(
     modules = _normalize_module_names(module_names)
     results = [_run_test_module(name, timeout_s=timeout_s, output_dir=output_dir) for name in modules]
     ok = all(item.ok for item in results)
+    counts = _collect_preflight_counts(results)
     summary = {
         "ok": bool(ok),
         "modules": [r.to_dict() for r in results],
         "count": len(results),
+        "module_count": len(results),
         "failed_modules": [r.module for r in results if not r.ok],
+        "total": int(counts["total"]),
+        "failures": int(counts["failures"]),
+        "errors": int(counts["errors"]),
+        "per_module": counts["per_module"],
+        "short_text": f"{int(counts['total'])} tests | {int(counts['failures'])} échec(s) | {int(counts['errors'])} erreur(s)",
     }
     path = Path(output_dir) / DEFAULT_TEST_SUMMARY_FILE
     path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
