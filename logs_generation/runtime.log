@@ -1598,3 +1598,6 @@
 2026-03-29 16:42:37 | WARNING  | camo_log | [diagnostic] Candidat analysé | payload={"accepted": false, "fail_count": 17, "fail_rules": ["abs_err_coyote", "abs_err_olive", "abs_err_terre", "abs_err_gris", "mean_abs_error", "ratio_coyote", "ratio_olive", "ratio_terre", "ratio_gris", "largest_olive_component_ratio", "largest_olive_component_ratio_small", "boundary_density", "vert_olive_macro_share", "vert_de_gris_micro_share", "center_empty_ratio", "center_empty_ratio_small", "vert_de_gris_macro_share"], "local_attempt": 118, "seed": 202603220118, "target_index": 1}
 2026-03-29 16:42:37 | WARNING  | camo_log | [start_worker] Candidat rejeté | payload={"global_attempt": 118, "local_attempt": 118, "score_final": 0.3554, "seed": 202603220118, "target_index": 1}
 2026-03-29 16:42:37 | INFO     | camo_log | [start_worker] Tentative en cours | payload={"global_attempt": 119, "local_attempt": 119, "seed": 202603220119, "target_index": 1}
+2026-03-29 16:43:38 | WARNING  | camo_log | [start_worker] Arrêt demandé | payload={"accepted_count": 0, "total_attempts": 119}
+2026-03-29 16:43:41 | INFO     | camo_log | [start] Arrêt de l'interface Kivy
+2026-03-29 16:48:54 | ERROR    | camo_log | [start_worker] Erreur de génération | payload={"accepted_count": 0, "error_message": "cannot schedule new futures after shutdown", "total_attempts": 119}

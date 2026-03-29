@@ -170,6 +170,7 @@ MIN_MACRO_TERRE_VISIBLE_RATIO = 0.09
 MIN_MACRO_GRIS_VISIBLE_RATIO = 0.07
 MAX_MACRO_TERRE_VISIBLE_RATIO = 0.16
 MAX_MACRO_GRIS_VISIBLE_RATIO = 0.12
+MAX_CENTRAL_BROWN_CONTINUITY = 0.38
 
 
 # Discipline de génération pilotée
@@ -1198,6 +1199,72 @@ def enforce_secondary_macro_budgets(
 
         apply_mask(canvas, origin_map, mask, color, ORIGIN_MACRO)
         macros.append(MacroRecord(color, poly, angle, (cx, cy), mask, macro_zone_count(mask)))
+
+def zone_center(name: str) -> Tuple[int, int]:
+    ys, xs = np.where(ANATOMY_ZONES[name])
+    return int(np.mean(xs)), int(np.mean(ys))
+
+
+def angle_from_points_vertical(p1: Tuple[int, int], p2: Tuple[int, int]) -> float:
+    dx = float(p2[0] - p1[0])
+    dy = float(p2[1] - p1[1])
+    return float(math.degrees(math.atan2(dx, dy)))
+
+
+def nearest_allowed_angle(angle: float, allowed: Sequence[int]) -> int:
+    allowed = list(allowed) or BASE_ANGLES
+    return int(min(allowed, key=lambda a: abs(a - angle)))
+
+
+def add_forced_structural_macros(
+    canvas: np.ndarray,
+    origin_map: np.ndarray,
+    macros: List[MacroRecord],
+    profile: VariantProfile,
+    rng: random.Random,
+) -> None:
+    main_side = rng.choice(["left", "right"])
+    other_side = "right" if main_side == "left" else "left"
+
+    plan = [
+        (IDX_OLIVE, (f"{main_side}_shoulder", f"{main_side}_thigh"), (52, 92), (18, 30)),
+        (IDX_TERRE, (f"{other_side}_shoulder", f"{other_side}_flank"), (42, 70), (14, 24)),
+        (IDX_GRIS, (f"{other_side}_flank", f"{other_side}_thigh"), (34, 56), (10, 18)),
+    ]
+
+    for color_idx, (z1, z2), length_range, width_range in plan:
+        p1 = zone_center(z1)
+        p2 = zone_center(z2)
+        cx = (p1[0] + p2[0]) / 2.0 + rng.uniform(-28.0, 28.0)
+        cy = (p1[1] + p2[1]) / 2.0 + rng.uniform(-40.0, 40.0)
+        base_angle = angle_from_points_vertical(p1, p2)
+        angle = nearest_allowed_angle(base_angle + rng.uniform(-7.0, 7.0), profile.allowed_angles)
+        length_px = max(cm_to_px(rng.uniform(*length_range)), int(math.hypot(p2[0]-p1[0], p2[1]-p1[1]) * 1.05))
+        width_px = cm_to_px(rng.uniform(*width_range))
+
+        poly = jagged_spine_poly(
+            rng=rng,
+            cx=cx,
+            cy=cy,
+            length_px=length_px,
+            width_px=width_px,
+            angle_from_vertical_deg=angle,
+            segments=rng.randint(7, 10),
+            width_variation=max(0.16, profile.macro_width_variation - 0.01),
+            lateral_jitter=max(0.12, profile.macro_lateral_jitter - 0.01),
+            tip_taper=profile.macro_tip_taper,
+            edge_break=profile.macro_edge_break,
+        )
+        mask = polygon_mask(poly)
+        if mask.sum() == 0:
+            continue
+        if color_idx == IDX_OLIVE and macro_zone_count(mask) < 2:
+            continue
+        if color_idx in (IDX_TERRE, IDX_GRIS) and macro_zone_count(mask) < 1:
+            continue
+
+        apply_mask(canvas, origin_map, mask, color_idx, ORIGIN_MACRO)
+        macros.append(MacroRecord(color_idx, poly, angle, (int(cx), int(cy)), mask, macro_zone_count(mask)))
 def add_macros(
     canvas: np.ndarray,
     origin_map: np.ndarray,
@@ -1811,20 +1878,22 @@ def ratio_score(rs: np.ndarray) -> float:
     return clamp01(1.0 - mae / 0.05)
 
 
+
 def main_metrics_score(metrics: Dict[str, float]) -> float:
     parts = [
         clamp01((metrics["largest_olive_component_ratio"] - 0.12) / 0.18),
         clamp01(1.0 - metrics["center_empty_ratio"] / 0.60),
         clamp01(1.0 - metrics["mirror_similarity"] / 0.90),
+        clamp01(1.0 - metrics.get("central_brown_continuity", 1.0) / 0.55),
         clamp01((metrics["olive_multizone_share"] - 0.25) / 0.45),
         clamp01(1.0 - abs(metrics["boundary_density"] - 0.14) / 0.12),
         clamp01((metrics["vert_olive_macro_share"] - 0.45) / 0.30),
-        clamp01((metrics["terre_de_france_transition_share"] - 0.20) / 0.30),
-        clamp01((metrics["vert_de_gris_micro_share"] - 0.50) / 0.25),
+        clamp01((metrics["terre_de_france_transition_share"] - 0.08) / 0.22),
+        clamp01((metrics["vert_de_gris_micro_share"] - 0.12) / 0.22),
+        clamp01((metrics.get("macro_terre_visible_ratio", 0.0) - 0.06) / 0.08),
+        clamp01((metrics.get("macro_gris_visible_ratio", 0.0) - 0.04) / 0.08),
     ]
     return float(np.mean(parts))
-
-
 def evaluate_visual_metrics(index_canvas: np.ndarray, rs: np.ndarray, metrics: Dict[str, float]) -> Dict[str, float]:
     sil_div = silhouette_color_diversity_score(index_canvas)
     contour_score, outline_band_div = contour_break_score(index_canvas)
@@ -1897,6 +1966,16 @@ def spatial_discipline_metrics(canvas: np.ndarray) -> Dict[str, float]:
     }
 
 
+
+def central_brown_continuity(canvas: np.ndarray) -> float:
+    x1 = int(canvas.shape[1] * 0.38)
+    x2 = int(canvas.shape[1] * 0.62)
+    y1 = int(canvas.shape[0] * 0.10)
+    y2 = int(canvas.shape[0] * 0.94)
+    band = (canvas[y1:y2, x1:x2] == IDX_COYOTE)
+    if band.size == 0:
+        return 0.0
+    return float(np.max([largest_component_ratio(band), float(np.mean(np.any(band, axis=1)))]))
 def military_visual_discipline_score(metrics: Dict[str, float]) -> Dict[str, float]:
     parts = [
         clamp01((metrics.get("visual_score_final", 0.0) - 0.45) / 0.30),
@@ -2033,6 +2112,7 @@ def _fallback_analyze_candidate_failures(candidate: CandidateResult) -> List[Dic
     _append_failure_max(failures, "boundary_density", _safe_failure_float(m.get("boundary_density")), float(MAX_BOUNDARY_DENSITY))
     _append_failure_max(failures, "boundary_density_small", _safe_failure_float(m.get("boundary_density_small")), float(MAX_BOUNDARY_DENSITY_SMALL))
     _append_failure_max(failures, "mirror_similarity", _safe_failure_float(m.get("mirror_similarity")), float(MAX_MIRROR_SIMILARITY))
+    _append_failure_max(failures, "central_brown_continuity", _safe_failure_float(m.get("central_brown_continuity")), float(MAX_CENTRAL_BROWN_CONTINUITY))
     _append_failure_max(failures, "angle_dominance_ratio", _safe_failure_float(m.get("angle_dominance_ratio")), float(MAX_ANGLE_DOMINANCE_RATIO))
     _append_failure_max(failures, "vert_de_gris_macro_share", _safe_failure_float(m.get("vert_de_gris_macro_share")), float(MAX_VISIBLE_GRIS_MACRO_SHARE))
     _append_failure_range(failures, "vertical_share", _safe_failure_float(m.get("vertical_share")), float(MIN_VERTICAL_SHARE), float(MAX_VERTICAL_SHARE))
@@ -2265,7 +2345,9 @@ def generate_one_variant(profile: VariantProfile) -> Tuple[Image.Image, np.ndarr
     canvas = np.full((HEIGHT, WIDTH), IDX_COYOTE, dtype=np.uint8)
     origin_map = np.full((HEIGHT, WIDTH), ORIGIN_BACKGROUND, dtype=np.uint8)
 
-    macros = add_macros(canvas, origin_map, profile, rng)
+    macros: List[MacroRecord] = []
+    add_forced_structural_macros(canvas, origin_map, macros, profile, rng)
+    macros.extend(add_macros(canvas, origin_map, profile, rng))
     enforce_secondary_macro_budgets(canvas, origin_map, macros, profile, rng)
     enforce_macro_angle_discipline(canvas, origin_map, macros, profile, rng)
     add_transitions(canvas, origin_map, macros, profile, rng)
@@ -2291,6 +2373,7 @@ def generate_one_variant(profile: VariantProfile) -> Tuple[Image.Image, np.ndarr
         "center_empty_ratio": center_empty_ratio(canvas),
         "boundary_density": boundary_density(canvas),
         "mirror_similarity": mirror_similarity_score(canvas),
+        "central_brown_continuity": central_brown_continuity(canvas),
         "oblique_share": orient["oblique_share"],
         "vertical_share": orient["vertical_share"],
         "angle_dominance_ratio": orient["dominance_ratio"],
@@ -2360,6 +2443,8 @@ def variant_is_valid(rs: np.ndarray, metrics: Dict[str, float]) -> bool:
         return False
 
     if metrics["mirror_similarity"] > MAX_MIRROR_SIMILARITY:
+        return False
+    if metrics.get("central_brown_continuity", 0.0) > MAX_CENTRAL_BROWN_CONTINUITY:
         return False
 
     if metrics["oblique_share"] < MIN_OBLIQUE_SHARE:
@@ -2472,6 +2557,7 @@ def candidate_row(
         "boundary_density_small": round(metrics["boundary_density_small"], 5),
         "boundary_density_tiny": round(metrics["boundary_density_tiny"], 5),
         "mirror_similarity": round(metrics["mirror_similarity"], 5),
+        "central_brown_continuity": round(float(metrics.get("central_brown_continuity", 0.0)), 5),
         "oblique_share": round(metrics["oblique_share"], 5),
         "vertical_share": round(metrics["vertical_share"], 5),
         "angle_dominance_ratio": round(metrics["angle_dominance_ratio"], 5),
