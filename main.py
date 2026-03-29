@@ -3605,15 +3605,498 @@ def run_generation(
     )
 
 
+
 # ============================================================
-# CLI UNIFIÉE
+# FUSION CLASSIQUE + ML/DL : MODE UNIQUE
+# ============================================================
+
+generate_all_classic = generate_all
+async_generate_all_classic = async_generate_all
+
+
+def _generate_guided_candidate_task(
+    seed: int,
+    base_state: Optional[Dict[str, Any]] = None,
+    action_idx: Optional[int] = None,
+) -> CandidateResult:
+    state = _guided_state_snapshot(base_state or {})
+    if action_idx is not None:
+        _name, delta = ACTION_LIBRARY[int(action_idx)]
+        state = merge_guided_delta(state, delta)
+    if _guided_state_has_effects(state):
+        return generate_candidate_from_seed(seed, correction_state=state)
+    return generate_candidate_from_seed(seed)
+
+
+def _select_action_indexes(
+    *,
+    rng: random.Random,
+    proposal_count: int,
+    last_rejected_candidate: Optional[CandidateResult],
+    last_analysis: Optional[RejectionAnalysis],
+    bandit: Optional[LinUCBBandit],
+) -> List[int]:
+    proposal_count = max(1, int(proposal_count))
+    lib_len = len(ACTION_LIBRARY)
+    if lib_len <= 0:
+        return []
+
+    if last_analysis is None or last_rejected_candidate is None or bandit is None:
+        indexes = list(range(lib_len))
+        rng.shuffle(indexes)
+        if proposal_count <= lib_len:
+            return indexes[:proposal_count]
+        out = indexes[:]
+        while len(out) < proposal_count:
+            extra = list(range(lib_len))
+            rng.shuffle(extra)
+            out.extend(extra)
+        return out[:proposal_count]
+
+    context = build_context_vector(last_rejected_candidate, last_analysis)
+    ranked = bandit.select_top_k(context, k=min(lib_len, max(1, proposal_count - 2)))
+    others = [i for i in range(lib_len) if i not in ranked]
+    rng.shuffle(others)
+    out = ranked + others
+    if len(out) < proposal_count:
+        refill = list(range(lib_len))
+        rng.shuffle(refill)
+        out.extend(refill)
+    return out[:proposal_count]
+
+
+def _score_candidate_for_ranking(
+    candidate: CandidateResult,
+    surrogate: Optional[DeepSurrogate],
+) -> Tuple[float, float]:
+    if surrogate is not None and surrogate.trained:
+        prob_valid, pred_reward = surrogate.predict(candidate_to_feature_vector(candidate))
+        return float(prob_valid[0]), float(pred_reward[0])
+    return 0.5, float(main_metrics_score(candidate.metrics))
+
+
+def _write_unified_summary(
+    *,
+    output_dir: Path,
+    total_rows: int,
+    total_attempts: int,
+    training_log: List[Dict[str, Any]],
+    learning_cfg: MLDLConfig,
+    ml_enabled: bool,
+) -> None:
+    summary = {
+        "mode": "unified",
+        "ml_enabled": bool(ml_enabled),
+        "config": asdict(learning_cfg),
+        "total_rows": int(total_rows),
+        "total_attempts": int(total_attempts),
+        "training_log": training_log,
+        "report": str((output_dir / "rapport_camouflages.csv").resolve()),
+        "checkpoint": str((output_dir / learning_cfg.checkpoint_name).resolve()),
+        "dataset": str((output_dir / learning_cfg.dataset_name).resolve()),
+        "actions": [name for name, _ in ACTION_LIBRARY],
+    }
+    (output_dir / "run_summary_unified.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def generate_all(
+    target_count: int = N_VARIANTS_REQUIRED,
+    output_dir: Path = OUTPUT_DIR,
+    base_seed: int = DEFAULT_BASE_SEED,
+    progress_callback: Optional[ProgressCallback] = None,
+    stop_requested: Optional[StopCallback] = None,
+    max_workers: Optional[int] = None,
+    attempt_batch_size: Optional[int] = None,
+    parallel_attempts: bool = True,
+    machine_intensity: float = DEFAULT_MACHINE_INTENSITY,
+    strict_preflight: bool = True,
+    preflight_modules: Sequence[str] | None = ("test_main", "test_start"),
+    resource_sample_every_batches: int = DEFAULT_RESOURCE_SAMPLE_EVERY_BATCHES,
+    enable_live_supervisor: bool = True,
+    warmup_samples: int = 128,
+    candidate_pool_size: int = 8,
+    validate_top_k: int = 3,
+    train_epochs: int = 24,
+    learning_batch_size: int = 32,
+    learning_rate: float = 1e-3,
+    hidden_dim: int = 128,
+    device: str = "auto",
+    alpha_ucb: float = 1.25,
+    min_train_size: int = 32,
+    retrain_every: int = 24,
+    random_seed: int = 12345,
+) -> List[Dict[str, object]]:
+    output_dir = ensure_output_dir(output_dir)
+    validate_generation_request(
+        target_count=target_count,
+        output_dir=output_dir,
+        base_seed=base_seed,
+        machine_intensity=machine_intensity,
+        max_workers=max_workers,
+        attempt_batch_size=attempt_batch_size,
+    )
+    _run_log_preflight(strict=strict_preflight, output_dir=output_dir, module_names=preflight_modules)
+
+    resource_sample_every_batches = max(1, int(resource_sample_every_batches))
+    tuning = compute_runtime_tuning(
+        max_workers=max_workers,
+        attempt_batch_size=attempt_batch_size,
+        parallel_attempts=parallel_attempts,
+        machine_intensity=machine_intensity,
+        sample=sample_process_resources(machine_intensity=machine_intensity, output_dir=output_dir),
+    )
+    _runtime_log("INFO", "main_generate_all_unified", "Plan de charge initial unifié", tuning=tuning.__dict__)
+
+    if enable_live_supervisor:
+        advice = _supervisor_feedback("generation_started", tuning=tuning.__dict__, output_dir=str(output_dir), target_count=target_count)
+        tuning = _merge_supervisor_tuning(tuning, advice, fallback_machine_intensity=machine_intensity)
+
+    learning_cfg = MLDLConfig(
+        target_count=target_count,
+        warmup_samples=warmup_samples,
+        candidate_pool_size=candidate_pool_size,
+        validate_top_k=validate_top_k,
+        max_attempts_per_target=10_000,
+        train_epochs=train_epochs,
+        batch_size=learning_batch_size,
+        learning_rate=learning_rate,
+        hidden_dim=hidden_dim,
+        device=device,
+        base_seed=base_seed,
+        output_dir=str(output_dir),
+        alpha_ucb=alpha_ucb,
+        min_train_size=min_train_size,
+        retrain_every=retrain_every,
+        random_seed=random_seed,
+    )
+
+    rng = random.Random(random_seed)
+    ml_enabled = bool(TORCH_AVAILABLE and torch is not None and DataLoader is not None and TensorDataset is not None)
+    surrogate: Optional[DeepSurrogate] = None
+    bandit: Optional[LinUCBBandit] = None
+    buffer: Optional[ExperienceBuffer] = None
+    training_log: List[Dict[str, Any]] = []
+    last_rejected_candidate: Optional[CandidateResult] = None
+
+    if ml_enabled:
+        surrogate = DeepSurrogate(
+            input_dim=len(FEATURE_KEYS),
+            hidden_dim=learning_cfg.hidden_dim,
+            lr=learning_cfg.learning_rate,
+            device=("cuda" if device == "auto" and torch.cuda.is_available() else device),
+        )
+        bandit = LinUCBBandit(
+            n_actions=len(ACTION_LIBRARY),
+            context_dim=len(FEATURE_KEYS) + len(FAILURE_KEYS),
+            alpha=learning_cfg.alpha_ucb,
+        )
+        buffer = ExperienceBuffer()
+        _runtime_log("INFO", "main_generate_all_unified", "ML/DL activé dans le pipeline unifié", device=learning_cfg.device)
+    else:
+        _runtime_log("WARNING", "main_generate_all_unified", "PyTorch indisponible : pipeline unifié en heuristique pure")
+
+    def maybe_train(force: bool = False) -> Optional[Dict[str, float]]:
+        nonlocal training_log
+        if not ml_enabled or buffer is None or surrogate is None:
+            return None
+        x, y_valid, y_reward = buffer.as_arrays()
+        if len(x) < learning_cfg.min_train_size:
+            return None
+        if not force and (len(x) % learning_cfg.retrain_every != 0):
+            return None
+        stats = surrogate.fit(
+            x,
+            y_valid,
+            y_reward,
+            epochs=learning_cfg.train_epochs,
+            batch_size=learning_cfg.batch_size,
+        )
+        training_log.append({
+            "n_samples": int(len(x)),
+            "stats": stats,
+            "ts": time.time(),
+        })
+        surrogate.save(output_dir / learning_cfg.checkpoint_name)
+        buffer.save(output_dir / learning_cfg.dataset_name)
+        _runtime_log("INFO", "main_generate_all_unified_train", "Réentraînement unifié terminé", n_samples=int(len(x)), stats=stats)
+        return stats
+
+    if ml_enabled and buffer is not None:
+        _runtime_log("INFO", "main_generate_all_unified", "Warmup unifié démarré", warmup_samples=learning_cfg.warmup_samples)
+        for i in range(learning_cfg.warmup_samples):
+            seed = build_seed(0, i + 1, learning_cfg.base_seed)
+            candidate = generate_candidate_from_seed(seed)
+            accepted = validate_candidate_result(candidate)
+            buffer.add(candidate, accepted)
+        maybe_train(force=True)
+        _runtime_log("INFO", "main_generate_all_unified", "Warmup unifié terminé", warmup_samples=learning_cfg.warmup_samples)
+
+    rows: List[Dict[str, object]] = []
+    total_attempts = 0
+    batch_counter = 0
+
+    for target_index in range(1, target_count + 1):
+        local_attempt = 1
+        guided_state = _guided_state_init()
+        last_analysis: Optional[RejectionAnalysis] = None
+
+        while True:
+            if stop_requested is not None and stop_requested():
+                write_report(rows, output_dir)
+                _write_unified_summary(
+                    output_dir=output_dir,
+                    total_rows=len(rows),
+                    total_attempts=total_attempts,
+                    training_log=training_log,
+                    learning_cfg=learning_cfg,
+                    ml_enabled=ml_enabled,
+                )
+                return rows
+
+            batch_counter += 1
+            if batch_counter % resource_sample_every_batches == 0:
+                snapshot = sample_process_resources(machine_intensity=tuning.machine_intensity, output_dir=output_dir)
+                if enable_live_supervisor:
+                    advice = _supervisor_feedback(
+                        "resource_snapshot",
+                        target_index=target_index,
+                        local_attempt=local_attempt,
+                        snapshot=snapshot.to_dict(),
+                        tuning=tuning.__dict__,
+                    )
+                    tuning = _merge_supervisor_tuning(tuning, advice)
+
+            proposal_count = max(1, min(int(candidate_pool_size), int(tuning.attempt_batch_size)))
+            action_indexes = _select_action_indexes(
+                rng=rng,
+                proposal_count=proposal_count,
+                last_rejected_candidate=last_rejected_candidate,
+                last_analysis=last_analysis,
+                bandit=bandit,
+            )
+
+            batch = [
+                (local_attempt + offset, build_seed(target_index, local_attempt + offset, base_seed), action_indexes[offset])
+                for offset in range(proposal_count)
+            ]
+            use_parallel = bool(tuning.parallel_attempts and tuning.max_workers > 1 and len(batch) > 1)
+            state_snapshot = _guided_state_snapshot(guided_state)
+
+            collected: List[Dict[str, Any]] = []
+            if use_parallel:
+                pool = get_process_pool(tuning.max_workers)
+                submitted: Dict[Any, Tuple[int, int, int, float]] = {}
+                for attempt_no, seed, action_idx in batch:
+                    fut = pool.submit(_generate_guided_candidate_task, seed, state_snapshot, action_idx)
+                    submitted[fut] = (attempt_no, seed, action_idx, time.time())
+
+                for fut in as_completed(list(submitted.keys())):
+                    attempt_no, seed, action_idx, started_at = submitted[fut]
+                    candidate = fut.result()
+                    duration_s = time.time() - started_at
+                    accepted = validate_candidate_result(candidate)
+                    pred_valid, pred_reward = _score_candidate_for_ranking(candidate, surrogate)
+                    reward = candidate_reward(candidate, accepted)
+                    total_attempts += 1
+
+                    if buffer is not None:
+                        buffer.add(candidate, accepted)
+
+                    item = {
+                        "attempt_no": attempt_no,
+                        "seed": seed,
+                        "action_idx": action_idx,
+                        "action_name": ACTION_LIBRARY[action_idx][0],
+                        "candidate": candidate,
+                        "accepted": accepted,
+                        "pred_valid": pred_valid,
+                        "pred_reward": pred_reward,
+                        "reward": reward,
+                    }
+                    collected.append(item)
+
+                    if progress_callback is not None:
+                        progress_callback(target_index, attempt_no, total_attempts, target_count, candidate, accepted)
+
+                    if enable_live_supervisor:
+                        advice = _supervisor_feedback(
+                            "attempt_finished",
+                            target_index=target_index,
+                            local_attempt=attempt_no,
+                            seed=seed,
+                            accepted=accepted,
+                            duration_s=duration_s,
+                            total_attempts=total_attempts,
+                            tuning=tuning.__dict__,
+                            predicted_valid=pred_valid,
+                            predicted_reward=pred_reward,
+                            action_name=ACTION_LIBRARY[action_idx][0],
+                            ratios={COLOR_NAMES[i]: float(candidate.ratios[i]) for i in range(4)},
+                            metrics={k: float(v) for k, v in candidate.metrics.items()},
+                        )
+                        tuning = _merge_supervisor_tuning(tuning, advice)
+            else:
+                for attempt_no, seed, action_idx in batch:
+                    started_at = time.time()
+                    candidate = _generate_guided_candidate_task(seed, state_snapshot, action_idx)
+                    duration_s = time.time() - started_at
+                    accepted = validate_candidate_result(candidate)
+                    pred_valid, pred_reward = _score_candidate_for_ranking(candidate, surrogate)
+                    reward = candidate_reward(candidate, accepted)
+                    total_attempts += 1
+
+                    if buffer is not None:
+                        buffer.add(candidate, accepted)
+
+                    item = {
+                        "attempt_no": attempt_no,
+                        "seed": seed,
+                        "action_idx": action_idx,
+                        "action_name": ACTION_LIBRARY[action_idx][0],
+                        "candidate": candidate,
+                        "accepted": accepted,
+                        "pred_valid": pred_valid,
+                        "pred_reward": pred_reward,
+                        "reward": reward,
+                    }
+                    collected.append(item)
+
+                    if progress_callback is not None:
+                        progress_callback(target_index, attempt_no, total_attempts, target_count, candidate, accepted)
+
+                    if enable_live_supervisor:
+                        advice = _supervisor_feedback(
+                            "attempt_finished",
+                            target_index=target_index,
+                            local_attempt=attempt_no,
+                            seed=seed,
+                            accepted=accepted,
+                            duration_s=duration_s,
+                            total_attempts=total_attempts,
+                            tuning=tuning.__dict__,
+                            predicted_valid=pred_valid,
+                            predicted_reward=pred_reward,
+                            action_name=ACTION_LIBRARY[action_idx][0],
+                            ratios={COLOR_NAMES[i]: float(candidate.ratios[i]) for i in range(4)},
+                            metrics={k: float(v) for k, v in candidate.metrics.items()},
+                        )
+                        tuning = _merge_supervisor_tuning(tuning, advice)
+
+            maybe_train(force=False)
+
+            ranked_items = sorted(collected, key=lambda x: (x["pred_valid"], x["pred_reward"], x["reward"]), reverse=True)
+            ranked_window = ranked_items[:max(1, min(int(validate_top_k), len(ranked_items)))]
+            accepted_item = next((item for item in ranked_window if item["accepted"]), None)
+            if accepted_item is None:
+                accepted_item = next((item for item in ranked_items if item["accepted"]), None)
+
+            best_analysis: Optional[RejectionAnalysis] = None
+            best_reward = -1e18
+            rejected_items = [item for item in sorted(collected, key=lambda x: x["attempt_no"]) if not item["accepted"]]
+            for item in rejected_items:
+                analysis = deep_rejection_analysis(
+                    item["candidate"],
+                    target_index=target_index,
+                    local_attempt=item["attempt_no"],
+                    reject_streak=int(guided_state.get("reject_streak", 0)) + 1,
+                )
+                guided_state = _merge_guided_generation_state(guided_state, analysis)
+                last_rejected_candidate = item["candidate"]
+                if item["reward"] > best_reward:
+                    best_reward = float(item["reward"])
+                    best_analysis = analysis
+                if bandit is not None:
+                    context = build_context_vector(item["candidate"], analysis)
+                    bandit.update(int(item["action_idx"]), context, float(item["reward"]))
+                _runtime_log(
+                    "WARNING",
+                    "main_rejection_analysis_unified",
+                    "Candidat rejeté - analyse profonde unifiée",
+                    target_index=target_index,
+                    local_attempt=item["attempt_no"],
+                    seed=item["seed"],
+                    action_name=item["action_name"],
+                    fail_count=analysis.fail_count,
+                    severity=analysis.severity,
+                    failure_names=analysis.failure_names[:12],
+                    notes=analysis.notes,
+                    corrections=_guided_state_snapshot(guided_state),
+                )
+
+            last_analysis = best_analysis
+
+            if accepted_item is None:
+                local_attempt += len(batch)
+                if guided_state.get("prefer_sequential_repair"):
+                    tuning = RuntimeTuning(
+                        max_workers=1,
+                        attempt_batch_size=1,
+                        parallel_attempts=False,
+                        machine_intensity=tuning.machine_intensity,
+                        reason="guided_repair_after_batch_reject_unified",
+                    ).normalized()
+                if enable_live_supervisor:
+                    advice = _supervisor_feedback(
+                        "batch_finished",
+                        target_index=target_index,
+                        accepted=False,
+                        tuning=tuning.__dict__,
+                        next_local_attempt=local_attempt,
+                        rejection_analysis=_guided_state_snapshot(guided_state),
+                    )
+                    tuning = _merge_supervisor_tuning(tuning, advice)
+                continue
+
+            accepted_attempt = int(accepted_item["attempt_no"])
+            accepted_candidate = accepted_item["candidate"]
+            filename = output_dir / f"camouflage_{target_index:03d}.png"
+            save_candidate_image(accepted_candidate, filename)
+            rows.append(candidate_row(target_index, accepted_attempt, total_attempts, accepted_candidate))
+
+            if enable_live_supervisor:
+                advice = _supervisor_feedback(
+                    "candidate_accepted",
+                    target_index=target_index,
+                    accepted_attempt=accepted_attempt,
+                    total_attempts=total_attempts,
+                    tuning=tuning.__dict__,
+                    output_file=str(filename),
+                )
+                tuning = _merge_supervisor_tuning(tuning, advice)
+            break
+
+    write_report(rows, output_dir)
+    _write_unified_summary(
+        output_dir=output_dir,
+        total_rows=len(rows),
+        total_attempts=total_attempts,
+        training_log=training_log,
+        learning_cfg=learning_cfg,
+        ml_enabled=ml_enabled,
+    )
+
+    if enable_live_supervisor:
+        _supervisor_feedback(
+            "generation_finished",
+            total_rows=len(rows),
+            total_attempts=total_attempts,
+            tuning=tuning.__dict__,
+            output_dir=str(output_dir),
+        )
+
+    return rows
+
+
+# ============================================================
+# CLI UNIQUE
 # ============================================================
 
 
 def parse_cli_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Générateur de camouflage avec mode classique ou guidé par ML/DL")
-    parser.add_argument("--mode", type=str, default="classic", choices=("classic", "ml-dl"))
-
+    parser = argparse.ArgumentParser(description="Générateur de camouflage unifié : heuristique + ML/DL + apprentissage des rejets")
     parser.add_argument("--target-count", type=int, default=N_VARIANTS_REQUIRED)
     parser.add_argument("--output-dir", type=str, default=str(OUTPUT_DIR))
     parser.add_argument("--base-seed", type=int, default=DEFAULT_BASE_SEED)
@@ -3628,9 +4111,8 @@ def parse_cli_args() -> argparse.Namespace:
     parser.add_argument("--warmup-samples", type=int, default=128)
     parser.add_argument("--candidate-pool-size", type=int, default=8)
     parser.add_argument("--validate-top-k", type=int, default=3)
-    parser.add_argument("--max-attempts-per-target", type=int, default=120)
     parser.add_argument("--train-epochs", type=int, default=24)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--learning-batch-size", type=int, default=32)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--device", type=str, default="auto")
@@ -3652,43 +4134,32 @@ def main() -> None:
             torch.cuda.manual_seed_all(args.random_seed)
 
     try:
-        if args.mode == "ml-dl":
-            cfg = MLDLConfig(
-                target_count=args.target_count,
-                warmup_samples=args.warmup_samples,
-                candidate_pool_size=args.candidate_pool_size,
-                validate_top_k=args.validate_top_k,
-                max_attempts_per_target=args.max_attempts_per_target,
-                train_epochs=args.train_epochs,
-                batch_size=args.batch_size,
-                learning_rate=args.learning_rate,
-                hidden_dim=args.hidden_dim,
-                device=args.device,
-                base_seed=args.base_seed,
-                output_dir=args.output_dir,
-                alpha_ucb=args.alpha_ucb,
-                min_train_size=args.min_train_size,
-                retrain_every=args.retrain_every,
-                random_seed=args.random_seed,
-            )
-            rows = generate_all_ml_dl(cfg)
-            csv_path = Path(args.output_dir) / cfg.report_name
-        else:
-            rows = generate_all(
-                target_count=args.target_count,
-                output_dir=Path(args.output_dir),
-                base_seed=args.base_seed,
-                max_workers=args.max_workers,
-                attempt_batch_size=args.attempt_batch_size,
-                parallel_attempts=not args.disable_parallel_attempts,
-                machine_intensity=args.machine_intensity,
-                strict_preflight=bool(args.strict_preflight),
-                enable_live_supervisor=not args.disable_live_supervisor,
-            )
-            csv_path = Path(args.output_dir) / "rapport_camouflages.csv"
-
+        rows = generate_all(
+            target_count=args.target_count,
+            output_dir=Path(args.output_dir),
+            base_seed=args.base_seed,
+            max_workers=args.max_workers,
+            attempt_batch_size=args.attempt_batch_size,
+            parallel_attempts=not args.disable_parallel_attempts,
+            machine_intensity=args.machine_intensity,
+            strict_preflight=bool(args.strict_preflight),
+            enable_live_supervisor=not args.disable_live_supervisor,
+            warmup_samples=args.warmup_samples,
+            candidate_pool_size=args.candidate_pool_size,
+            validate_top_k=args.validate_top_k,
+            train_epochs=args.train_epochs,
+            learning_batch_size=args.learning_batch_size,
+            learning_rate=args.learning_rate,
+            hidden_dim=args.hidden_dim,
+            device=args.device,
+            alpha_ucb=args.alpha_ucb,
+            min_train_size=args.min_train_size,
+            retrain_every=args.retrain_every,
+            random_seed=args.random_seed,
+        )
+        csv_path = Path(args.output_dir) / "rapport_camouflages.csv"
         print("\nTerminé.")
-        print(f"Mode : {args.mode}")
+        print("Mode : unifié")
         print(f"Images validées : {len(rows)}/{args.target_count}")
         print(f"Dossier : {Path(args.output_dir).resolve()}")
         print(f"CSV : {csv_path.resolve()}")
