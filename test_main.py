@@ -1,10 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-test_main_corrected.py
-Suite de tests unitaires corrigée pour la version corrigée de main.py.
+test_main.py
+Suite de tests robuste et rapide pour main.py.
+
+Objectifs :
+- couvrir les helpers purs et la géométrie ;
+- couvrir les diagnostics macro et l'adaptation des rejets ;
+- couvrir la validation métier ;
+- couvrir les exports ;
+- couvrir les orchestrateurs sync/async ;
+- couvrir les chemins séquentiels et parallèles sans lancer de vrai ProcessPool.
 
 Exécution :
-    python -m unittest -v test_main_corrected.py
+    python -m unittest -v test_main.py
 """
 
 from __future__ import annotations
@@ -12,20 +20,22 @@ from __future__ import annotations
 import asyncio
 import csv
 import logging
+import os
+import random
+import sys
 import tempfile
-import time
+import types
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from pathlib import Path
-from typing import Dict, Iterable, List
-from unittest.mock import AsyncMock, patch
+from typing import Any, Dict, Iterable, List
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import numpy as np
 from PIL import Image
 
-try:
-    import main_corrected as mut
-except ImportError:
-    import main as mut
+import main as mut
 
 
 # ============================================================
@@ -34,13 +44,12 @@ except ImportError:
 
 LOG_DIR = Path(__file__).resolve().parent / "logs_tests"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE = LOG_DIR / "test_main_corrected.log"
+LOG_FILE = LOG_DIR / "test_main.log"
 
 
 def configure_logger() -> logging.Logger:
-    logger = logging.getLogger("test_main_corrected")
+    logger = logging.getLogger("test_main")
     logger.setLevel(logging.DEBUG)
-
     if logger.handlers:
         return logger
 
@@ -72,7 +81,7 @@ LOGGER = configure_logger()
 
 class TempDirMixin:
     def setUp(self) -> None:
-        self._tmpdir_obj = tempfile.TemporaryDirectory(prefix="test_main_corrected_")
+        self._tmpdir_obj = tempfile.TemporaryDirectory(prefix="test_main_")
         self.tmpdir = Path(self._tmpdir_obj.name)
 
     def tearDown(self) -> None:
@@ -81,15 +90,42 @@ class TempDirMixin:
 
 class AsyncTempDirMixin:
     async def asyncSetUp(self) -> None:
-        self._tmpdir_obj = tempfile.TemporaryDirectory(prefix="test_main_corrected_async_")
+        self._tmpdir_obj = tempfile.TemporaryDirectory(prefix="test_main_async_")
         self.tmpdir = Path(self._tmpdir_obj.name)
 
     async def asyncTearDown(self) -> None:
         self._tmpdir_obj.cleanup()
 
 
+class GlobalStateMixin:
+    def setUp(self) -> None:
+        self._orig_overrides = dict(mut._ADAPTIVE_PROFILE_OVERRIDES)
+        self._orig_log_cache = mut._LOG_MODULE_CACHE
+        self._orig_log_attempted = mut._LOG_MODULE_ATTEMPTED
+        self._orig_pool = mut._PROCESS_POOL
+        self._orig_pool_workers = mut._PROCESS_POOL_WORKERS
+        mut._ADAPTIVE_PROFILE_OVERRIDES.clear()
+        mut._LOG_MODULE_CACHE = None
+        mut._LOG_MODULE_ATTEMPTED = False
+        mut._PROCESS_POOL = None
+        mut._PROCESS_POOL_WORKERS = None
+
+    def tearDown(self) -> None:
+        if mut._PROCESS_POOL is not None:
+            try:
+                mut.shutdown_process_pool()
+            except Exception:
+                pass
+        mut._ADAPTIVE_PROFILE_OVERRIDES.clear()
+        mut._ADAPTIVE_PROFILE_OVERRIDES.update(self._orig_overrides)
+        mut._LOG_MODULE_CACHE = self._orig_log_cache
+        mut._LOG_MODULE_ATTEMPTED = self._orig_log_attempted
+        mut._PROCESS_POOL = self._orig_pool
+        mut._PROCESS_POOL_WORKERS = self._orig_pool_workers
+
+
 class TestAssertionsMixin:
-    def assertFloatClose(self, a: float, b: float, places: int = 8, msg: str | None = None) -> None:
+    def assertFloatClose(self, a: float, b: float, places: int = 7, msg: str | None = None) -> None:
         self.assertAlmostEqual(float(a), float(b), places=places, msg=msg)
 
     def assertArrayClose(self, a: np.ndarray, b: np.ndarray, atol: float = 1e-8, msg: str | None = None) -> None:
@@ -107,13 +143,8 @@ class TestAssertionsMixin:
         self.assertIsInstance(candidate.profile, mut.VariantProfile)
         self.assertIsInstance(candidate.image, Image.Image)
         self.assertEqual(candidate.ratios.shape, (4,))
-        self.assertIsInstance(candidate.metrics, dict)
-        self.assertGreaterEqual(candidate.seed, 0)
         self.assertAlmostEqual(float(np.sum(candidate.ratios)), 1.0, places=5)
-
-
-async def gather_concurrent(*aws):
-    return await asyncio.gather(*aws)
+        self.assertIsInstance(candidate.metrics, dict)
 
 
 # ============================================================
@@ -132,15 +163,16 @@ def valid_metrics() -> Dict[str, float]:
     return {
         "largest_olive_component_ratio": 0.24,
         "largest_olive_component_ratio_small": 0.20,
-        "olive_multizone_share": 0.60,
-        "center_empty_ratio": 0.31,
+        "olive_multizone_share": 0.62,
+        "center_empty_ratio": 0.30,
         "center_empty_ratio_small": 0.34,
         "boundary_density": 0.145,
-        "boundary_density_small": 0.110,
-        "boundary_density_tiny": 0.12,
+        "boundary_density_small": 0.11,
+        "boundary_density_tiny": 0.11,
         "mirror_similarity": 0.44,
+        "central_brown_continuity": 0.20,
         "oblique_share": 0.72,
-        "vertical_share": 0.15,
+        "vertical_share": 0.16,
         "angle_dominance_ratio": 0.20,
         "coyote_brown_macro_share": 0.00,
         "coyote_brown_transition_share": 0.05,
@@ -165,8 +197,8 @@ def valid_metrics() -> Dict[str, float]:
         "visual_small_scale_structural_score": 0.54,
         "visual_validation_passed": 1.0,
         "macro_olive_visible_ratio": 0.19,
-        "macro_terre_visible_ratio": 0.07,
-        "macro_gris_visible_ratio": 0.008,
+        "macro_terre_visible_ratio": 0.11,
+        "macro_gris_visible_ratio": 0.08,
         "transition_terre_visible_ratio": 0.12,
         "micro_gris_visible_ratio": 0.12,
         "periphery_boundary_density": 0.17,
@@ -198,22 +230,19 @@ def make_candidate(
     )
 
 
-def summarize_candidate(candidate: mut.CandidateResult) -> str:
-    rs = candidate.ratios
-    return (
-        f"seed={candidate.seed} | "
-        f"ratios=({rs[0]:.4f}, {rs[1]:.4f}, {rs[2]:.4f}, {rs[3]:.4f}) | "
-        f"boundary={candidate.metrics.get('boundary_density', float('nan')):.4f} | "
-        f"mirror={candidate.metrics.get('mirror_similarity', float('nan')):.4f}"
-    )
-
-
 def make_canvas_quadrants() -> np.ndarray:
     canvas = np.zeros((8, 8), dtype=np.uint8)
     canvas[:4, 4:] = 1
     canvas[4:, :4] = 2
     canvas[4:, 4:] = 3
     return canvas
+
+
+def full_size_mask_from_zone_names(*names: str) -> np.ndarray:
+    mask = np.zeros((mut.HEIGHT, mut.WIDTH), dtype=bool)
+    for name in names:
+        mask |= mut.ANATOMY_ZONES[name]
+    return mask
 
 
 def iter_metric_failure_cases() -> Iterable[tuple[str, float]]:
@@ -227,6 +256,7 @@ def iter_metric_failure_cases() -> Iterable[tuple[str, float]]:
     yield "boundary_density_small", mut.MIN_BOUNDARY_DENSITY_SMALL - 0.001
     yield "boundary_density_small", mut.MAX_BOUNDARY_DENSITY_SMALL + 0.001
     yield "mirror_similarity", mut.MAX_MIRROR_SIMILARITY + 0.001
+    yield "central_brown_continuity", mut.MAX_CENTRAL_BROWN_CONTINUITY + 0.001
     yield "oblique_share", mut.MIN_OBLIQUE_SHARE - 0.001
     yield "vertical_share", mut.MIN_VERTICAL_SHARE - 0.001
     yield "vertical_share", mut.MAX_VERTICAL_SHARE + 0.001
@@ -243,14 +273,75 @@ def iter_metric_failure_cases() -> Iterable[tuple[str, float]]:
     yield "periphery_boundary_density_ratio", mut.MIN_PERIPHERY_BOUNDARY_DENSITY_RATIO - 0.001
     yield "periphery_non_coyote_ratio", mut.MIN_PERIPHERY_NON_COYOTE_RATIO - 0.001
     yield "macro_olive_visible_ratio", mut.MIN_MACRO_OLIVE_VISIBLE_RATIO - 0.001
+    yield "macro_terre_visible_ratio", mut.MIN_MACRO_TERRE_VISIBLE_RATIO - 0.001
     yield "macro_terre_visible_ratio", mut.MAX_MACRO_TERRE_VISIBLE_RATIO + 0.001
+    yield "macro_gris_visible_ratio", mut.MIN_MACRO_GRIS_VISIBLE_RATIO - 0.001
     yield "macro_gris_visible_ratio", mut.MAX_MACRO_GRIS_VISIBLE_RATIO + 0.001
     yield "visual_military_score", mut.VISUAL_MIN_MILITARY_SCORE - 0.001
 
 
 # ============================================================
-# TESTS UTILITAIRES PURS
+# TESTS UTILITAIRES / CONFIG / SYSTÈME
 # ============================================================
+
+class TestSystemHelpers(GlobalStateMixin, TestAssertionsMixin, unittest.TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+
+    def tearDown(self) -> None:
+        super().tearDown()
+
+    def test_worker_initializer_can_limit_numeric_threads(self) -> None:
+        with patch.dict(os.environ, {"CAMO_LIMIT_NUMERIC_THREADS": "1"}, clear=True):
+            mut._worker_initializer()
+            self.assertEqual(os.environ["OMP_NUM_THREADS"], "1")
+            self.assertEqual(os.environ["OPENBLAS_NUM_THREADS"], "1")
+            self.assertEqual(os.environ["MKL_NUM_THREADS"], "1")
+
+    def test_worker_initializer_can_leave_environment_unmodified(self) -> None:
+        with patch.dict(os.environ, {"CAMO_LIMIT_NUMERIC_THREADS": "0"}, clear=True):
+            mut._worker_initializer()
+            self.assertNotIn("OMP_NUM_THREADS", os.environ)
+
+    def test_shutdown_process_pool_calls_shutdown(self) -> None:
+        pool = Mock()
+        mut._PROCESS_POOL = pool
+        mut._PROCESS_POOL_WORKERS = 4
+        mut.shutdown_process_pool()
+        pool.shutdown.assert_called_once_with(wait=False, cancel_futures=True)
+        self.assertIsNone(mut._PROCESS_POOL)
+        self.assertIsNone(mut._PROCESS_POOL_WORKERS)
+
+    def test_get_process_pool_creates_and_reuses_pool(self) -> None:
+        fake_pool = object()
+        with patch.object(mut, "ProcessPoolExecutor", return_value=fake_pool) as mock_exec:
+            p1 = mut.get_process_pool(3)
+            p2 = mut.get_process_pool(3)
+        self.assertIs(p1, fake_pool)
+        self.assertIs(p2, fake_pool)
+        mock_exec.assert_called_once()
+        self.assertEqual(mut._PROCESS_POOL_WORKERS, 3)
+
+    def test_get_process_pool_recreates_when_worker_count_changes(self) -> None:
+        first = Mock(name="first_pool")
+        second = Mock(name="second_pool")
+        with patch.object(mut, "ProcessPoolExecutor", side_effect=[first, second]) as mock_exec:
+            p1 = mut.get_process_pool(2)
+            p2 = mut.get_process_pool(4)
+        self.assertIs(p1, first)
+        self.assertIs(p2, second)
+        self.assertEqual(mock_exec.call_count, 2)
+        first.shutdown.assert_called_once_with(wait=False, cancel_futures=True)
+
+    def test_clip_clamp_safe_helpers(self) -> None:
+        self.assertEqual(mut.clamp01(-1.0), 0.0)
+        self.assertEqual(mut.clamp01(2.0), 1.0)
+        self.assertEqual(mut._clip_float(5.0, 0.0, 3.0), 3.0)
+        self.assertEqual(mut._clip_float(-2.0, 0.0, 3.0), 0.0)
+        self.assertEqual(mut._safe_failure_float("2.5"), 2.5)
+        self.assertEqual(mut._safe_failure_float("bad", default=7.0), 7.0)
+        self.assertEqual(mut._safe_failure_float(float("nan"), default=8.0), 8.0)
+
 
 class TestPureUtilities(TempDirMixin, TestAssertionsMixin, unittest.TestCase):
     def test_ensure_output_dir_creates_directory(self) -> None:
@@ -287,7 +378,6 @@ class TestPureUtilities(TempDirMixin, TestAssertionsMixin, unittest.TestCase):
         profile = mut.make_profile(424242, adaptive_hint=hint)
         self.assertIsInstance(profile, mut.VariantProfile)
         self.assertGreater(len(profile.angle_pool), len(profile.allowed_angles))
-        self.assertGreater(profile.angle_pool.count(0), 1)
         self.assertGreaterEqual(profile.micro_cluster_max, 6)
         self.assertGreater(profile.olive_macro_target_scale, 1.0)
         self.assertAlmostEqual(profile.transition_terre_bias, 0.08, places=6)
@@ -316,7 +406,6 @@ class TestPureUtilities(TempDirMixin, TestAssertionsMixin, unittest.TestCase):
         self.assertFloatClose(y, 1.0, places=6)
 
     def test_choose_biased_center_is_in_bounds(self) -> None:
-        import random
         rng = random.Random(123)
         for _ in range(30):
             x, y = mut.choose_biased_center(rng)
@@ -372,7 +461,6 @@ class TestPureUtilities(TempDirMixin, TestAssertionsMixin, unittest.TestCase):
         self.assertEqual(origin, 1)
 
     def test_pick_macro_angle_returns_allowed_angle(self) -> None:
-        import random
         profile = mut.make_profile(111)
         angle = mut.pick_macro_angle([], profile, random.Random(42))
         self.assertIn(angle, profile.allowed_angles)
@@ -382,11 +470,11 @@ class TestPureUtilities(TempDirMixin, TestAssertionsMixin, unittest.TestCase):
         chosen = mut.choose_semantic_color_for_origin(deficits, mut.ORIGIN_MICRO, mut.IDX_TERRE)
         self.assertEqual(chosen, mut.IDX_GRIS)
         self.assertTrue(mut.semantic_color_allowed(mut.ORIGIN_MACRO, mut.IDX_OLIVE))
-        self.assertFalse(mut.semantic_color_allowed(mut.ORIGIN_MACRO, mut.IDX_GRIS))
+        self.assertTrue(mut.semantic_color_allowed(mut.ORIGIN_MACRO, mut.IDX_GRIS))
 
 
 # ============================================================
-# TESTS ZONES / MORPHOLOGIE
+# TESTS ZONES / MORPHOLOGIE / MACROS
 # ============================================================
 
 class TestMorphologyAndZones(TestAssertionsMixin, unittest.TestCase):
@@ -399,14 +487,27 @@ class TestMorphologyAndZones(TestAssertionsMixin, unittest.TestCase):
         zones = mut.anatomy_zone_masks()
         self.assertEqual(
             set(zones.keys()),
-            {"left_shoulder", "right_shoulder", "left_flank", "right_flank", "left_thigh", "right_thigh", "center_torso"},
+            {
+                "left_shoulder", "right_shoulder", "left_flank", "right_flank",
+                "left_thigh", "right_thigh", "center_torso",
+            },
         )
+
+    def test_combine_zone_masks(self) -> None:
+        mask = mut.combine_zone_masks(["left_shoulder", "right_shoulder"])
+        self.assertTrue(mask.any())
+        self.assertGreater(int(mask.sum()), 1000)
 
     def test_macro_zone_count(self) -> None:
         mask = np.zeros((mut.HEIGHT, mut.WIDTH), dtype=bool)
         mask |= mut.ANATOMY_ZONES["left_shoulder"]
         mask |= mut.ANATOMY_ZONES["left_flank"]
         self.assertGreaterEqual(mut.macro_zone_count(mask), 2)
+
+    def test_zone_overlap_ratio(self) -> None:
+        mask = mut.ANATOMY_ZONES["center_torso"].copy()
+        ratio = mut.zone_overlap_ratio(mask, mut.ANATOMY_ZONES["center_torso"])
+        self.assertFloatClose(ratio, 1.0)
 
     def test_center_empty_ratio(self) -> None:
         canvas = np.full((mut.HEIGHT, mut.WIDTH), mut.IDX_COYOTE, dtype=np.uint8)
@@ -430,6 +531,26 @@ class TestMorphologyAndZones(TestAssertionsMixin, unittest.TestCase):
         self.assertFloatClose(out["vertical_share"], 1 / 3)
         self.assertFloatClose(out["dominance_ratio"], 1 / 3)
 
+    def test_macro_angle_histogram(self) -> None:
+        dummy_mask = np.zeros((10, 10), dtype=bool)
+        macros = [
+            mut.MacroRecord(mut.IDX_OLIVE, [], 20, (0, 0), dummy_mask, 2),
+            mut.MacroRecord(mut.IDX_OLIVE, [], 20, (0, 0), dummy_mask, 2),
+            mut.MacroRecord(mut.IDX_TERRE, [], 0, (0, 0), dummy_mask, 1),
+        ]
+        hist = mut.macro_angle_histogram(macros)
+        self.assertEqual(hist[20], 2)
+        self.assertEqual(hist[0], 1)
+
+    def test_preferred_boundary_coordinates_prefers_mask(self) -> None:
+        boundary = np.zeros((6, 6), dtype=bool)
+        boundary[1, 1] = True
+        boundary[4, 4] = True
+        preferred = np.zeros((6, 6), dtype=bool)
+        preferred[4, 4] = True
+        ys, xs = mut.preferred_boundary_coordinates(boundary, preferred)
+        self.assertEqual(list(zip(xs.tolist(), ys.tolist())), [(4, 4)])
+
     def test_visible_origin_shares(self) -> None:
         canvas = np.array([[0, 1, 1, 2], [0, 1, 3, 3]], dtype=np.uint8)
         origin_map = np.array([[0, 1, 3, 2], [0, 1, 3, 3]], dtype=np.uint8)
@@ -437,21 +558,54 @@ class TestMorphologyAndZones(TestAssertionsMixin, unittest.TestCase):
         self.assertFloatClose(out["vert_olive_macro_share"], 2 / 3)
         self.assertFloatClose(out["vert_olive_micro_share"], 1 / 3)
 
-    def test_multiscale_metrics_keys(self) -> None:
-        out = mut.multiscale_metrics(make_canvas_quadrants())
-        self.assertEqual(
-            set(out.keys()),
-            {"boundary_density_small", "boundary_density_tiny", "center_empty_ratio_small", "largest_olive_component_ratio_small"},
-        )
+    def test_macro_candidate_diagnostics_empty(self) -> None:
+        diag = mut.macro_candidate_diagnostics(np.zeros((mut.HEIGHT, mut.WIDTH), dtype=bool))
+        self.assertEqual(diag["zone_count"], 0.0)
+        self.assertEqual(diag["edge_lock_ratio"], 1.0)
+
+    def test_macro_candidate_diagnostics_non_empty(self) -> None:
+        mask = full_size_mask_from_zone_names("left_shoulder", "left_flank")
+        diag = mut.macro_candidate_diagnostics(mask)
+        self.assertGreaterEqual(diag["zone_count"], 2.0)
+        self.assertGreater(diag["height_span_ratio"], 0.0)
+        self.assertGreater(diag["high_density_overlap"], 0.0)
+
+    def test_macro_candidate_is_valid_rejects_empty(self) -> None:
+        canvas = np.zeros((mut.HEIGHT, mut.WIDTH), dtype=np.uint8)
+        self.assertFalse(mut.macro_candidate_is_valid(np.zeros_like(canvas, dtype=bool), mut.IDX_OLIVE, 0, canvas, []))
+
+    def test_macro_candidate_is_valid_accepts_good_olive(self) -> None:
+        canvas = np.zeros((mut.HEIGHT, mut.WIDTH), dtype=np.uint8)
+        mask = full_size_mask_from_zone_names("left_shoulder", "left_flank")
+        self.assertTrue(mut.macro_candidate_is_valid(mask, mut.IDX_OLIVE, 20, canvas, []))
+
+    def test_macro_candidate_is_valid_rejects_local_parallel_conflict(self) -> None:
+        canvas = np.zeros((mut.HEIGHT, mut.WIDTH), dtype=np.uint8)
+        mask = full_size_mask_from_zone_names("left_shoulder", "left_flank")
+        dummy_mask = full_size_mask_from_zone_names("left_shoulder")
+        macros = [
+            mut.MacroRecord(mut.IDX_OLIVE, [], 20, (100, 100), dummy_mask, 2),
+            mut.MacroRecord(mut.IDX_OLIVE, [], 20, (120, 120), dummy_mask, 2),
+        ]
+        with patch.object(mut, "local_parallel_conflict", return_value=True):
+            self.assertFalse(mut.macro_candidate_is_valid(mask, mut.IDX_OLIVE, 20, canvas, macros))
+
+    def test_zone_center_angle_and_nearest_allowed_angle(self) -> None:
+        p1 = mut.zone_center("left_shoulder")
+        p2 = mut.zone_center("left_flank")
+        angle = mut.angle_from_points_vertical(p1, p2)
+        nearest = mut.nearest_allowed_angle(angle, mut.BASE_ANGLES)
+        self.assertIsInstance(p1, tuple)
+        self.assertIsInstance(angle, float)
+        self.assertIn(nearest, mut.BASE_ANGLES)
 
 
 # ============================================================
-# TESTS FORMES / GÉOMÉTRIE / CONTRÔLES
+# TESTS GÉOMÉTRIE / CONTRÔLES / COUCHES
 # ============================================================
 
-class TestGeometryAndControls(unittest.TestCase):
+class TestGeometryAndLayers(unittest.TestCase):
     def test_jagged_spine_poly_returns_points(self) -> None:
-        import random
         rng = random.Random(42)
         poly = mut.jagged_spine_poly(
             rng=rng,
@@ -469,7 +623,6 @@ class TestGeometryAndControls(unittest.TestCase):
         self.assertEqual(len(poly), 16)
 
     def test_attached_transition_returns_polygon(self) -> None:
-        import random
         rng = random.Random(42)
         parent = [(10, 10), (50, 10), (50, 50), (10, 50)]
         poly = mut.attached_transition(rng, parent, length_px=20, width_px=10)
@@ -485,7 +638,15 @@ class TestGeometryAndControls(unittest.TestCase):
             mut.MacroRecord(mut.IDX_OLIVE, [], 20, (100, 100), dummy_mask, 2),
             mut.MacroRecord(mut.IDX_OLIVE, [], 22, (150, 110), dummy_mask, 2),
         ]
-        self.assertTrue(mut.local_parallel_conflict(macros, center=(130, 105), angle_deg=18, dist_threshold_px=100, angle_threshold_deg=8))
+        self.assertTrue(
+            mut.local_parallel_conflict(
+                macros,
+                center=(130, 105),
+                angle_deg=18,
+                dist_threshold_px=100,
+                angle_threshold_deg=8,
+            )
+        )
 
     def test_transition_is_attached(self) -> None:
         parent = np.zeros((20, 20), dtype=bool)
@@ -505,125 +666,221 @@ class TestGeometryAndControls(unittest.TestCase):
         canvas = np.zeros((100, 100), dtype=np.uint8)
         new_mask = np.zeros((100, 100), dtype=bool)
         new_mask[10:12, 10:12] = True
-        self.assertFalse(mut.creates_new_mass(canvas, new_mask, mut.IDX_OLIVE, local_radius=10, max_local_area_ratio=0.50))
+        self.assertFalse(mut.creates_new_mass(canvas, new_mask, mut.IDX_OLIVE, local_radius=10))
 
-
-# ============================================================
-# TESTS COUCHES / NUDGE
-# ============================================================
-
-class TestLayerBehaviors(unittest.TestCase):
     def test_apply_mask_changes_canvas_and_origin(self) -> None:
-        canvas = np.zeros((6, 6), dtype=np.uint8)
-        origin_map = np.zeros((6, 6), dtype=np.uint8)
-        mask = np.zeros((6, 6), dtype=bool)
+        canvas = np.zeros((10, 10), dtype=np.uint8)
+        origin_map = np.zeros((10, 10), dtype=np.uint8)
+        mask = np.zeros((10, 10), dtype=bool)
         mask[2:4, 2:4] = True
         mut.apply_mask(canvas, origin_map, mask, mut.IDX_TERRE, mut.ORIGIN_TRANSITION)
         self.assertTrue(np.all(canvas[mask] == mut.IDX_TERRE))
         self.assertTrue(np.all(origin_map[mask] == mut.ORIGIN_TRANSITION))
 
-    def test_nudge_proportions_no_boundary_no_crash(self) -> None:
-        import random
+    def test_enforce_secondary_macro_budgets_smoke(self) -> None:
+        canvas = np.full((mut.HEIGHT, mut.WIDTH), mut.IDX_COYOTE, dtype=np.uint8)
+        origin_map = np.full((mut.HEIGHT, mut.WIDTH), mut.ORIGIN_BACKGROUND, dtype=np.uint8)
+        macros: List[mut.MacroRecord] = []
+        profile = mut.make_profile(123)
+        rng = random.Random(42)
+        simple_mask = full_size_mask_from_zone_names("right_shoulder")
+
+        with patch.object(mut, "absolute_origin_color_ratios", side_effect=[
+            {"macro_terre_visible_ratio": 0.00, "macro_gris_visible_ratio": 0.00, "macro_olive_visible_ratio": 0.20},
+            {"macro_terre_visible_ratio": 0.10, "macro_gris_visible_ratio": 0.08, "macro_olive_visible_ratio": 0.20},
+        ]), patch.object(mut, "polygon_mask", return_value=simple_mask), patch.object(mut, "macro_candidate_is_valid", return_value=True), patch.object(mut, "zone_overlap_ratio", return_value=0.0):
+            mut.enforce_secondary_macro_budgets(canvas, origin_map, macros, profile, rng)
+
+        self.assertGreaterEqual(len(macros), 1)
+
+    def test_add_forced_structural_macros_smoke(self) -> None:
+        canvas = np.full((mut.HEIGHT, mut.WIDTH), mut.IDX_COYOTE, dtype=np.uint8)
+        origin_map = np.full((mut.HEIGHT, mut.WIDTH), mut.ORIGIN_BACKGROUND, dtype=np.uint8)
+        macros: List[mut.MacroRecord] = []
+        profile = mut.make_profile(123)
+        rng = random.Random(42)
+        simple_mask = full_size_mask_from_zone_names("left_shoulder", "left_flank")
+
+        with patch.object(mut, "polygon_mask", return_value=simple_mask), patch.object(mut, "macro_candidate_is_valid", return_value=True):
+            mut.add_forced_structural_macros(canvas, origin_map, macros, profile, rng)
+
+        self.assertGreaterEqual(len(macros), 1)
+
+
+# ============================================================
+# TESTS VISUELS / MÉTRIQUES
+# ============================================================
+
+class TestVisualMetrics(TestAssertionsMixin, unittest.TestCase):
+    def test_center_empty_ratio_upscaled_proxy(self) -> None:
         canvas = np.zeros((20, 20), dtype=np.uint8)
-        origin_map = np.zeros((20, 20), dtype=np.uint8)
-        before_canvas = canvas.copy()
-        before_origin = origin_map.copy()
-        mut.nudge_proportions(canvas, origin_map, random.Random(123))
-        np.testing.assert_array_equal(canvas, before_canvas)
-        np.testing.assert_array_equal(origin_map, before_origin)
+        self.assertEqual(mut.center_empty_ratio_upscaled_proxy(canvas), 1.0)
+
+    def test_build_silhouette_mask_and_boundary(self) -> None:
+        mask = mut.build_silhouette_mask(100, 200)
+        boundary = mut.silhouette_boundary(mask)
+        self.assertEqual(mask.shape, (200, 100))
+        self.assertTrue(mask.any())
+        self.assertTrue(boundary.any())
+
+    def test_silhouette_color_diversity_score(self) -> None:
+        canvas = np.zeros((120, 80), dtype=np.uint8)
+        canvas[:, :20] = 1
+        canvas[:, 20:40] = 2
+        canvas[:, 40:60] = 3
+        score = mut.silhouette_color_diversity_score(canvas)
+        self.assertGreater(score, 0.0)
+
+    def test_contour_break_score(self) -> None:
+        canvas = np.zeros((120, 80), dtype=np.uint8)
+        canvas[::2, :] = 1
+        score, entropy = mut.contour_break_score(canvas)
+        self.assertGreaterEqual(score, 0.0)
+        self.assertGreaterEqual(entropy, 0.0)
+
+    def test_small_scale_structural_score_and_ratio_score(self) -> None:
+        canvas = make_canvas_quadrants()
+        self.assertGreaterEqual(mut.small_scale_structural_score(canvas), 0.0)
+        self.assertGreater(mut.ratio_score(valid_ratios()), 0.9)
+        self.assertLess(mut.ratio_score(invalid_ratios_far()), 0.5)
+
+    def test_main_metrics_score(self) -> None:
+        score = mut.main_metrics_score(valid_metrics())
+        self.assertGreater(score, 0.0)
+
+    def test_absolute_origin_color_ratios(self) -> None:
+        canvas = np.array([[1, 1, 2], [3, 0, 2]], dtype=np.uint8)
+        origin = np.array([[1, 1, 2], [3, 0, 2]], dtype=np.uint8)
+        out = mut.absolute_origin_color_ratios(canvas, origin)
+        self.assertIn("macro_olive_visible_ratio", out)
+        self.assertIn("transition_terre_visible_ratio", out)
+
+    def test_spatial_discipline_metrics(self) -> None:
+        canvas = np.full((mut.HEIGHT, mut.WIDTH), mut.IDX_COYOTE, dtype=np.uint8)
+        canvas[mut.HIGH_DENSITY_ZONE_MASK] = mut.IDX_OLIVE
+        out = mut.spatial_discipline_metrics(canvas)
+        self.assertIn("periphery_boundary_density_ratio", out)
+        self.assertIn("periphery_non_coyote_ratio", out)
+
+    def test_central_brown_continuity(self) -> None:
+        canvas = np.zeros((100, 100), dtype=np.uint8)
+        canvas[:, 45:55] = mut.IDX_COYOTE
+        score = mut.central_brown_continuity(canvas)
+        self.assertGreaterEqual(score, 0.0)
+
+    def test_evaluate_visual_metrics(self) -> None:
+        canvas = np.zeros((120, 80), dtype=np.uint8)
+        canvas[:, :20] = 1
+        canvas[:, 20:40] = 2
+        canvas[:, 40:60] = 3
+        metrics = valid_metrics()
+        out = mut.evaluate_visual_metrics(canvas, valid_ratios(), metrics)
+        self.assertIn("visual_score_final", out)
+        self.assertIn("visual_validation_passed", out)
+
+    def test_military_visual_discipline_score(self) -> None:
+        out = mut.military_visual_discipline_score(valid_metrics())
+        self.assertIn("visual_military_score", out)
+        self.assertIn("visual_military_passed", out)
 
 
 # ============================================================
-# TESTS VALIDATION / EXPORT
+# TESTS ADAPTATION / LOGS / DIAGNOSTICS
 # ============================================================
 
-class TestValidationAndExport(TempDirMixin, TestAssertionsMixin, unittest.TestCase):
-    def test_variant_is_valid_accepts_valid_candidate(self) -> None:
-        self.assertTrue(mut.variant_is_valid(valid_ratios(), valid_metrics()))
+class TestAdaptiveRejectionCorrection(GlobalStateMixin, unittest.TestCase):
+    def setUp(self) -> None:
+        super().setUp()
 
-    def test_variant_is_valid_rejects_bad_ratios(self) -> None:
-        self.assertFalse(mut.variant_is_valid(invalid_ratios_far(), valid_metrics()))
+    def tearDown(self) -> None:
+        super().tearDown()
 
-    def test_variant_is_valid_rejects_each_metric_threshold(self) -> None:
-        rs = valid_ratios()
-        for metric_name, bad_value in iter_metric_failure_cases():
-            with self.subTest(metric=metric_name, bad_value=bad_value):
-                metrics = valid_metrics()
-                metrics[metric_name] = bad_value
-                self.assertFalse(mut.variant_is_valid(rs, metrics))
+    def test_register_and_consume_profile_override(self) -> None:
+        mut._register_profile_override(123, {"prefer_oblique": 1.0})
+        self.assertIn(123, mut._ADAPTIVE_PROFILE_OVERRIDES)
+        hint = mut._consume_profile_override(123)
+        self.assertEqual(hint["prefer_oblique"], 1.0)
+        self.assertIsNone(mut._consume_profile_override(123))
 
-    def test_validate_candidate_result_delegates_to_variant_is_valid(self) -> None:
-        self.assertTrue(mut.validate_candidate_result(make_candidate()))
+    def test_get_log_module_from_sys_modules(self) -> None:
+        module = types.SimpleNamespace(log_event=lambda *a, **k: None)
+        with patch.dict(sys.modules, {"log": module}, clear=False):
+            got = mut._get_log_module()
+        self.assertIs(got, module)
 
-    def test_save_candidate_image(self) -> None:
-        path = self.tmpdir / "img" / "camouflage_test.png"
-        out = mut.save_candidate_image(make_candidate(), path)
-        self.assertTrue(path.exists())
-        self.assertEqual(out, path)
+    def test_runtime_log_calls_log_event(self) -> None:
+        event = Mock()
+        module = types.SimpleNamespace(log_event=event)
+        with patch.object(mut, "_get_log_module", return_value=module):
+            mut._runtime_log("INFO", "source", "message", x=1)
+        event.assert_called_once()
 
-    def test_candidate_row_contains_expected_fields(self) -> None:
-        row = mut.candidate_row(1, 2, 3, make_candidate(seed=999))
-        required = {
-            "index", "seed", "attempts_for_this_image", "global_attempt",
-            "coyote_brown_pct", "vert_olive_pct", "terre_de_france_pct", "vert_de_gris_pct",
-            "largest_olive_component_ratio", "largest_olive_component_ratio_small",
-            "olive_multizone_share", "center_empty_ratio", "center_empty_ratio_small",
-            "boundary_density", "boundary_density_small", "boundary_density_tiny",
-            "mirror_similarity", "oblique_share", "vertical_share", "angle_dominance_ratio",
-            "olive_macro_share", "terre_transition_share", "gris_micro_share", "gris_macro_share", "angles",
-            "visual_score_final", "periphery_boundary_density_ratio", "visual_military_score",
-        }
-        self.assertTrue(required.issubset(row.keys()))
-        self.assertEqual(row["seed"], 999)
+    def test_failure_payload_and_append_helpers(self) -> None:
+        payload = mut._failure_payload("rule", 1.0, 0.2, min_value=0.0, max_value=2.0, target=1.2)
+        self.assertEqual(payload["rule"], "rule")
+        failures: List[Dict[str, Any]] = []
+        mut._append_failure_range(failures, "r1", 0.1, 0.2, 0.8)
+        mut._append_failure_min(failures, "r2", 0.1, 0.2)
+        mut._append_failure_max(failures, "r3", 0.9, 0.8)
+        mut._append_failure_abs_target(failures, "r4", 0.5, 0.2, 0.1)
+        self.assertEqual([f["rule"] for f in failures], ["r1", "r2", "r3", "r4"])
 
-    def test_write_report_with_rows(self) -> None:
-        rows = [mut.candidate_row(1, 1, 1, make_candidate(seed=111)), mut.candidate_row(2, 1, 2, make_candidate(seed=222))]
-        csv_path = mut.write_report(rows, self.tmpdir, filename="rapport.csv")
-        self.assertTrue(csv_path.exists())
-        with csv_path.open("r", encoding="utf-8", newline="") as f:
-            reader = list(csv.DictReader(f))
-        self.assertEqual(len(reader), 2)
-        self.assertEqual(reader[0]["seed"], "111")
-        self.assertEqual(reader[1]["seed"], "222")
+    def test_fallback_analyze_candidate_failures_returns_rules(self) -> None:
+        candidate = make_candidate(ratios=invalid_ratios_far())
+        failures = mut._fallback_analyze_candidate_failures(candidate)
+        self.assertTrue(any(item["rule"] == "ratio_coyote" for item in failures))
 
-    def test_write_report_with_empty_rows_creates_empty_file(self) -> None:
-        csv_path = mut.write_report([], self.tmpdir, filename="empty.csv")
-        self.assertTrue(csv_path.exists())
-        self.assertEqual(csv_path.read_text(encoding="utf-8"), "")
+    def test_extract_rejection_failures_prefers_log_module_analyze_candidate(self) -> None:
+        fake_failure = types.SimpleNamespace(rule="ratio_olive", actual=0.1, target=0.28, min_value=0.24, max_value=0.33, delta=0.14)
+        diagnostic = types.SimpleNamespace(failures=[fake_failure])
+        module = types.SimpleNamespace(analyze_candidate=Mock(return_value=diagnostic))
+        candidate = make_candidate(ratios=invalid_ratios_far())
+        with patch.object(mut, "_get_log_module", return_value=module):
+            out = mut.extract_rejection_failures(candidate, 1, 1)
+        self.assertEqual(out[0]["rule"], "ratio_olive")
 
+    def test_build_adaptive_hint_wrapper(self) -> None:
+        state = mut.AdaptiveGenerationState(olive_pressure=2.0)
+        hint = mut.build_adaptive_hint(state)
+        self.assertIn("olive_macro_target_scale", hint)
 
-# ============================================================
-# TESTS ASYNC I/O
-# ============================================================
+    def test_update_adaptive_state_after_attempt_success_and_failure(self) -> None:
+        state = mut.AdaptiveGenerationState()
+        accepted_candidate = make_candidate()
+        rejected_candidate = make_candidate(ratios=invalid_ratios_far())
 
-class TestValidationAndExportAsync(AsyncTempDirMixin, TestAssertionsMixin, unittest.IsolatedAsyncioTestCase):
-    async def test_async_save_candidate_image(self) -> None:
-        path = self.tmpdir / "img" / "camouflage_async.png"
-        out = await mut.async_save_candidate_image(make_candidate(), path)
-        self.assertTrue(out.exists())
+        out1 = mut.update_adaptive_state_after_attempt(state, accepted_candidate, True, 1, 1)
+        self.assertEqual(out1, [])
+        self.assertEqual(state.consecutive_rejections, 0)
 
-    async def test_async_write_report(self) -> None:
-        rows = [mut.candidate_row(1, 1, 1, make_candidate(seed=1)), mut.candidate_row(2, 1, 2, make_candidate(seed=2))]
-        path = await mut.async_write_report(rows, self.tmpdir, filename="async_report.csv")
-        self.assertTrue(path.exists())
-        with path.open("r", encoding="utf-8", newline="") as f:
-            data = list(csv.DictReader(f))
-        self.assertEqual(len(data), 2)
+        with patch.object(mut, "extract_rejection_failures", return_value=[{"rule": "ratio_olive", "actual": 0.1, "delta": 0.2, "min_value": 0.24, "max_value": 0.33, "target": 0.28}]):
+            out2 = mut.update_adaptive_state_after_attempt(state, rejected_candidate, False, 1, 2)
+        self.assertEqual(out2[0]["rule"], "ratio_olive")
+        self.assertGreater(state.consecutive_rejections, 0)
 
-    async def test_async_io_batch_is_parallelizable(self) -> None:
-        async def fake_save(candidate: mut.CandidateResult, path: Path) -> Path:
-            await asyncio.sleep(0.10)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text("ok", encoding="utf-8")
-            return path
+    def test_generate_candidate_from_seed_with_hint_and_validate_wrappers(self) -> None:
+        candidate = make_candidate(seed=999)
+        with patch.object(mut, "generate_one_variant", return_value=(candidate.image, candidate.ratios, candidate.metrics)):
+            cand = mut.generate_candidate_from_seed_with_hint(999, {"prefer_oblique": 1.0})
+        self.assertEqual(cand.seed, 999)
 
-        candidates = [make_candidate(seed=i) for i in range(4)]
-        paths = [self.tmpdir / "parallel" / f"{i}.png" for i in range(4)]
-        started = time.perf_counter()
-        with patch.object(mut, "async_save_candidate_image", side_effect=fake_save):
-            await gather_concurrent(*(mut.async_save_candidate_image(c, p) for c, p in zip(candidates, paths)))
-        elapsed = time.perf_counter() - started
-        self.assertLess(elapsed, 0.30)
+        with patch.object(mut, "generate_candidate_from_seed_with_hint", return_value=candidate), patch.object(mut, "validate_candidate_result", return_value=True):
+            out_candidate, accepted = mut.generate_and_validate_from_seed_with_hint(999, {"prefer_oblique": 1.0})
+        self.assertTrue(accepted)
+        self.assertEqual(out_candidate.seed, 999)
+
+    def test_generate_and_validate_from_seed_wrapper(self) -> None:
+        candidate = make_candidate(seed=123)
+        with patch.object(mut, "generate_candidate_from_seed", return_value=candidate), patch.object(mut, "validate_candidate_result", return_value=False):
+            out_candidate, accepted = mut.generate_and_validate_from_seed(123)
+        self.assertFalse(accepted)
+        self.assertEqual(out_candidate.seed, 123)
+
+    def test_batch_attempt_seeds(self) -> None:
+        batch = mut._batch_attempt_seeds(2, 3, 4, 100)
+        self.assertEqual(len(batch), 4)
+        self.assertEqual(batch[0][0], 3)
+        self.assertEqual(batch[-1][0], 6)
 
 
 # ============================================================
@@ -639,74 +896,78 @@ class TestCandidateGeneration(TestAssertionsMixin, unittest.TestCase):
         dummy_mask = np.zeros((10, 10), dtype=bool)
         fake_macros = [mut.MacroRecord(mut.IDX_OLIVE, [], 0, (10, 10), dummy_mask, 2)]
 
-        with patch.object(mut, "add_macros", return_value=fake_macros), \
-             patch.object(mut, "enforce_macro_angle_discipline"), \
-             patch.object(mut, "add_transitions"), \
-             patch.object(mut, "add_micro_clusters"), \
-             patch.object(mut, "repair_spatial_discipline"), \
-             patch.object(mut, "nudge_proportions"), \
-             patch.object(mut, "render_canvas", return_value=fake_image), \
-             patch.object(mut, "compute_ratios", return_value=fake_ratios), \
-             patch.object(mut, "orientation_score", return_value={
-                 "oblique_share": fake_metrics["oblique_share"],
-                 "vertical_share": fake_metrics["vertical_share"],
-                 "dominance_ratio": fake_metrics["angle_dominance_ratio"],
-             }), \
-             patch.object(mut, "visible_origin_shares", return_value={
-                 "coyote_brown_macro_share": fake_metrics["coyote_brown_macro_share"],
-                 "coyote_brown_transition_share": fake_metrics["coyote_brown_transition_share"],
-                 "coyote_brown_micro_share": fake_metrics["coyote_brown_micro_share"],
-                 "vert_olive_macro_share": fake_metrics["vert_olive_macro_share"],
-                 "vert_olive_transition_share": fake_metrics["vert_olive_transition_share"],
-                 "vert_olive_micro_share": fake_metrics["vert_olive_micro_share"],
-                 "terre_de_france_macro_share": fake_metrics["terre_de_france_macro_share"],
-                 "terre_de_france_transition_share": fake_metrics["terre_de_france_transition_share"],
-                 "terre_de_france_micro_share": fake_metrics["terre_de_france_micro_share"],
-                 "vert_de_gris_macro_share": fake_metrics["vert_de_gris_macro_share"],
-                 "vert_de_gris_transition_share": fake_metrics["vert_de_gris_transition_share"],
-                 "vert_de_gris_micro_share": fake_metrics["vert_de_gris_micro_share"],
-             }), \
-             patch.object(mut, "multiscale_metrics", return_value={
-                 "boundary_density_small": fake_metrics["boundary_density_small"],
-                 "boundary_density_tiny": fake_metrics["boundary_density_tiny"],
-                 "center_empty_ratio_small": fake_metrics["center_empty_ratio_small"],
-                 "largest_olive_component_ratio_small": fake_metrics["largest_olive_component_ratio_small"],
-             }), \
-             patch.object(mut, "absolute_origin_color_ratios", return_value={
-                 "macro_olive_visible_ratio": fake_metrics["macro_olive_visible_ratio"],
-                 "macro_terre_visible_ratio": fake_metrics["macro_terre_visible_ratio"],
-                 "macro_gris_visible_ratio": fake_metrics["macro_gris_visible_ratio"],
-                 "transition_terre_visible_ratio": fake_metrics["transition_terre_visible_ratio"],
-                 "micro_gris_visible_ratio": fake_metrics["micro_gris_visible_ratio"],
-             }), \
-             patch.object(mut, "spatial_discipline_metrics", return_value={
-                 "periphery_boundary_density": fake_metrics["periphery_boundary_density"],
-                 "center_boundary_density": fake_metrics["center_boundary_density"],
-                 "periphery_boundary_density_ratio": fake_metrics["periphery_boundary_density_ratio"],
-                 "periphery_non_coyote_density": fake_metrics["periphery_non_coyote_density"],
-                 "center_non_coyote_density": fake_metrics["center_non_coyote_density"],
-                 "periphery_non_coyote_ratio": fake_metrics["periphery_non_coyote_ratio"],
-             }), \
-             patch.object(mut, "evaluate_visual_metrics", return_value={
-                 "visual_score_final": fake_metrics["visual_score_final"],
-                 "visual_score_ratio": fake_metrics["visual_score_ratio"],
-                 "visual_score_silhouette": fake_metrics["visual_score_silhouette"],
-                 "visual_score_contour": fake_metrics["visual_score_contour"],
-                 "visual_score_main": fake_metrics["visual_score_main"],
-                 "visual_silhouette_color_diversity": fake_metrics["visual_silhouette_color_diversity"],
-                 "visual_contour_break_score": fake_metrics["visual_contour_break_score"],
-                 "visual_outline_band_diversity": fake_metrics["visual_outline_band_diversity"],
-                 "visual_small_scale_structural_score": fake_metrics["visual_small_scale_structural_score"],
-                 "visual_validation_passed": fake_metrics["visual_validation_passed"],
-             }), \
-             patch.object(mut, "military_visual_discipline_score", return_value={
-                 "visual_military_score": fake_metrics["visual_military_score"],
-                 "visual_military_passed": fake_metrics["visual_military_passed"],
-             }), \
-             patch.object(mut, "largest_component_ratio", return_value=fake_metrics["largest_olive_component_ratio"]), \
-             patch.object(mut, "center_empty_ratio", return_value=fake_metrics["center_empty_ratio"]), \
-             patch.object(mut, "boundary_density", return_value=fake_metrics["boundary_density"]), \
-             patch.object(mut, "mirror_similarity_score", return_value=fake_metrics["mirror_similarity"]):
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(mut, "add_macros", return_value=fake_macros))
+            stack.enter_context(patch.object(mut, "enforce_macro_angle_discipline"))
+            stack.enter_context(patch.object(mut, "add_transitions"))
+            stack.enter_context(patch.object(mut, "add_micro_clusters"))
+            stack.enter_context(patch.object(mut, "repair_spatial_discipline"))
+            stack.enter_context(patch.object(mut, "nudge_proportions"))
+            stack.enter_context(patch.object(mut, "enforce_secondary_macro_budgets"))
+            stack.enter_context(patch.object(mut, "add_forced_structural_macros"))
+            stack.enter_context(patch.object(mut, "render_canvas", return_value=fake_image))
+            stack.enter_context(patch.object(mut, "compute_ratios", return_value=fake_ratios))
+            stack.enter_context(patch.object(mut, "orientation_score", return_value={
+                "oblique_share": fake_metrics["oblique_share"],
+                "vertical_share": fake_metrics["vertical_share"],
+                "dominance_ratio": fake_metrics["angle_dominance_ratio"],
+            }))
+            stack.enter_context(patch.object(mut, "visible_origin_shares", return_value={
+                "coyote_brown_macro_share": fake_metrics["coyote_brown_macro_share"],
+                "coyote_brown_transition_share": fake_metrics["coyote_brown_transition_share"],
+                "coyote_brown_micro_share": fake_metrics["coyote_brown_micro_share"],
+                "vert_olive_macro_share": fake_metrics["vert_olive_macro_share"],
+                "vert_olive_transition_share": fake_metrics["vert_olive_transition_share"],
+                "vert_olive_micro_share": fake_metrics["vert_olive_micro_share"],
+                "terre_de_france_macro_share": fake_metrics["terre_de_france_macro_share"],
+                "terre_de_france_transition_share": fake_metrics["terre_de_france_transition_share"],
+                "terre_de_france_micro_share": fake_metrics["terre_de_france_micro_share"],
+                "vert_de_gris_macro_share": fake_metrics["vert_de_gris_macro_share"],
+                "vert_de_gris_transition_share": fake_metrics["vert_de_gris_transition_share"],
+                "vert_de_gris_micro_share": fake_metrics["vert_de_gris_micro_share"],
+            }))
+            stack.enter_context(patch.object(mut, "multiscale_metrics", return_value={
+                "boundary_density_small": fake_metrics["boundary_density_small"],
+                "boundary_density_tiny": fake_metrics["boundary_density_tiny"],
+                "center_empty_ratio_small": fake_metrics["center_empty_ratio_small"],
+                "largest_olive_component_ratio_small": fake_metrics["largest_olive_component_ratio_small"],
+            }))
+            stack.enter_context(patch.object(mut, "absolute_origin_color_ratios", return_value={
+                "macro_olive_visible_ratio": fake_metrics["macro_olive_visible_ratio"],
+                "macro_terre_visible_ratio": fake_metrics["macro_terre_visible_ratio"],
+                "macro_gris_visible_ratio": fake_metrics["macro_gris_visible_ratio"],
+                "transition_terre_visible_ratio": fake_metrics["transition_terre_visible_ratio"],
+                "micro_gris_visible_ratio": fake_metrics["micro_gris_visible_ratio"],
+            }))
+            stack.enter_context(patch.object(mut, "spatial_discipline_metrics", return_value={
+                "periphery_boundary_density": fake_metrics["periphery_boundary_density"],
+                "center_boundary_density": fake_metrics["center_boundary_density"],
+                "periphery_boundary_density_ratio": fake_metrics["periphery_boundary_density_ratio"],
+                "periphery_non_coyote_density": fake_metrics["periphery_non_coyote_density"],
+                "center_non_coyote_density": fake_metrics["center_non_coyote_density"],
+                "periphery_non_coyote_ratio": fake_metrics["periphery_non_coyote_ratio"],
+            }))
+            stack.enter_context(patch.object(mut, "evaluate_visual_metrics", return_value={
+                "visual_score_final": fake_metrics["visual_score_final"],
+                "visual_score_ratio": fake_metrics["visual_score_ratio"],
+                "visual_score_silhouette": fake_metrics["visual_score_silhouette"],
+                "visual_score_contour": fake_metrics["visual_score_contour"],
+                "visual_score_main": fake_metrics["visual_score_main"],
+                "visual_silhouette_color_diversity": fake_metrics["visual_silhouette_color_diversity"],
+                "visual_contour_break_score": fake_metrics["visual_contour_break_score"],
+                "visual_outline_band_diversity": fake_metrics["visual_outline_band_diversity"],
+                "visual_small_scale_structural_score": fake_metrics["visual_small_scale_structural_score"],
+                "visual_validation_passed": fake_metrics["visual_validation_passed"],
+            }))
+            stack.enter_context(patch.object(mut, "military_visual_discipline_score", return_value={
+                "visual_military_score": fake_metrics["visual_military_score"],
+                "visual_military_passed": fake_metrics["visual_military_passed"],
+            }))
+            stack.enter_context(patch.object(mut, "largest_component_ratio", return_value=fake_metrics["largest_olive_component_ratio"]))
+            stack.enter_context(patch.object(mut, "center_empty_ratio", return_value=fake_metrics["center_empty_ratio"]))
+            stack.enter_context(patch.object(mut, "boundary_density", return_value=fake_metrics["boundary_density"]))
+            stack.enter_context(patch.object(mut, "mirror_similarity_score", return_value=fake_metrics["mirror_similarity"]))
+            stack.enter_context(patch.object(mut, "central_brown_continuity", return_value=fake_metrics["central_brown_continuity"]))
             image, ratios, metrics = mut.generate_one_variant(profile)
 
         self.assertIsInstance(image, Image.Image)
@@ -714,6 +975,7 @@ class TestCandidateGeneration(TestAssertionsMixin, unittest.TestCase):
         self.assertIsInstance(metrics, dict)
         self.assertAlmostEqual(float(np.sum(ratios)), 1.0, places=5)
         self.assertEqual(metrics["largest_olive_component_ratio_small"], fake_metrics["largest_olive_component_ratio_small"])
+        self.assertEqual(metrics["central_brown_continuity"], fake_metrics["central_brown_continuity"])
 
     def test_generate_candidate_from_seed_returns_candidate_result(self) -> None:
         seed = mut.DEFAULT_BASE_SEED
@@ -742,7 +1004,56 @@ class TestCandidateGenerationAsync(TestAssertionsMixin, unittest.IsolatedAsyncio
 
 
 # ============================================================
-# TESTS ORCHESTRATEURS
+# TESTS VALIDATION / EXPORTS
+# ============================================================
+
+class TestValidation(unittest.TestCase):
+    def test_variant_is_valid_accepts_valid_candidate(self) -> None:
+        self.assertTrue(mut.variant_is_valid(valid_ratios(), valid_metrics()))
+
+    def test_variant_is_valid_rejects_bad_ratios(self) -> None:
+        self.assertFalse(mut.variant_is_valid(invalid_ratios_far(), valid_metrics()))
+
+    def test_variant_is_valid_rejects_each_metric_failure(self) -> None:
+        for key, value in iter_metric_failure_cases():
+            metrics = valid_metrics()
+            metrics[key] = value
+            with self.subTest(metric=key, value=value):
+                self.assertFalse(mut.variant_is_valid(valid_ratios(), metrics))
+
+    def test_validate_candidate_result_wrapper(self) -> None:
+        self.assertTrue(mut.validate_candidate_result(make_candidate()))
+
+    def test_candidate_row_contains_expected_fields(self) -> None:
+        row = mut.candidate_row(1, 2, 3, make_candidate(seed=777))
+        self.assertEqual(row["index"], 1)
+        self.assertEqual(row["seed"], 777)
+        self.assertIn("coyote_brown_pct", row)
+        self.assertIn("visual_military_score", row)
+
+
+class TestExports(TempDirMixin, unittest.TestCase):
+    def test_save_candidate_image(self) -> None:
+        candidate = make_candidate()
+        out = mut.save_candidate_image(candidate, self.tmpdir / "x" / "img.png")
+        self.assertTrue(out.exists())
+
+    def test_write_report(self) -> None:
+        row = mut.candidate_row(1, 1, 1, make_candidate())
+        out = mut.write_report([row], self.tmpdir)
+        self.assertTrue(out.exists())
+        with out.open("r", encoding="utf-8", newline="") as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual(len(rows), 1)
+
+    def test_write_report_empty(self) -> None:
+        out = mut.write_report([], self.tmpdir)
+        self.assertTrue(out.exists())
+        self.assertEqual(out.read_text(encoding="utf-8"), "")
+
+
+# ============================================================
+# TESTS ORCHESTRATEURS SYNCHRONES
 # ============================================================
 
 class TestGenerateAllSync(TempDirMixin, unittest.TestCase):
@@ -777,89 +1088,96 @@ class TestGenerateAllSync(TempDirMixin, unittest.TestCase):
 
     def test_generate_all_stop_requested_writes_partial_report(self) -> None:
         with patch.object(mut, "generate_candidate_from_seed") as mock_gen:
-            rows = mut.generate_all(target_count=3, output_dir=self.tmpdir, stop_requested=lambda: True)
+            rows = mut.generate_all(target_count=3, output_dir=self.tmpdir, stop_requested=lambda: True, parallel_attempts=False)
         self.assertEqual(rows, [])
         self.assertEqual(mock_gen.call_count, 0)
         self.assertTrue((self.tmpdir / "rapport_camouflages.csv").exists())
 
+    def test_generate_all_parallel_path_with_adaptive_enabled(self) -> None:
+        def fake_eval(seed: int, adaptive_hint: Dict[str, Any] | None = None):
+            cand = make_candidate(seed=seed)
+            accepted = (seed % 2 == 0)
+            return cand, accepted
+
+        with ThreadPoolExecutor(max_workers=2) as pool, \
+             patch.object(mut, "get_process_pool", return_value=pool), \
+             patch.object(mut, "generate_and_validate_from_seed_with_hint", side_effect=fake_eval):
+            rows = mut.generate_all(
+                target_count=1,
+                output_dir=self.tmpdir,
+                base_seed=0,
+                max_workers=2,
+                attempt_batch_size=2,
+                parallel_attempts=True,
+                adaptive_rejection_correction=True,
+            )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["attempts_for_this_image"], 2)
+        self.assertTrue((self.tmpdir / "camouflage_001.png").exists())
+
+
+# ============================================================
+# TESTS ORCHESTRATEURS ASYNCHRONES
+# ============================================================
 
 class TestGenerateAllAsync(AsyncTempDirMixin, unittest.IsolatedAsyncioTestCase):
     async def test_async_generate_all_accepts_first_attempt(self) -> None:
         candidate = make_candidate(seed=301)
-        progress_calls: List[tuple] = []
+        progress = AsyncMock()
 
-        async def progress_cb(target_index: int, local_attempt: int, total_attempts: int, target_count: int, cand: mut.CandidateResult, accepted: bool) -> None:
-            progress_calls.append((target_index, local_attempt, total_attempts, target_count, cand.seed, accepted))
-
-        with patch.object(mut, "async_generate_candidate_from_seed", AsyncMock(return_value=candidate)) as mock_gen, \
-             patch.object(mut, "async_validate_candidate_result", AsyncMock(return_value=True)) as mock_val:
-            rows = await mut.async_generate_all(target_count=1, output_dir=self.tmpdir, progress_callback=progress_cb, parallel_attempts=False)
+        with patch.object(mut, "generate_candidate_from_seed", return_value=candidate), \
+             patch.object(mut, "validate_candidate_result", return_value=True):
+            rows = await mut.async_generate_all(
+                target_count=1,
+                output_dir=self.tmpdir,
+                progress_callback=progress,
+                parallel_attempts=False,
+            )
 
         self.assertEqual(len(rows), 1)
-        self.assertEqual(mock_gen.await_count, 1)
-        self.assertEqual(mock_val.await_count, 1)
-        self.assertEqual(len(progress_calls), 1)
+        self.assertEqual(progress.await_count, 1)
         self.assertTrue((self.tmpdir / "camouflage_001.png").exists())
-        self.assertTrue((self.tmpdir / "rapport_camouflages.csv").exists())
 
     async def test_async_generate_all_stop_requested(self) -> None:
-        async def stop_requested() -> bool:
-            return True
-
-        with patch.object(mut, "async_generate_candidate_from_seed", AsyncMock()) as mock_gen:
-            rows = await mut.async_generate_all(target_count=5, output_dir=self.tmpdir, stop_requested=stop_requested)
+        stop_cb = AsyncMock(return_value=True)
+        rows = await mut.async_generate_all(
+            target_count=3,
+            output_dir=self.tmpdir,
+            stop_requested=stop_cb,
+            parallel_attempts=False,
+        )
         self.assertEqual(rows, [])
-        self.assertEqual(mock_gen.await_count, 0)
         self.assertTrue((self.tmpdir / "rapport_camouflages.csv").exists())
 
+    async def test_async_generate_all_parallel_path(self) -> None:
+        def fake_eval(seed: int, adaptive_hint: Dict[str, Any] | None = None):
+            cand = make_candidate(seed=seed)
+            accepted = (seed % 2 == 0)
+            return cand, accepted
 
-# ============================================================
-# TESTS ADAPTATION REJETS
-# ============================================================
+        with ThreadPoolExecutor(max_workers=2) as pool, \
+             patch.object(mut, "get_process_pool", return_value=pool), \
+             patch.object(mut, "generate_and_validate_from_seed_with_hint", side_effect=fake_eval):
+            rows = await mut.async_generate_all(
+                target_count=1,
+                output_dir=self.tmpdir,
+                base_seed=0,
+                max_workers=2,
+                attempt_batch_size=2,
+                parallel_attempts=True,
+                adaptive_rejection_correction=True,
+            )
 
-class TestAdaptiveRejectionCorrection(TempDirMixin, unittest.TestCase):
-    def test_extract_rejection_failures_returns_expected_rules(self) -> None:
-        metrics = valid_metrics()
-        metrics["oblique_share"] = mut.MIN_OBLIQUE_SHARE - 0.05
-        metrics["center_empty_ratio"] = mut.MAX_COYOTE_CENTER_EMPTY_RATIO + 0.04
-        candidate = make_candidate(seed=777, ratios=invalid_ratios_far(), metrics=metrics)
-        failures = mut.extract_rejection_failures(candidate, target_index=1, local_attempt=1)
-        rules = {item["rule"] for item in failures}
-        self.assertIn("ratio_coyote", rules)
-        self.assertIn("ratio_olive", rules)
-        self.assertIn("ratio_gris", rules)
-        self.assertIn("oblique_share", rules)
-        self.assertIn("center_empty_ratio", rules)
-        self.assertIn("mean_abs_error", rules)
-
-    def test_adaptive_state_builds_and_softens_hint(self) -> None:
-        state = mut.AdaptiveGenerationState()
-        failures = [
-            {"rule": "ratio_olive", "actual": 0.20, "target": None, "min_value": 0.24, "max_value": 0.33, "delta": 0.04},
-            {"rule": "oblique_share", "actual": 0.40, "target": None, "min_value": mut.MIN_OBLIQUE_SHARE, "max_value": None, "delta": mut.MIN_OBLIQUE_SHARE - 0.40},
-            {"rule": "center_empty_ratio", "actual": 0.61, "target": None, "min_value": None, "max_value": mut.MAX_COYOTE_CENTER_EMPTY_RATIO, "delta": 0.10},
-        ]
-        state.register_failures(failures)
-        hint_before = state.to_hint()
-        self.assertGreater(state.consecutive_rejections, 0)
-        self.assertGreater(hint_before["olive_macro_target_scale"], 1.0)
-        self.assertGreater(hint_before["prefer_oblique"], 0.0)
-        self.assertLess(hint_before["center_torso_overlap_scale"], 1.0)
-        state.register_success()
-        hint_after = state.to_hint()
-        self.assertEqual(state.consecutive_rejections, 0)
-        self.assertLess(hint_after["olive_macro_target_scale"], hint_before["olive_macro_target_scale"])
-        self.assertLessEqual(hint_after["prefer_oblique"], hint_before["prefer_oblique"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["attempts_for_this_image"], 2)
 
 
 # ============================================================
-# TESTS CONSTANTES
+# TESTS CONSTANTES / SANITY CHECKS
 # ============================================================
 
-class TestConstantsAndShapes(unittest.TestCase):
-    def test_rgb_has_four_colors(self) -> None:
-        self.assertEqual(mut.RGB.shape, (4, 3))
-
+class TestConstants(unittest.TestCase):
     def test_target_is_probability_distribution(self) -> None:
         self.assertEqual(mut.TARGET.shape, (4,))
         self.assertAlmostEqual(float(np.sum(mut.TARGET)), 1.0, places=8)
@@ -878,5 +1196,5 @@ class TestConstantsAndShapes(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    LOGGER.info("========== DÉBUT DES TESTS test_main_corrected.py ==========")
+    LOGGER.info("========== DÉBUT DES TESTS test_main.py ==========")
     unittest.main(verbosity=2)

@@ -609,6 +609,10 @@ class CamouflageApp(App):
         self.runtime_last_label: Optional[Label] = None
         self.preview_img: Optional[Image] = None
         self.preview_silhouette: Optional[Image] = None
+        self.live_preview_img: Optional[Image] = None
+        self.live_stage_label: Optional[Label] = None
+        self.live_counts_label: Optional[Label] = None
+        self.live_meta_label: Optional[Label] = None
         self.gallery_grid: Optional[GridLayout] = None
         self.log_view: Optional[LogView] = None
         self.diag_log_view: Optional[LogView] = None
@@ -724,11 +728,25 @@ class CamouflageApp(App):
         control_scroll.add_widget(control_content)
         left.add_widget(control_scroll)
 
-        previews = BoxLayout(spacing=dp(10), size_hint_y=0.46)
+        previews = GridLayout(cols=3, spacing=dp(10), size_hint_y=0.46)
         self.preview_img = Image()
         self.preview_silhouette = Image()
+        self.live_preview_img = Image()
         previews.add_widget(self._carded_view("Camouflage courant", self.preview_img))
         previews.add_widget(self._carded_view("Projection silhouette", self.preview_silhouette))
+
+        live_card = GlassCard(orientation="vertical")
+        live_card.add_widget(self._label("Suivi direct de construction"))
+        self.live_stage_label = self._small_label("Étape : attente")
+        self.live_counts_label = self._small_label("Macros -- | transitions -- | micros --")
+        self.live_meta_label = self._small_label("Image -- | essai -- | seed --")
+        live_card.add_widget(self.live_stage_label)
+        live_card.add_widget(self.live_counts_label)
+        live_card.add_widget(self.live_meta_label)
+        live_pane = SoftPane(orientation="vertical")
+        live_pane.add_widget(self.live_preview_img)
+        live_card.add_widget(live_pane)
+        previews.add_widget(live_card)
         right.add_widget(previews)
 
         bottom = BoxLayout(spacing=dp(10), size_hint_y=0.54)
@@ -827,6 +845,7 @@ class CamouflageApp(App):
     def _on_runtime_event(self, event: Any):
         line = self._format_runtime_event(event)
         self._append_runtime_line(line)
+        self._maybe_handle_live_runtime_payload(event)
 
     @mainthread
     def _append_runtime_line(self, line: str):
@@ -890,6 +909,64 @@ class CamouflageApp(App):
             self.preview_img.texture = pil_to_coreimage(pil_img).texture
         if self.preview_silhouette is not None:
             self.preview_silhouette.texture = pil_to_coreimage(silhouette_img).texture
+
+    @mainthread
+    def update_live_stage(
+        self,
+        stage: str,
+        target_index: Optional[int] = None,
+        local_attempt: Optional[int] = None,
+        seed: Optional[int] = None,
+        macro_count: Optional[int] = None,
+        transition_count: Optional[int] = None,
+        micro_count: Optional[int] = None,
+        pil_img: Optional[PILImage.Image] = None,
+        preview_path: Optional[str] = None,
+    ):
+        if self.live_stage_label is not None:
+            self.live_stage_label.text = f"Étape : {stage}"
+        if self.live_counts_label is not None:
+            m = "--" if macro_count is None else str(macro_count)
+            t = "--" if transition_count is None else str(transition_count)
+            mi = "--" if micro_count is None else str(micro_count)
+            self.live_counts_label.text = f"Macros {m} | transitions {t} | micros {mi}"
+        if self.live_meta_label is not None:
+            ti = "--" if target_index is None else f"{target_index:03d}"
+            la = "--" if local_attempt is None else f"{local_attempt:04d}"
+            sd = "--" if seed is None else str(seed)
+            self.live_meta_label.text = f"Image {ti} | essai {la} | seed {sd}"
+        try:
+            if pil_img is not None and self.live_preview_img is not None:
+                self.live_preview_img.texture = pil_to_coreimage(pil_img).texture
+            elif preview_path and self.live_preview_img is not None and Path(preview_path).exists():
+                img = PILImage.open(preview_path).convert("RGB")
+                self.live_preview_img.texture = pil_to_coreimage(img).texture
+        except Exception:
+            pass
+
+    def _maybe_handle_live_runtime_payload(self, event: Any):
+        payload = getattr(event, "payload", {}) or {}
+        if not isinstance(payload, dict):
+            return
+        stage = payload.get("stage") or payload.get("live_stage") or payload.get("phase")
+        preview_path = payload.get("preview_path") or payload.get("snapshot_path") or payload.get("frame_path")
+        macro_count = payload.get("macro_count")
+        transition_count = payload.get("transition_count")
+        micro_count = payload.get("micro_count")
+        target_index = payload.get("target_index")
+        local_attempt = payload.get("local_attempt")
+        seed = payload.get("seed")
+        if stage or preview_path or macro_count is not None or transition_count is not None or micro_count is not None:
+            self.update_live_stage(
+                stage=str(stage or "construction"),
+                target_index=int(target_index) if target_index is not None else None,
+                local_attempt=int(local_attempt) if local_attempt is not None else None,
+                seed=int(seed) if seed is not None else None,
+                macro_count=int(macro_count) if macro_count is not None else None,
+                transition_count=int(transition_count) if transition_count is not None else None,
+                micro_count=int(micro_count) if micro_count is not None else None,
+                preview_path=str(preview_path) if preview_path else None,
+            )
 
     def _refresh_controls_state(self):
         if self.start_btn is not None:
@@ -1169,7 +1246,9 @@ class CamouflageApp(App):
                     local_attempt += 1
                     self.total_attempts = total_attempts
                     seed = camo.build_seed(target_index, local_attempt, base_seed=camo.DEFAULT_BASE_SEED)
+                    self.update_live_stage("génération backend", target_index, local_attempt, seed)
                     candidate = await camo.async_generate_candidate_from_seed(seed)
+                    self.update_live_stage("validation", target_index, local_attempt, seed, pil_img=candidate.image)
                     valid = await camo.async_validate_candidate_result(candidate)
                     scores = extract_backend_scores(candidate.metrics)
                     silhouette_img = await asyncio.to_thread(silhouette_projection_image, rgb_image_to_index_canvas(candidate.image))
@@ -1178,12 +1257,14 @@ class CamouflageApp(App):
                     self._update_attempt_status(target_index, local_attempt, total_attempts, seed, target_count, len(rows) + (1 if valid else 0), self.diag_rejects, valid, candidate.ratios, scores, candidate.metrics)
 
                     if not valid:
+                        self.update_live_stage("rejeté", target_index, local_attempt, seed, pil_img=candidate.image)
                         self.log(f"[img={target_index:03d} essai={local_attempt:04d}] rejeté | SF={scores['score_final']:.3f}")
                         await self._adaptive_pause()
                         await asyncio.sleep(0)
                         continue
 
                     filename = self.current_output_dir / f"camouflage_{target_index:03d}.png"
+                    self.update_live_stage("export image", target_index, local_attempt, seed, pil_img=candidate.image)
                     await camo.async_save_candidate_image(candidate, filename)
                     record = CandidateRecord(index=target_index, seed=candidate.seed, local_attempt=local_attempt, global_attempt=total_attempts, image_path=filename, metrics=dict(candidate.metrics), ratios=candidate.ratios.copy())
                     self.best_records.append(record)
@@ -1193,6 +1274,7 @@ class CamouflageApp(App):
                     rows.append(row)
                     self.accepted_count = len(rows)
                     self.update_progress(len(rows), target_count)
+                    self.update_live_stage("accepté", target_index, local_attempt, seed, pil_img=candidate.image)
                     self.log(f"[img={target_index:03d}] accepté -> {filename.name} | SF={scores['score_final']:.3f} | militaire={scores['military_score']:.3f}")
                     self.reload_gallery()
                     await self._adaptive_pause()
