@@ -847,6 +847,159 @@ class TestCandidateAndValidation(AssertionsMixin, unittest.TestCase):
         self.assertIn("angles", row)
 
 
+class TestGuidedRejectionAnalysis(AssertionsMixin, unittest.TestCase):
+    def test_rejection_analysis_dataclass(self) -> None:
+        analysis = mut.RejectionAnalysis(
+            target_index=1,
+            local_attempt=2,
+            seed=3,
+            reject_streak=1,
+            fail_count=2,
+            severity=3.5,
+            failure_names=["ratio_olive", "center_empty_ratio"],
+            notes=["note"],
+            corrections={"olive_scale_delta": 0.1},
+        )
+        self.assertEqual(analysis.target_index, 1)
+        self.assertEqual(analysis.fail_count, 2)
+        self.assertIn("ratio_olive", analysis.failure_names)
+
+    def test_guided_state_init_and_has_effects(self) -> None:
+        state = mut._guided_state_init()
+        self.assertFalse(mut._guided_state_has_effects(state))
+        state["olive_scale_delta"] = 0.1
+        self.assertTrue(mut._guided_state_has_effects(state))
+
+    def test_extract_rejection_failures_uses_log_analyzer(self) -> None:
+        class FakeFail:
+            def __init__(self, rule: str):
+                self.rule = rule
+
+            def to_dict(self) -> Dict[str, Any]:
+                return {"rule": self.rule, "delta": 0.1}
+
+        fake_diag = types.SimpleNamespace(failures=[FakeFail("ratio_olive"), {"rule": "center_empty_ratio"}])
+        fake_log = types.SimpleNamespace(analyze_candidate=lambda candidate, target_index, local_attempt: fake_diag)
+        with patch.object(mut, "_get_log_module", return_value=fake_log):
+            out = mut.extract_rejection_failures(make_candidate(), 1, 2)
+        self.assertEqual([x["rule"] for x in out], ["ratio_olive", "center_empty_ratio"])
+
+    def test_deep_rejection_analysis_builds_corrections(self) -> None:
+        candidate = make_candidate(metrics={
+            **valid_metrics(),
+            "vertical_share": 0.05,
+            "boundary_density": 0.05,
+        })
+        failures = [
+            {"rule": "ratio_olive"},
+            {"rule": "center_empty_ratio"},
+            {"rule": "periphery_non_coyote_ratio"},
+            {"rule": "vertical_share"},
+            {"rule": "visual_contour_break_score"},
+        ]
+        with patch.object(mut, "extract_rejection_failures", return_value=failures):
+            analysis = mut.deep_rejection_analysis(candidate, 1, 2, reject_streak=2)
+        self.assertGreater(analysis.fail_count, 0)
+        self.assertGreater(analysis.corrections["olive_scale_delta"], 0.0)
+        self.assertGreater(analysis.corrections["center_overlap_delta"], 0.0)
+        self.assertTrue(analysis.corrections["prefer_sequential_repair"])
+        self.assertTrue(analysis.notes)
+
+    def test_merge_guided_generation_state_accumulates(self) -> None:
+        state = mut._guided_state_init()
+        analysis = mut.RejectionAnalysis(
+            target_index=1,
+            local_attempt=1,
+            seed=1,
+            reject_streak=1,
+            fail_count=1,
+            severity=2.0,
+            failure_names=["ratio_olive"],
+            notes=["olive"],
+            corrections={
+                "olive_scale_delta": 0.1,
+                "terre_scale_delta": 0.0,
+                "gris_scale_delta": 0.0,
+                "center_overlap_delta": 0.05,
+                "extra_macro_attempts": 40,
+                "zone_boost_deltas": [0.1 for _ in mut.DENSITY_ZONES],
+                "width_variation_delta": 0.02,
+                "lateral_jitter_delta": 0.01,
+                "tip_taper_delta": 0.0,
+                "edge_break_delta": 0.03,
+                "force_vertical": False,
+                "avoid_vertical": True,
+                "expand_angle_pool": True,
+                "prefer_sequential_repair": True,
+            },
+        )
+        merged = mut._merge_guided_generation_state(state, analysis)
+        self.assertEqual(merged["reject_streak"], 1)
+        self.assertGreater(merged["olive_scale_delta"], 0.0)
+        self.assertEqual(merged["extra_macro_attempts"], 40)
+        self.assertTrue(merged["avoid_vertical"])
+        self.assertTrue(merged["expand_angle_pool"])
+        self.assertTrue(mut._guided_state_has_effects(merged))
+
+    def test_apply_guided_generation_state_changes_profile(self) -> None:
+        profile = mut.make_profile(123)
+        guided = {
+            "olive_scale_delta": 0.1,
+            "terre_scale_delta": 0.05,
+            "gris_scale_delta": 0.02,
+            "center_overlap_delta": 0.08,
+            "extra_macro_attempts": 60,
+            "zone_boost_deltas": [0.1 for _ in mut.DENSITY_ZONES],
+            "width_variation_delta": 0.03,
+            "lateral_jitter_delta": 0.02,
+            "tip_taper_delta": 0.01,
+            "edge_break_delta": 0.02,
+            "force_vertical": True,
+            "avoid_vertical": False,
+            "expand_angle_pool": True,
+            "prefer_sequential_repair": True,
+        }
+        out = mut._apply_guided_generation_state(profile, guided)
+        self.assertGreater(out.olive_macro_target_scale, 1.0)
+        self.assertGreater(out.terre_macro_target_scale, 1.0)
+        self.assertGreater(out.extra_macro_attempts, 0)
+        self.assertIn(0, out.allowed_angles)
+        self.assertEqual(set(out.allowed_angles), set(mut.BASE_ANGLES))
+
+    def test_generate_candidate_from_seed_applies_correction_state(self) -> None:
+        seed = 123456
+        fake_image = Image.new("RGB", (mut.WIDTH, mut.HEIGHT), (0, 0, 0))
+        fake_ratios = valid_ratios()
+        fake_metrics = valid_metrics()
+        seen: List[mut.VariantProfile] = []
+
+        def fake_generate_one_variant(profile: mut.VariantProfile):
+            seen.append(profile)
+            return fake_image, fake_ratios, fake_metrics
+
+        guided = {
+            "olive_scale_delta": 0.15,
+            "terre_scale_delta": 0.0,
+            "gris_scale_delta": 0.0,
+            "center_overlap_delta": 0.05,
+            "extra_macro_attempts": 50,
+            "zone_boost_deltas": [0.0 for _ in mut.DENSITY_ZONES],
+            "width_variation_delta": 0.01,
+            "lateral_jitter_delta": 0.0,
+            "tip_taper_delta": 0.0,
+            "edge_break_delta": 0.0,
+            "force_vertical": False,
+            "avoid_vertical": True,
+            "expand_angle_pool": False,
+            "prefer_sequential_repair": True,
+        }
+        with patch.object(mut, "generate_one_variant", side_effect=fake_generate_one_variant):
+            cand = mut.generate_candidate_from_seed(seed, correction_state=guided)
+        self.assertCandidateLooksConsistent(cand)
+        self.assertGreater(seen[0].olive_macro_target_scale, 1.0)
+        self.assertNotIn(0, seen[0].allowed_angles)
+
+
 class TestAsyncCandidateWrappers(AssertionsMixin, unittest.IsolatedAsyncioTestCase):
     async def test_async_generate_candidate_from_seed_returns_candidate_result(self) -> None:
         fake_candidate = make_candidate(seed=mut.DEFAULT_BASE_SEED + 1)
@@ -975,6 +1128,60 @@ class TestOrchestratorsSync(TempDirMixin, AssertionsMixin, unittest.TestCase):
         self.assertEqual(rows[0]["attempts_for_this_image"], 2)
         self.assertEqual(progress.call_count, 2)
 
+    def test_generate_all_applies_guided_corrections_after_reject(self) -> None:
+        seen_states: List[Any] = []
+
+        def fake_generate(seed: int, correction_state: Dict[str, Any] | None = None) -> mut.CandidateResult:
+            seen_states.append(correction_state)
+            return make_candidate(seed=seed)
+
+        analysis = mut.RejectionAnalysis(
+            target_index=1,
+            local_attempt=1,
+            seed=101,
+            reject_streak=1,
+            fail_count=2,
+            severity=2.5,
+            failure_names=["ratio_olive", "center_empty_ratio"],
+            notes=["guided"],
+            corrections={
+                "olive_scale_delta": 0.1,
+                "terre_scale_delta": 0.0,
+                "gris_scale_delta": 0.0,
+                "center_overlap_delta": 0.05,
+                "extra_macro_attempts": 50,
+                "zone_boost_deltas": [0.0 for _ in mut.DENSITY_ZONES],
+                "width_variation_delta": 0.0,
+                "lateral_jitter_delta": 0.0,
+                "tip_taper_delta": 0.0,
+                "edge_break_delta": 0.0,
+                "force_vertical": False,
+                "avoid_vertical": True,
+                "expand_angle_pool": False,
+                "prefer_sequential_repair": True,
+            },
+        )
+
+        with patch.object(mut, "validate_generation_request", return_value=None), \
+             patch.object(mut, "_run_log_preflight", return_value=None), \
+             patch.object(mut, "compute_runtime_tuning", return_value=mut.RuntimeTuning(1, 1, False, 0.9, "test")), \
+             patch.object(mut, "sample_process_resources", return_value=fake_snapshot()), \
+             patch.object(mut, "generate_candidate_from_seed", side_effect=fake_generate), \
+             patch.object(mut, "validate_candidate_result", side_effect=[False, True]), \
+             patch.object(mut, "deep_rejection_analysis", return_value=analysis), \
+             patch.object(mut, "_runtime_log"):
+            rows = mut.generate_all(
+                target_count=1,
+                output_dir=self.tmpdir,
+                enable_live_supervisor=False,
+                strict_preflight=False,
+            )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(seen_states), 2)
+        self.assertFalse(mut._guided_state_has_effects(seen_states[0]))
+        self.assertTrue(mut._guided_state_has_effects(seen_states[1]))
+
     def test_generate_all_stop_requested_writes_partial_report(self) -> None:
         stop = Mock(side_effect=[True])
         with patch.object(mut, "validate_generation_request", return_value=None), \
@@ -1043,6 +1250,60 @@ class TestOrchestratorsAsync(TempDirMixin, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["attempts_for_this_image"], 2)
         self.assertEqual(progress.await_count, 2)
+
+    async def test_async_generate_all_applies_guided_corrections_after_reject(self) -> None:
+        seen_states: List[Any] = []
+
+        def fake_generate(seed: int, correction_state: Dict[str, Any] | None = None) -> mut.CandidateResult:
+            seen_states.append(correction_state)
+            return make_candidate(seed=seed)
+
+        analysis = mut.RejectionAnalysis(
+            target_index=1,
+            local_attempt=1,
+            seed=101,
+            reject_streak=1,
+            fail_count=2,
+            severity=2.5,
+            failure_names=["ratio_olive", "center_empty_ratio"],
+            notes=["guided"],
+            corrections={
+                "olive_scale_delta": 0.1,
+                "terre_scale_delta": 0.0,
+                "gris_scale_delta": 0.0,
+                "center_overlap_delta": 0.05,
+                "extra_macro_attempts": 50,
+                "zone_boost_deltas": [0.0 for _ in mut.DENSITY_ZONES],
+                "width_variation_delta": 0.0,
+                "lateral_jitter_delta": 0.0,
+                "tip_taper_delta": 0.0,
+                "edge_break_delta": 0.0,
+                "force_vertical": False,
+                "avoid_vertical": True,
+                "expand_angle_pool": False,
+                "prefer_sequential_repair": True,
+            },
+        )
+
+        with patch.object(mut, "validate_generation_request", return_value=None), \
+             patch.object(mut, "_run_log_preflight", return_value=None), \
+             patch.object(mut, "compute_runtime_tuning", return_value=mut.RuntimeTuning(1, 1, False, 0.9, "test")), \
+             patch.object(mut, "sample_process_resources", return_value=fake_snapshot()), \
+             patch.object(mut, "generate_candidate_from_seed", side_effect=fake_generate), \
+             patch.object(mut, "validate_candidate_result", side_effect=[False, True]), \
+             patch.object(mut, "deep_rejection_analysis", return_value=analysis), \
+             patch.object(mut, "_runtime_log"):
+            rows = await mut.async_generate_all(
+                target_count=1,
+                output_dir=self.tmpdir,
+                enable_live_supervisor=False,
+                strict_preflight=False,
+            )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(seen_states), 2)
+        self.assertFalse(mut._guided_state_has_effects(seen_states[0]))
+        self.assertTrue(mut._guided_state_has_effects(seen_states[1]))
 
     async def test_async_generate_all_stop_requested(self) -> None:
         stop = AsyncMock(side_effect=[True])
