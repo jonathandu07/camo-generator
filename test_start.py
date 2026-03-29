@@ -15,6 +15,7 @@ from __future__ import annotations
 import csv
 import functools
 import logging
+import os
 import sys
 import tempfile
 import types
@@ -180,7 +181,7 @@ import start as sut
 # LOGS
 # ============================================================
 
-LOG_DIR = Path(__file__).resolve().parent / "logs_tests"
+LOG_DIR = Path(os.getenv("LOG_OUTPUT_DIR", Path(__file__).resolve().parent / "logs")).resolve()
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / "test_start_exhaustive.log"
 
@@ -190,7 +191,7 @@ def configure_logger() -> logging.Logger:
     logger.setLevel(logging.DEBUG)
     if logger.handlers:
         return logger
-    fmt = logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)s | %(message)s")
+    fmt = logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)s | %(filename)s:%(lineno)d | %(funcName)s | %(message)s")
     fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(fmt)
@@ -958,6 +959,60 @@ class TestCamouflageAppAsync(LoggedAsyncCase):
         self.assertEqual(self.app.status_label.text, "Erreur")
 
 
+class LoggedTextTestResult(unittest.TextTestResult):
+    def startTestRun(self) -> None:
+        LOGGER.info("========== START TEST RUN ==========")
+        super().startTestRun()
+
+    def stopTestRun(self) -> None:
+        LOGGER.info(
+            "========== STOP TEST RUN | testsRun=%s | failures=%s | errors=%s | skipped=%s | expectedFailures=%s | unexpectedSuccesses=%s ==========",
+            self.testsRun,
+            len(self.failures),
+            len(self.errors),
+            len(getattr(self, "skipped", [])),
+            len(getattr(self, "expectedFailures", [])),
+            len(getattr(self, "unexpectedSuccesses", [])),
+        )
+        super().stopTestRun()
+
+    def startTest(self, test: unittest.case.TestCase) -> None:
+        LOGGER.info("START | %s", test.id())
+        super().startTest(test)
+
+    def stopTest(self, test: unittest.case.TestCase) -> None:
+        LOGGER.info("STOP  | %s", test.id())
+        super().stopTest(test)
+
+    def addSuccess(self, test: unittest.case.TestCase) -> None:
+        LOGGER.info("OK    | %s", test.id())
+        super().addSuccess(test)
+
+    def addFailure(self, test: unittest.case.TestCase, err) -> None:
+        details = self._exc_info_to_string(err, test)
+        LOGGER.error("FAIL  | %s\n%s", test.id(), details)
+        super().addFailure(test, err)
+
+    def addError(self, test: unittest.case.TestCase, err) -> None:
+        details = self._exc_info_to_string(err, test)
+        LOGGER.error("ERROR | %s\n%s", test.id(), details)
+        super().addError(test, err)
+
+    def addSkip(self, test: unittest.case.TestCase, reason: str) -> None:
+        LOGGER.warning("SKIP  | %s | reason=%s", test.id(), reason)
+        super().addSkip(test, reason)
+
+    def addExpectedFailure(self, test: unittest.case.TestCase, err) -> None:
+        details = self._exc_info_to_string(err, test)
+        LOGGER.warning("XFAIL | %s\n%s", test.id(), details)
+        super().addExpectedFailure(test, err)
+
+    def addUnexpectedSuccess(self, test: unittest.case.TestCase) -> None:
+        LOGGER.warning("XPASS | %s", test.id())
+        super().addUnexpectedSuccess(test)
+
+
 if __name__ == "__main__":
     LOGGER.info("========== DÉBUT DES TESTS test_start.py ==========")
-    unittest.main(verbosity=2)
+    runner = unittest.TextTestRunner(verbosity=2, resultclass=LoggedTextTestResult)
+    unittest.main(testRunner=runner, verbosity=2)
