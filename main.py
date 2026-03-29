@@ -108,8 +108,8 @@ TRANSITION_WIDTH_CM = (5, 15)
 MICRO_SIZE_CM = (2, 8)
 
 VISIBLE_MACRO_OLIVE_TARGET = 0.160
-VISIBLE_MACRO_TERRE_TARGET = 0.100
-VISIBLE_MACRO_GRIS_TARGET = 0.070
+VISIBLE_MACRO_TERRE_TARGET = 0.125
+VISIBLE_MACRO_GRIS_TARGET = 0.095
 
 VISIBLE_TOTAL_OLIVE_TARGET = TARGET[IDX_OLIVE]
 VISIBLE_TOTAL_TERRE_TARGET = TARGET[IDX_TERRE]
@@ -128,9 +128,9 @@ MAX_BOUNDARY_DENSITY_SMALL = 0.220
 MAX_MIRROR_SIMILARITY = 0.76
 
 MIN_VISIBLE_OLIVE_MACRO_SHARE = 0.48
-MIN_VISIBLE_TERRE_TRANS_SHARE = 0.18
-MIN_VISIBLE_GRIS_MICRO_SHARE = 0.28
-MAX_VISIBLE_GRIS_MACRO_SHARE = 0.40
+MIN_VISIBLE_TERRE_TRANS_SHARE = 0.12
+MIN_VISIBLE_GRIS_MICRO_SHARE = 0.18
+MAX_VISIBLE_GRIS_MACRO_SHARE = 0.55
 
 MIN_OBLIQUE_SHARE = 0.64
 MIN_VERTICAL_SHARE = 0.10
@@ -166,10 +166,10 @@ VISUAL_MIN_MILITARY_SCORE = 0.62
 MIN_PERIPHERY_BOUNDARY_DENSITY_RATIO = 1.10
 MIN_PERIPHERY_NON_COYOTE_RATIO = 1.05
 MIN_MACRO_OLIVE_VISIBLE_RATIO = 0.14
-MIN_MACRO_TERRE_VISIBLE_RATIO = 0.07
-MIN_MACRO_GRIS_VISIBLE_RATIO = 0.05
-MAX_MACRO_TERRE_VISIBLE_RATIO = 0.14
-MAX_MACRO_GRIS_VISIBLE_RATIO = 0.09
+MIN_MACRO_TERRE_VISIBLE_RATIO = 0.09
+MIN_MACRO_GRIS_VISIBLE_RATIO = 0.07
+MAX_MACRO_TERRE_VISIBLE_RATIO = 0.16
+MAX_MACRO_GRIS_VISIBLE_RATIO = 0.12
 
 
 # Discipline de génération pilotée
@@ -1119,8 +1119,18 @@ def creates_new_mass(
 # ============================================================
 
 def apply_mask(canvas: np.ndarray, origin_map: np.ndarray, mask: np.ndarray, color_idx: int, origin_code: int) -> None:
-    canvas[mask] = color_idx
-    origin_map[mask] = origin_code
+    if origin_code == ORIGIN_MACRO:
+        eligible = mask
+    elif origin_code == ORIGIN_TRANSITION:
+        eligible = mask & (origin_map != ORIGIN_MACRO)
+    else:
+        eligible = mask & ((origin_map == ORIGIN_BACKGROUND) | (origin_map == ORIGIN_TRANSITION) | (origin_map == ORIGIN_MICRO))
+
+    if not np.any(eligible):
+        return
+
+    canvas[eligible] = color_idx
+    origin_map[eligible] = origin_code
 
 
 
@@ -1609,7 +1619,7 @@ def nudge_proportions(
             if chosen not in neigh and local_rng.random() < 0.60:
                 continue
 
-            if origin == ORIGIN_MACRO and chosen == IDX_TERRE and local_color_variety(canvas, x, y, radius=2) < 2:
+            if origin == ORIGIN_MACRO and local_color_variety(canvas, x, y, radius=3) < 2:
                 continue
             if origin == ORIGIN_MICRO and chosen == IDX_GRIS and local_color_variety(canvas, x, y, radius=2) < 2:
                 continue
