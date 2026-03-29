@@ -2,38 +2,40 @@
 # -*- coding: utf-8 -*-
 """
 main.py
-Camouflage Armée Fédérale Europe — version MACRO-ONLY.
+Camouflage Armée Fédérale Europe — version MACRO-ONLY + supervision continue.
 
-Objectif :
-- respecter le cahier des charges sur le théâtre Europe tempérée / France ;
-- utiliser uniquement des macro-formes anguleuses ;
-- conserver une API synchrone et asynchrone ;
-- conserver la génération séquentielle stricte par image ;
-- autoriser des tentatives parallèles pour une même image.
-
-Important :
-- aucune transition ;
-- aucun micro-motif ;
-- aucune forme circulaire ;
-- aucune isotropie ;
-- aucun bruit uniforme ;
-- aucun motif décoratif.
+Objectifs :
+- uniquement des macro-formes anguleuses ;
+- génération séquentielle stricte par image ;
+- exploitation forte du CPU sans thrash mémoire ;
+- asynchrone musclé avec consommation streaming des résultats ;
+- contrôles en amont ;
+- télémétrie continue et corrections en direct via log.py.
 """
 
 from __future__ import annotations
 
 import asyncio
 import csv
+import importlib
 import math
 import os
 import random
-from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass, field
+import shutil
+import sys
+import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw
+
+try:
+    import psutil  # type: ignore
+except Exception:
+    psutil = None
 
 
 # ============================================================
@@ -63,10 +65,10 @@ COLOR_NAMES = [
 ]
 
 RGB = np.array([
-    (0x81, 0x61, 0x3C),  # Coyote Brown
-    (0x55, 0x54, 0x3F),  # Vert Olive
-    (0x7C, 0x6D, 0x66),  # Terre de France
-    (0x57, 0x5D, 0x57),  # Vert-de-gris
+    (0x81, 0x61, 0x3C),
+    (0x55, 0x54, 0x3F),
+    (0x7C, 0x6D, 0x66),
+    (0x57, 0x5D, 0x57),
 ], dtype=np.uint8)
 
 TARGET = np.array([0.32, 0.28, 0.22, 0.18], dtype=float)
@@ -91,7 +93,6 @@ DENSITY_ZONES = [
     (0.30, 0.70, 0.18, 0.62, 0.60),
 ]
 
-# Macro-only : toutes les formes non-coyote sont des macros.
 MACRO_LENGTH_CM = (40, 90)
 MACRO_WIDTH_CM = (15, 35)
 
@@ -157,6 +158,8 @@ TARGET_CENTER_REPAIR_STEPS = 64
 CPU_COUNT = max(1, os.cpu_count() or 1)
 DEFAULT_MAX_WORKERS = max(1, CPU_COUNT)
 DEFAULT_ATTEMPT_BATCH_SIZE = max(1, DEFAULT_MAX_WORKERS)
+DEFAULT_MACHINE_INTENSITY = 0.94
+DEFAULT_RESOURCE_SAMPLE_EVERY_BATCHES = 1
 
 VISUAL_MIN_SILHOUETTE_COLOR_DIVERSITY = 0.62
 VISUAL_MIN_CONTOUR_BREAK_SCORE = 0.44
@@ -206,6 +209,147 @@ class CandidateResult:
     metrics: Dict[str, float]
 
 
+@dataclass
+class ResourceSnapshot:
+    ts: float
+    cpu_count: int
+    process_cpu_percent: float
+    system_cpu_percent: float
+    process_rss_mb: float
+    system_available_mb: float
+    system_total_mb: float
+    disk_free_mb: float
+    machine_intensity: float
+
+    def to_dict(self) -> Dict[str, float]:
+        return {
+            "ts": float(self.ts),
+            "cpu_count": float(self.cpu_count),
+            "process_cpu_percent": float(self.process_cpu_percent),
+            "system_cpu_percent": float(self.system_cpu_percent),
+            "process_rss_mb": float(self.process_rss_mb),
+            "system_available_mb": float(self.system_available_mb),
+            "system_total_mb": float(self.system_total_mb),
+            "disk_free_mb": float(self.disk_free_mb),
+            "machine_intensity": float(self.machine_intensity),
+        }
+
+
+@dataclass
+class RuntimeTuning:
+    max_workers: int
+    attempt_batch_size: int
+    parallel_attempts: bool
+    machine_intensity: float
+    reason: str = "initial"
+
+    def normalized(self) -> "RuntimeTuning":
+        max_workers = max(1, int(self.max_workers))
+        batch = max(1, int(self.attempt_batch_size))
+        return RuntimeTuning(
+            max_workers=max_workers,
+            attempt_batch_size=batch,
+            parallel_attempts=bool(self.parallel_attempts and max_workers > 1 and batch > 1),
+            machine_intensity=max(0.10, min(1.00, float(self.machine_intensity))),
+            reason=str(self.reason),
+        )
+
+
+ProgressCallback = Callable[[int, int, int, int, CandidateResult, bool], None]
+AsyncProgressCallback = Callable[[int, int, int, int, CandidateResult, bool], Awaitable[None]]
+StopCallback = Callable[[], bool]
+AsyncStopCallback = Callable[[], Awaitable[bool]]
+SupervisorCallback = Callable[[Dict[str, Any]], Optional[Dict[str, Any]]]
+
+
+# ============================================================
+# LOG / SUPERVISEUR DYNAMIQUE
+# ============================================================
+
+_LOG_MODULE_CACHE: Any = None
+_LOG_MODULE_ATTEMPTED = False
+
+
+def _get_log_module() -> Any:
+    global _LOG_MODULE_CACHE, _LOG_MODULE_ATTEMPTED
+    if _LOG_MODULE_CACHE is not None:
+        return _LOG_MODULE_CACHE
+    if _LOG_MODULE_ATTEMPTED:
+        return None
+    _LOG_MODULE_ATTEMPTED = True
+
+    module = sys.modules.get("log")
+    if module is not None:
+        _LOG_MODULE_CACHE = module
+        return module
+
+    try:
+        module = importlib.import_module("log")
+    except Exception:
+        module = None
+
+    _LOG_MODULE_CACHE = module
+    return module
+
+
+def _runtime_log(level: str, source: str, message: str, **payload: Any) -> None:
+    mod = _get_log_module()
+    fn = getattr(mod, "log_event", None) if mod is not None else None
+    if callable(fn):
+        try:
+            fn(level, source, message, **payload)
+        except Exception:
+            pass
+
+
+def _run_log_preflight(strict: bool, output_dir: Path, module_names: Sequence[str] | None = None) -> None:
+    mod = _get_log_module()
+    fn = getattr(mod, "run_generation_preflight", None) if mod is not None else None
+    if callable(fn):
+        result = fn(output_dir=output_dir, strict=strict, module_names=module_names)
+        if isinstance(result, dict) and not bool(result.get("ok", True)) and strict:
+            raise RuntimeError(str(result.get("message", "Préflight refusé par log.py")))
+
+
+def _supervisor_feedback(event_type: str, **payload: Any) -> Optional[Dict[str, Any]]:
+    mod = _get_log_module()
+    fn = getattr(mod, "feedback_runtime_event", None) if mod is not None else None
+    if callable(fn):
+        try:
+            out = fn(event_type=event_type, **payload)
+            if isinstance(out, dict):
+                return out
+        except Exception:
+            return None
+    return None
+
+
+def _merge_supervisor_tuning(
+    tuning: RuntimeTuning,
+    advice: Optional[Dict[str, Any]],
+    *,
+    fallback_machine_intensity: Optional[float] = None,
+) -> RuntimeTuning:
+    if not advice:
+        return tuning
+
+    max_workers = int(advice.get("max_workers", tuning.max_workers))
+    attempt_batch_size = int(advice.get("attempt_batch_size", tuning.attempt_batch_size))
+    parallel_attempts = bool(advice.get("parallel_attempts", tuning.parallel_attempts))
+    machine_intensity = float(advice.get(
+        "machine_intensity",
+        tuning.machine_intensity if fallback_machine_intensity is None else fallback_machine_intensity,
+    ))
+    reason = str(advice.get("reason", tuning.reason))
+    return RuntimeTuning(
+        max_workers=max_workers,
+        attempt_batch_size=attempt_batch_size,
+        parallel_attempts=parallel_attempts,
+        machine_intensity=machine_intensity,
+        reason=reason,
+    ).normalized()
+
+
 # ============================================================
 # OUTILS SYSTÈME
 # ============================================================
@@ -239,8 +383,8 @@ def shutdown_process_pool() -> None:
 
 def get_process_pool(max_workers: Optional[int] = None) -> ProcessPoolExecutor:
     global _PROCESS_POOL, _PROCESS_POOL_WORKERS
-
     wanted = max(1, int(max_workers or DEFAULT_MAX_WORKERS))
+
     if _PROCESS_POOL is not None and _PROCESS_POOL_WORKERS != wanted:
         shutdown_process_pool()
 
@@ -255,16 +399,8 @@ def get_process_pool(max_workers: Optional[int] = None) -> ProcessPoolExecutor:
 
 
 # ============================================================
-# PROFILS
+# PRÉFLIGHT / RESSOURCES
 # ============================================================
-
-def build_seed(target_index: int, local_attempt: int, base_seed: int = DEFAULT_BASE_SEED) -> int:
-    return int(base_seed + target_index * 100000 + local_attempt)
-
-
-def clamp01(x: float) -> float:
-    return max(0.0, min(1.0, float(x)))
-
 
 def _clip_float(value: float, low: float, high: float) -> float:
     return max(float(low), min(float(high), float(value)))
@@ -280,9 +416,128 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
     return out
 
 
+def clamp01(x: float) -> float:
+    return max(0.0, min(1.0, float(x)))
+
+
+def sample_process_resources(machine_intensity: float = DEFAULT_MACHINE_INTENSITY, output_dir: Path = OUTPUT_DIR) -> ResourceSnapshot:
+    machine_intensity = _clip_float(float(machine_intensity), 0.10, 1.00)
+    disk = shutil.disk_usage(str(Path(output_dir).resolve()))
+    process_cpu = 0.0
+    system_cpu = 0.0
+    process_rss = 0.0
+    available_mb = 0.0
+    total_mb = 0.0
+
+    if psutil is not None:
+        try:
+            proc = psutil.Process(os.getpid())
+            process_cpu = float(proc.cpu_percent(interval=0.0))
+            system_cpu = float(psutil.cpu_percent(interval=0.0))
+            process_rss = float(proc.memory_info().rss / (1024 * 1024))
+            mem = psutil.virtual_memory()
+            available_mb = float(mem.available / (1024 * 1024))
+            total_mb = float(mem.total / (1024 * 1024))
+        except Exception:
+            pass
+
+    return ResourceSnapshot(
+        ts=time.time(),
+        cpu_count=CPU_COUNT,
+        process_cpu_percent=process_cpu,
+        system_cpu_percent=system_cpu,
+        process_rss_mb=process_rss,
+        system_available_mb=available_mb,
+        system_total_mb=total_mb,
+        disk_free_mb=float(disk.free / (1024 * 1024)),
+        machine_intensity=machine_intensity,
+    )
+
+
+def compute_runtime_tuning(
+    *,
+    max_workers: Optional[int] = None,
+    attempt_batch_size: Optional[int] = None,
+    parallel_attempts: bool = True,
+    machine_intensity: float = DEFAULT_MACHINE_INTENSITY,
+    sample: Optional[ResourceSnapshot] = None,
+) -> RuntimeTuning:
+    intensity = _clip_float(float(machine_intensity), 0.10, 1.00)
+    sample = sample or sample_process_resources(machine_intensity=intensity)
+    baseline_workers = max(1, int(round(CPU_COUNT * intensity)))
+
+    if sample.system_available_mb > 0.0:
+        if sample.system_available_mb < 1024:
+            baseline_workers = min(baseline_workers, 1)
+        elif sample.system_available_mb < 2048:
+            baseline_workers = min(baseline_workers, max(1, CPU_COUNT // 4))
+        elif sample.system_available_mb < 4096:
+            baseline_workers = min(baseline_workers, max(1, CPU_COUNT // 2))
+
+    chosen_workers = max_workers if max_workers is not None else baseline_workers
+    chosen_workers = max(1, min(CPU_COUNT, int(chosen_workers)))
+
+    chosen_batch = attempt_batch_size if attempt_batch_size is not None else chosen_workers
+    chosen_batch = max(1, int(chosen_batch))
+    chosen_batch = min(max(chosen_workers, chosen_batch), max(1, CPU_COUNT * 2))
+
+    return RuntimeTuning(
+        max_workers=chosen_workers,
+        attempt_batch_size=chosen_batch,
+        parallel_attempts=bool(parallel_attempts),
+        machine_intensity=intensity,
+        reason="resource_plan",
+    ).normalized()
+
+
+def validate_generation_request(
+    *,
+    target_count: int,
+    output_dir: Path,
+    base_seed: int,
+    machine_intensity: float,
+    max_workers: Optional[int],
+    attempt_batch_size: Optional[int],
+) -> None:
+    if int(target_count) <= 0:
+        raise ValueError("target_count doit être > 0")
+    if WIDTH <= 0 or HEIGHT <= 0:
+        raise ValueError("WIDTH et HEIGHT doivent être > 0")
+    if PX_PER_CM <= 0:
+        raise ValueError("PX_PER_CM doit être > 0")
+    if int(base_seed) < 0:
+        raise ValueError("base_seed doit être >= 0")
+
+    intensity = _clip_float(float(machine_intensity), 0.10, 1.00)
+    if not (0.10 <= intensity <= 1.00):
+        raise ValueError("machine_intensity doit être compris entre 0.10 et 1.00")
+
+    if max_workers is not None and int(max_workers) <= 0:
+        raise ValueError("max_workers doit être > 0")
+    if attempt_batch_size is not None and int(attempt_batch_size) <= 0:
+        raise ValueError("attempt_batch_size doit être > 0")
+
+    ensure_output_dir(output_dir)
+    test_file = Path(output_dir) / ".write_probe.tmp"
+    test_file.write_text("ok", encoding="utf-8")
+    test_file.unlink()
+
+    snapshot = sample_process_resources(machine_intensity=intensity, output_dir=output_dir)
+    if snapshot.disk_free_mb < 256:
+        raise RuntimeError("Espace disque insuffisant pour générer les sorties")
+    _runtime_log("INFO", "main_preflight", "Préflight local validé", snapshot=snapshot.to_dict())
+
+
+# ============================================================
+# PROFILS
+# ============================================================
+
+def build_seed(target_index: int, local_attempt: int, base_seed: int = DEFAULT_BASE_SEED) -> int:
+    return int(base_seed + target_index * 100000 + local_attempt)
+
+
 def make_profile(seed: int) -> VariantProfile:
     rng = random.Random(seed)
-
     angles = BASE_ANGLES[:]
     rng.shuffle(angles)
     allowed = sorted(set([0] + angles[:rng.randint(8, len(BASE_ANGLES))]))
@@ -295,7 +550,7 @@ def make_profile(seed: int) -> VariantProfile:
 
     zone_weight_boosts = []
     asym_side = rng.choice([0, 1])
-    for idx, zone in enumerate(DENSITY_ZONES):
+    for idx, _zone in enumerate(DENSITY_ZONES):
         w = 1.0
         if idx in (0, 2, 4) and asym_side == 0:
             w += rng.uniform(0.12, 0.34)
@@ -398,7 +653,6 @@ def compute_boundary_mask(canvas: np.ndarray) -> np.ndarray:
 def dilate_mask(mask: np.ndarray, radius: int = 1) -> np.ndarray:
     h, w = mask.shape
     out = np.zeros_like(mask, dtype=bool)
-
     for dy in range(-radius, radius + 1):
         for dx in range(-radius, radius + 1):
             y1 = max(0, dy)
@@ -412,7 +666,6 @@ def dilate_mask(mask: np.ndarray, radius: int = 1) -> np.ndarray:
             sx2 = min(w, w - dx)
 
             out[y1:y2, x1:x2] |= mask[sy1:sy2, sx1:sx2]
-
     return out
 
 
@@ -517,12 +770,10 @@ def largest_component_ratio(mask: np.ndarray) -> float:
 
     visited = np.zeros_like(mask, dtype=bool)
     best = 0
-
     for y in range(h):
         for x in range(w):
             if not mask[y, x] or visited[y, x]:
                 continue
-
             stack = [(y, x)]
             visited[y, x] = True
             size = 0
@@ -530,7 +781,6 @@ def largest_component_ratio(mask: np.ndarray) -> float:
             while stack:
                 cy, cx = stack.pop()
                 size += 1
-
                 if cy > 0 and mask[cy - 1, cx] and not visited[cy - 1, cx]:
                     visited[cy - 1, cx] = True
                     stack.append((cy - 1, cx))
@@ -546,22 +796,18 @@ def largest_component_ratio(mask: np.ndarray) -> float:
 
             if size > best:
                 best = size
-
     return best / total
 
 
 def orientation_score(macro_records: Sequence[MacroRecord]) -> Dict[str, float]:
     if not macro_records:
         return {"oblique_share": 0.0, "vertical_share": 0.0, "dominance_ratio": 1.0}
-
     angles = np.array([m.angle_deg for m in macro_records], dtype=int)
     abs_angles = np.abs(angles)
     oblique_share = float(np.mean(abs_angles >= 15))
     vertical_share = float(np.mean(abs_angles == 0))
-
     _, counts = np.unique(angles, return_counts=True)
     dominance_ratio = float(counts.max() / counts.sum())
-
     return {
         "oblique_share": oblique_share,
         "vertical_share": vertical_share,
@@ -588,9 +834,7 @@ def pick_macro_angle(
     vertical_count = counts.get(0, 0)
     vertical_share = (vertical_count / total) if total else 0.0
 
-    obliques = [a for a in allowed if a != 0]
-    if not obliques:
-        obliques = [a for a in BASE_ANGLES if a != 0]
+    obliques = [a for a in allowed if a != 0] or [a for a in BASE_ANGLES if a != 0]
 
     if force_vertical_floor and 0 in allowed and total >= 4 and vertical_share < TARGET_VERTICAL_SHARE:
         return 0
@@ -686,7 +930,6 @@ def macro_candidate_diagnostics(mask: np.ndarray) -> Dict[str, float]:
     y_span = float((ys.max() - ys.min() + 1) / HEIGHT)
     left_edge = np.mean(xs <= int(WIDTH * 0.14))
     right_edge = np.mean(xs >= int(WIDTH * 0.86))
-
     return {
         "zone_count": float(macro_zone_count(mask)),
         "height_span_ratio": y_span,
@@ -751,7 +994,6 @@ def macro_candidate_is_valid(
             return False
         if float(np.mean(canvas[mask] == IDX_OLIVE)) > 0.46:
             return False
-
     elif color_idx == IDX_TERRE:
         if diag["zone_count"] < 1.0:
             return False
@@ -759,7 +1001,6 @@ def macro_candidate_is_valid(
             return False
         if diag["high_density_overlap"] < MIN_TERRE_HIGH_DENSITY_OVERLAP:
             return False
-
     else:
         if diag["zone_count"] < 1.0:
             return False
@@ -813,15 +1054,10 @@ def macro_visible_pixels(canvas: np.ndarray, origin_map: np.ndarray, color_idx: 
     return int(np.sum((canvas == color_idx) & (origin_map == ORIGIN_MACRO)))
 
 
-def macro_system_metrics(
-    macros: Sequence[MacroRecord],
-    canvas: np.ndarray,
-    origin_map: np.ndarray,
-) -> Dict[str, float]:
+def macro_system_metrics(macros: Sequence[MacroRecord], canvas: np.ndarray, origin_map: np.ndarray) -> Dict[str, float]:
     counts = macro_counts(macros)
     multizone_ratio = float(np.mean([m.zone_count >= 2 for m in macros])) if macros else 0.0
     largest_mask_ratio = max((float(m.mask.sum()) / float(canvas.size) for m in macros), default=0.0)
-
     return {
         "macro_total_count": float(len(macros)),
         "macro_olive_count": float(counts[IDX_OLIVE]),
@@ -883,12 +1119,10 @@ def _macro_size_config(color_idx: int, long_mode: bool) -> Tuple[Tuple[float, fl
         if long_mode:
             return (56, 90), (17, 32), (7, 10)
         return (44, 74), (15, 26), (7, 9)
-
     if color_idx == IDX_TERRE:
         if long_mode:
             return (48, 76), (15, 26), (6, 9)
         return (40, 66), (15, 22), (6, 8)
-
     if long_mode:
         return (44, 62), (15, 22), (6, 8)
     return (40, 54), (15, 18), (5, 7)
@@ -906,7 +1140,6 @@ def try_place_validated_macro(
     require_cross_core: bool = False,
 ) -> bool:
     length_range, width_range, segment_range = _macro_size_config(color_idx, long_mode)
-
     cx, cy = choose_biased_center(rng, profile.zone_weight_boosts)
     angle = pick_macro_angle(macros, profile, rng, force_vertical_floor=(color_idx == IDX_OLIVE))
 
@@ -927,14 +1160,7 @@ def try_place_validated_macro(
     if mask.sum() == 0:
         return False
 
-    if not macro_candidate_is_valid(
-        mask,
-        color_idx,
-        angle,
-        canvas,
-        macros,
-        require_cross_core=require_cross_core,
-    ):
+    if not macro_candidate_is_valid(mask, color_idx, angle, canvas, macros, require_cross_core=require_cross_core):
         return False
 
     center_overlap = zone_overlap_ratio(mask, CENTER_TORSO_MASK)
@@ -992,10 +1218,7 @@ def add_forced_structural_macros(
             rng=rng,
             cx=cx,
             cy=cy,
-            length_px=max(
-                cm_to_px(rng.uniform(*length_range)),
-                int(math.hypot(p2[0] - p1[0], p2[1] - p1[1]) * 1.05),
-            ),
+            length_px=max(cm_to_px(rng.uniform(*length_range)), int(math.hypot(p2[0] - p1[0], p2[1] - p1[1]) * 1.05)),
             width_px=cm_to_px(rng.uniform(*width_range)),
             angle_from_vertical_deg=angle,
             segments=rng.randint(*segment_range),
@@ -1060,10 +1283,7 @@ def add_macros(
                 break
 
             long_mode = bool(current_count < max(2, min_counts[color_idx] // 2))
-            require_cross_core = bool(
-                color_idx in (IDX_OLIVE, IDX_TERRE)
-                and current_count < max(2, min_counts[color_idx] // 2)
-            )
+            require_cross_core = bool(color_idx in (IDX_OLIVE, IDX_TERRE) and current_count < max(2, min_counts[color_idx] // 2))
 
             try_place_validated_macro(
                 canvas,
@@ -1110,14 +1330,8 @@ def enforce_macro_population(
         if stats["macro_total_count"] < MIN_TOTAL_MACRO_COUNT:
             priority.extend([IDX_OLIVE, IDX_TERRE, IDX_GRIS])
 
-        if not priority:
-            break
-
-        color_idx = priority[(repair_attempts - 1) % len(priority)]
-        require_cross_core = bool(
-            stats["macro_multizone_ratio"] < MIN_GLOBAL_MACRO_MULTIZONE_RATIO
-            and color_idx in (IDX_OLIVE, IDX_TERRE)
-        )
+        color_idx = priority[(repair_attempts - 1) % len(priority)] if priority else IDX_OLIVE
+        require_cross_core = bool(stats["macro_multizone_ratio"] < MIN_GLOBAL_MACRO_MULTIZONE_RATIO and color_idx in (IDX_OLIVE, IDX_TERRE))
 
         try_place_validated_macro(
             canvas,
@@ -1188,7 +1402,6 @@ def enforce_macro_angle_discipline(
     while repair_attempts < TARGET_CENTER_REPAIR_STEPS:
         repair_attempts += 1
         orient = orientation_score(macros)
-
         if (
             orient["oblique_share"] >= MIN_OBLIQUE_SHARE
             and MIN_VERTICAL_SHARE <= orient["vertical_share"] <= MAX_VERTICAL_SHARE
@@ -1203,10 +1416,11 @@ def enforce_macro_angle_discipline(
 
         color = IDX_OLIVE if rng.random() < 0.70 else IDX_TERRE
         length_range, width_range, segment_range = _macro_size_config(color, False)
+        cx, cy = choose_biased_center(rng, profile.zone_weight_boosts)
         poly = jagged_spine_poly(
             rng=rng,
-            cx=choose_biased_center(rng, profile.zone_weight_boosts)[0],
-            cy=choose_biased_center(rng, profile.zone_weight_boosts)[1],
+            cx=cx,
+            cy=cy,
             length_px=cm_to_px(rng.uniform(max(40, length_range[0]), max(48, length_range[1]))),
             width_px=cm_to_px(rng.uniform(max(15, width_range[0]), max(18, width_range[1]))),
             angle_from_vertical_deg=angle,
@@ -1276,21 +1490,13 @@ def build_silhouette_mask(width: int, height: int) -> np.ndarray:
     torso_h = int(height * 0.38)
     torso_x1 = (width - torso_w) // 2
     torso_y1 = int(height * 0.16)
-    draw.rounded_rectangle(
-        [torso_x1, torso_y1, torso_x1 + torso_w, torso_y1 + torso_h],
-        radius=int(width * 0.03),
-        fill=255,
-    )
+    draw.rounded_rectangle([torso_x1, torso_y1, torso_x1 + torso_w, torso_y1 + torso_h], radius=int(width * 0.03), fill=255)
 
     shoulder_w = int(width * 0.58)
     shoulder_h = int(height * 0.10)
     shoulder_x1 = (width - shoulder_w) // 2
     shoulder_y1 = int(height * 0.14)
-    draw.rounded_rectangle(
-        [shoulder_x1, shoulder_y1, shoulder_x1 + shoulder_w, shoulder_y1 + shoulder_h],
-        radius=int(width * 0.025),
-        fill=255,
-    )
+    draw.rounded_rectangle([shoulder_x1, shoulder_y1, shoulder_x1 + shoulder_w, shoulder_y1 + shoulder_h], radius=int(width * 0.025), fill=255)
 
     arm_w = int(width * 0.11)
     arm_h = int(height * 0.32)
@@ -1344,7 +1550,6 @@ def contour_break_score(index_canvas: np.ndarray) -> Tuple[float, float]:
     h, w = index_canvas.shape
     sil = build_silhouette_mask(w, h)
     bound = silhouette_boundary(sil)
-
     band = dilate_mask(bound, radius=5) & sil
     vals = index_canvas[band]
     if vals.size == 0:
@@ -1389,7 +1594,7 @@ def main_metrics_score(metrics: Dict[str, float]) -> float:
     parts = [
         clamp01((metrics["largest_olive_component_ratio"] - 0.12) / 0.18),
         clamp01(1.0 - metrics["center_empty_ratio"] / 0.66),
-        clamp01(1.0 - metrics["mirror_similarity"] / 0.90),
+        clamp01(1.0 - metrics.get("mirror_similarity", 1.0) / 0.90),
         clamp01(1.0 - metrics.get("central_brown_continuity", 1.0) / 0.55),
         clamp01((metrics["olive_multizone_share"] - 0.30) / 0.35),
         clamp01(1.0 - abs(metrics["boundary_density"] - 0.13) / 0.11),
@@ -1465,7 +1670,6 @@ def military_visual_discipline_score(metrics: Dict[str, float]) -> Dict[str, flo
 
 def generate_one_variant(profile: VariantProfile) -> Tuple[Image.Image, np.ndarray, Dict[str, float]]:
     rng = random.Random(profile.seed)
-
     canvas = np.full((HEIGHT, WIDTH), IDX_COYOTE, dtype=np.uint8)
     origin_map = np.full((HEIGHT, WIDTH), ORIGIN_BACKGROUND, dtype=np.uint8)
 
@@ -1509,13 +1713,7 @@ def generate_one_variant(profile: VariantProfile) -> Tuple[Image.Image, np.ndarr
 def generate_candidate_from_seed(seed: int) -> CandidateResult:
     profile = make_profile(seed)
     image, ratios, metrics = generate_one_variant(profile)
-    return CandidateResult(
-        seed=seed,
-        profile=profile,
-        image=image,
-        ratios=ratios,
-        metrics=metrics,
-    )
+    return CandidateResult(seed=seed, profile=profile, image=image, ratios=ratios, metrics=metrics)
 
 
 async def async_generate_candidate_from_seed(seed: int) -> CandidateResult:
@@ -1528,7 +1726,6 @@ async def async_generate_candidate_from_seed(seed: int) -> CandidateResult:
 
 def variant_is_valid(rs: np.ndarray, metrics: Dict[str, float]) -> bool:
     abs_err = np.abs(rs - TARGET)
-
     if np.any(abs_err > MAX_ABS_ERROR_PER_COLOR):
         return False
     if float(np.mean(abs_err)) > MAX_MEAN_ABS_ERROR:
@@ -1636,16 +1833,10 @@ async def async_save_candidate_image(candidate: CandidateResult, path: Path) -> 
     return await asyncio.to_thread(save_candidate_image, candidate, path)
 
 
-def candidate_row(
-    target_index: int,
-    local_attempt: int,
-    global_attempt: int,
-    candidate: CandidateResult,
-) -> Dict[str, object]:
+def candidate_row(target_index: int, local_attempt: int, global_attempt: int, candidate: CandidateResult) -> Dict[str, object]:
     rs = candidate.ratios
     metrics = candidate.metrics
-
-    row = {
+    return {
         "index": target_index,
         "seed": candidate.seed,
         "attempts_for_this_image": local_attempt,
@@ -1686,7 +1877,6 @@ def candidate_row(
         "visual_military_score": round(metrics["visual_military_score"], 5),
         "angles": " ".join(map(str, candidate.profile.allowed_angles)),
     }
-    return row
 
 
 def write_report(rows: List[Dict[str, object]], output_dir: Path, filename: str = "rapport_camouflages.csv") -> Path:
@@ -1705,11 +1895,7 @@ def write_report(rows: List[Dict[str, object]], output_dir: Path, filename: str 
     return csv_path
 
 
-async def async_write_report(
-    rows: List[Dict[str, object]],
-    output_dir: Path,
-    filename: str = "rapport_camouflages.csv",
-) -> Path:
+async def async_write_report(rows: List[Dict[str, object]], output_dir: Path, filename: str = "rapport_camouflages.csv") -> Path:
     return await asyncio.to_thread(write_report, rows, output_dir, filename)
 
 
@@ -1723,12 +1909,7 @@ def generate_and_validate_from_seed(seed: int) -> Tuple[CandidateResult, bool]:
     return candidate, accepted
 
 
-def _batch_attempt_seeds(
-    target_index: int,
-    start_attempt: int,
-    batch_size: int,
-    base_seed: int,
-) -> List[Tuple[int, int]]:
+def _batch_attempt_seeds(target_index: int, start_attempt: int, batch_size: int, base_seed: int) -> List[Tuple[int, int]]:
     return [
         (local_attempt, build_seed(target_index, local_attempt, base_seed=base_seed))
         for local_attempt in range(start_attempt, start_attempt + batch_size)
@@ -1736,30 +1917,52 @@ def _batch_attempt_seeds(
 
 
 # ============================================================
-# GÉNÉRATION SYNCHRONE
+# GÉNÉRATION SYNCHRONE / STREAMING
 # ============================================================
 
 def generate_all(
     target_count: int = N_VARIANTS_REQUIRED,
     output_dir: Path = OUTPUT_DIR,
     base_seed: int = DEFAULT_BASE_SEED,
-    progress_callback: Optional[
-        Callable[[int, int, int, int, CandidateResult, bool], None]
-    ] = None,
-    stop_requested: Optional[Callable[[], bool]] = None,
-    max_workers: int = DEFAULT_MAX_WORKERS,
-    attempt_batch_size: int = DEFAULT_ATTEMPT_BATCH_SIZE,
+    progress_callback: Optional[ProgressCallback] = None,
+    stop_requested: Optional[StopCallback] = None,
+    max_workers: Optional[int] = None,
+    attempt_batch_size: Optional[int] = None,
     parallel_attempts: bool = True,
+    machine_intensity: float = DEFAULT_MACHINE_INTENSITY,
+    strict_preflight: bool = True,
+    preflight_modules: Sequence[str] | None = ("test_main", "test_start"),
+    resource_sample_every_batches: int = DEFAULT_RESOURCE_SAMPLE_EVERY_BATCHES,
+    enable_live_supervisor: bool = True,
 ) -> List[Dict[str, object]]:
     output_dir = ensure_output_dir(output_dir)
+    validate_generation_request(
+        target_count=target_count,
+        output_dir=output_dir,
+        base_seed=base_seed,
+        machine_intensity=machine_intensity,
+        max_workers=max_workers,
+        attempt_batch_size=attempt_batch_size,
+    )
+    _run_log_preflight(strict=strict_preflight, output_dir=output_dir, module_names=preflight_modules)
+
+    resource_sample_every_batches = max(1, int(resource_sample_every_batches))
+    tuning = compute_runtime_tuning(
+        max_workers=max_workers,
+        attempt_batch_size=attempt_batch_size,
+        parallel_attempts=parallel_attempts,
+        machine_intensity=machine_intensity,
+        sample=sample_process_resources(machine_intensity=machine_intensity, output_dir=output_dir),
+    )
+    _runtime_log("INFO", "main_generate_all", "Plan de charge initial", tuning=tuning.__dict__)
+
+    if enable_live_supervisor:
+        advice = _supervisor_feedback("generation_started", tuning=tuning.__dict__, output_dir=str(output_dir), target_count=target_count)
+        tuning = _merge_supervisor_tuning(tuning, advice, fallback_machine_intensity=machine_intensity)
 
     rows: List[Dict[str, object]] = []
     total_attempts = 0
-    max_workers = max(1, int(max_workers))
-    attempt_batch_size = max(1, int(attempt_batch_size))
-
-    use_parallel = parallel_attempts and max_workers > 1 and attempt_batch_size > 1
-    pool = get_process_pool(max_workers) if use_parallel else None
+    batch_counter = 0
 
     for target_index in range(1, target_count + 1):
         local_attempt = 1
@@ -1769,87 +1972,148 @@ def generate_all(
                 write_report(rows, output_dir)
                 return rows
 
-            if use_parallel and pool is not None:
-                batch = _batch_attempt_seeds(
-                    target_index=target_index,
-                    start_attempt=local_attempt,
-                    batch_size=attempt_batch_size,
-                    base_seed=base_seed,
-                )
+            batch_counter += 1
+            if batch_counter % resource_sample_every_batches == 0:
+                snapshot = sample_process_resources(machine_intensity=tuning.machine_intensity, output_dir=output_dir)
+                if enable_live_supervisor:
+                    advice = _supervisor_feedback(
+                        "resource_snapshot",
+                        target_index=target_index,
+                        local_attempt=local_attempt,
+                        snapshot=snapshot.to_dict(),
+                        tuning=tuning.__dict__,
+                    )
+                    tuning = _merge_supervisor_tuning(tuning, advice)
+                else:
+                    snapshot = snapshot  # explicit
 
-                futures = [
-                    pool.submit(generate_and_validate_from_seed, seed)
-                    for _, seed in batch
-                ]
+            use_parallel = bool(tuning.parallel_attempts and tuning.max_workers > 1 and tuning.attempt_batch_size > 1)
+
+            if use_parallel:
+                pool = get_process_pool(tuning.max_workers)
+                batch = _batch_attempt_seeds(target_index, local_attempt, tuning.attempt_batch_size, base_seed)
+                submitted: Dict[Any, Tuple[int, int, float]] = {}
+                for attempt_no, seed in batch:
+                    fut = pool.submit(generate_and_validate_from_seed, seed)
+                    submitted[fut] = (attempt_no, seed, time.time())
 
                 batch_results: List[Tuple[int, CandidateResult, bool]] = []
-                for (attempt_no, _seed), fut in zip(batch, futures):
+                for fut in as_completed(list(submitted.keys())):
+                    attempt_no, seed, started_at = submitted[fut]
                     candidate, accepted = fut.result()
+                    duration_s = time.time() - started_at
                     total_attempts += 1
                     batch_results.append((attempt_no, candidate, accepted))
 
                     if progress_callback is not None:
-                        progress_callback(
-                            target_index,
-                            attempt_no,
-                            total_attempts,
-                            target_count,
-                            candidate,
-                            accepted,
-                        )
+                        progress_callback(target_index, attempt_no, total_attempts, target_count, candidate, accepted)
 
-                accepted_result = next(((a, c) for a, c, ok in batch_results if ok), None)
+                    if enable_live_supervisor:
+                        advice = _supervisor_feedback(
+                            "attempt_finished",
+                            target_index=target_index,
+                            local_attempt=attempt_no,
+                            seed=seed,
+                            accepted=accepted,
+                            duration_s=duration_s,
+                            total_attempts=total_attempts,
+                            tuning=tuning.__dict__,
+                            ratios={COLOR_NAMES[i]: float(candidate.ratios[i]) for i in range(4)},
+                            metrics={k: float(v) for k, v in candidate.metrics.items()},
+                        )
+                        tuning = _merge_supervisor_tuning(tuning, advice)
+
+                accepted_result = next(((a, c) for a, c, ok in sorted(batch_results, key=lambda x: x[0]) if ok), None)
                 if accepted_result is None:
-                    local_attempt += attempt_batch_size
+                    local_attempt += tuning.attempt_batch_size
+                    if enable_live_supervisor:
+                        advice = _supervisor_feedback(
+                            "batch_finished",
+                            target_index=target_index,
+                            accepted=False,
+                            tuning=tuning.__dict__,
+                            next_local_attempt=local_attempt,
+                        )
+                        tuning = _merge_supervisor_tuning(tuning, advice)
                     continue
 
                 accepted_attempt, accepted_candidate = accepted_result
 
             else:
                 seed = build_seed(target_index, local_attempt, base_seed=base_seed)
+                started_at = time.time()
                 accepted_candidate = generate_candidate_from_seed(seed)
                 accepted = validate_candidate_result(accepted_candidate)
+                duration_s = time.time() - started_at
                 total_attempts += 1
 
                 if progress_callback is not None:
-                    progress_callback(
-                        target_index,
-                        local_attempt,
-                        total_attempts,
-                        target_count,
-                        accepted_candidate,
-                        accepted,
+                    progress_callback(target_index, local_attempt, total_attempts, target_count, accepted_candidate, accepted)
+
+                if enable_live_supervisor:
+                    advice = _supervisor_feedback(
+                        "attempt_finished",
+                        target_index=target_index,
+                        local_attempt=local_attempt,
+                        seed=seed,
+                        accepted=accepted,
+                        duration_s=duration_s,
+                        total_attempts=total_attempts,
+                        tuning=tuning.__dict__,
+                        ratios={COLOR_NAMES[i]: float(accepted_candidate.ratios[i]) for i in range(4)},
+                        metrics={k: float(v) for k, v in accepted_candidate.metrics.items()},
                     )
+                    tuning = _merge_supervisor_tuning(tuning, advice)
 
                 if not accepted:
                     local_attempt += 1
                     continue
-
                 accepted_attempt = local_attempt
 
             filename = output_dir / f"camouflage_{target_index:03d}.png"
             save_candidate_image(accepted_candidate, filename)
+            rows.append(candidate_row(target_index, accepted_attempt, total_attempts, accepted_candidate))
 
-            rows.append(
-                candidate_row(
+            if enable_live_supervisor:
+                advice = _supervisor_feedback(
+                    "candidate_accepted",
                     target_index=target_index,
-                    local_attempt=accepted_attempt,
-                    global_attempt=total_attempts,
-                    candidate=accepted_candidate,
+                    accepted_attempt=accepted_attempt,
+                    total_attempts=total_attempts,
+                    tuning=tuning.__dict__,
+                    output_file=str(filename),
                 )
-            )
+                tuning = _merge_supervisor_tuning(tuning, advice)
+
             break
 
     write_report(rows, output_dir)
+
+    if enable_live_supervisor:
+        _supervisor_feedback(
+            "generation_finished",
+            total_rows=len(rows),
+            total_attempts=total_attempts,
+            tuning=tuning.__dict__,
+            output_dir=str(output_dir),
+        )
+
     return rows
 
 
 # ============================================================
-# GÉNÉRATION ASYNCHRONE
+# GÉNÉRATION ASYNCHRONE / STREAMING
 # ============================================================
 
-AsyncProgressCallback = Callable[[int, int, int, int, CandidateResult, bool], Awaitable[None]]
-AsyncStopCallable = Callable[[], Awaitable[bool]]
+
+async def _wrap_async_attempt(
+    fut: asyncio.Future,
+    attempt_no: int,
+    seed: int,
+    started_at: float,
+) -> Tuple[int, int, float, CandidateResult, bool]:
+    candidate, accepted = await fut
+    return attempt_no, seed, started_at, candidate, accepted
 
 
 async def async_generate_all(
@@ -1857,21 +2121,45 @@ async def async_generate_all(
     output_dir: Path = OUTPUT_DIR,
     base_seed: int = DEFAULT_BASE_SEED,
     progress_callback: Optional[AsyncProgressCallback] = None,
-    stop_requested: Optional[AsyncStopCallable] = None,
-    max_workers: int = DEFAULT_MAX_WORKERS,
-    attempt_batch_size: int = DEFAULT_ATTEMPT_BATCH_SIZE,
+    stop_requested: Optional[AsyncStopCallback] = None,
+    max_workers: Optional[int] = None,
+    attempt_batch_size: Optional[int] = None,
     parallel_attempts: bool = True,
+    machine_intensity: float = DEFAULT_MACHINE_INTENSITY,
+    strict_preflight: bool = True,
+    preflight_modules: Sequence[str] | None = ("test_main", "test_start"),
+    resource_sample_every_batches: int = DEFAULT_RESOURCE_SAMPLE_EVERY_BATCHES,
+    enable_live_supervisor: bool = True,
 ) -> List[Dict[str, object]]:
     output_dir = ensure_output_dir(output_dir)
+    validate_generation_request(
+        target_count=target_count,
+        output_dir=output_dir,
+        base_seed=base_seed,
+        machine_intensity=machine_intensity,
+        max_workers=max_workers,
+        attempt_batch_size=attempt_batch_size,
+    )
+    _run_log_preflight(strict=strict_preflight, output_dir=output_dir, module_names=preflight_modules)
+
+    resource_sample_every_batches = max(1, int(resource_sample_every_batches))
+    tuning = compute_runtime_tuning(
+        max_workers=max_workers,
+        attempt_batch_size=attempt_batch_size,
+        parallel_attempts=parallel_attempts,
+        machine_intensity=machine_intensity,
+        sample=sample_process_resources(machine_intensity=machine_intensity, output_dir=output_dir),
+    )
+    _runtime_log("INFO", "main_async_generate_all", "Plan de charge initial", tuning=tuning.__dict__)
+
+    if enable_live_supervisor:
+        advice = _supervisor_feedback("generation_started", tuning=tuning.__dict__, output_dir=str(output_dir), target_count=target_count)
+        tuning = _merge_supervisor_tuning(tuning, advice, fallback_machine_intensity=machine_intensity)
 
     rows: List[Dict[str, object]] = []
     total_attempts = 0
-    max_workers = max(1, int(max_workers))
-    attempt_batch_size = max(1, int(attempt_batch_size))
-
-    use_parallel = parallel_attempts and max_workers > 1 and attempt_batch_size > 1
+    batch_counter = 0
     loop = asyncio.get_running_loop()
-    pool = get_process_pool(max_workers) if use_parallel else None
 
     for target_index in range(1, target_count + 1):
         local_attempt = 1
@@ -1881,57 +2169,98 @@ async def async_generate_all(
                 await async_write_report(rows, output_dir)
                 return rows
 
-            if use_parallel and pool is not None:
-                batch = _batch_attempt_seeds(
-                    target_index=target_index,
-                    start_attempt=local_attempt,
-                    batch_size=attempt_batch_size,
-                    base_seed=base_seed,
-                )
+            batch_counter += 1
+            if batch_counter % resource_sample_every_batches == 0:
+                snapshot = sample_process_resources(machine_intensity=tuning.machine_intensity, output_dir=output_dir)
+                if enable_live_supervisor:
+                    advice = _supervisor_feedback(
+                        "resource_snapshot",
+                        target_index=target_index,
+                        local_attempt=local_attempt,
+                        snapshot=snapshot.to_dict(),
+                        tuning=tuning.__dict__,
+                    )
+                    tuning = _merge_supervisor_tuning(tuning, advice)
 
-                tasks = [
-                    loop.run_in_executor(pool, generate_and_validate_from_seed, seed)
-                    for _, seed in batch
-                ]
-                raw_results = await asyncio.gather(*tasks)
+            use_parallel = bool(tuning.parallel_attempts and tuning.max_workers > 1 and tuning.attempt_batch_size > 1)
+
+            if use_parallel:
+                pool = get_process_pool(tuning.max_workers)
+                batch = _batch_attempt_seeds(target_index, local_attempt, tuning.attempt_batch_size, base_seed)
+
+                wrapped_tasks: List[asyncio.Task] = []
+                for attempt_no, seed in batch:
+                    fut = loop.run_in_executor(pool, generate_and_validate_from_seed, seed)
+                    wrapped_tasks.append(
+                        asyncio.create_task(_wrap_async_attempt(fut, attempt_no, seed, time.time()))
+                    )
 
                 batch_results: List[Tuple[int, CandidateResult, bool]] = []
-                for (attempt_no, _seed), (candidate, accepted) in zip(batch, raw_results):
+                for done in asyncio.as_completed(wrapped_tasks):
+                    attempt_no, seed, started_at, candidate, accepted = await done
+                    duration_s = time.time() - started_at
                     total_attempts += 1
                     batch_results.append((attempt_no, candidate, accepted))
 
                     if progress_callback is not None:
-                        await progress_callback(
-                            target_index,
-                            attempt_no,
-                            total_attempts,
-                            target_count,
-                            candidate,
-                            accepted,
-                        )
+                        await progress_callback(target_index, attempt_no, total_attempts, target_count, candidate, accepted)
 
-                accepted_result = next(((a, c) for a, c, ok in batch_results if ok), None)
+                    if enable_live_supervisor:
+                        advice = _supervisor_feedback(
+                            "attempt_finished",
+                            target_index=target_index,
+                            local_attempt=attempt_no,
+                            seed=seed,
+                            accepted=accepted,
+                            duration_s=duration_s,
+                            total_attempts=total_attempts,
+                            tuning=tuning.__dict__,
+                            ratios={COLOR_NAMES[i]: float(candidate.ratios[i]) for i in range(4)},
+                            metrics={k: float(v) for k, v in candidate.metrics.items()},
+                        )
+                        tuning = _merge_supervisor_tuning(tuning, advice)
+
+                accepted_result = next(((a, c) for a, c, ok in sorted(batch_results, key=lambda x: x[0]) if ok), None)
                 if accepted_result is None:
-                    local_attempt += attempt_batch_size
+                    local_attempt += tuning.attempt_batch_size
+                    if enable_live_supervisor:
+                        advice = _supervisor_feedback(
+                            "batch_finished",
+                            target_index=target_index,
+                            accepted=False,
+                            tuning=tuning.__dict__,
+                            next_local_attempt=local_attempt,
+                        )
+                        tuning = _merge_supervisor_tuning(tuning, advice)
                     continue
 
                 accepted_attempt, accepted_candidate = accepted_result
 
             else:
                 seed = build_seed(target_index, local_attempt, base_seed=base_seed)
+                started_at = time.time()
                 accepted_candidate = await async_generate_candidate_from_seed(seed)
                 accepted = await async_validate_candidate_result(accepted_candidate)
+                duration_s = time.time() - started_at
                 total_attempts += 1
 
                 if progress_callback is not None:
-                    await progress_callback(
-                        target_index,
-                        local_attempt,
-                        total_attempts,
-                        target_count,
-                        accepted_candidate,
-                        accepted,
+                    await progress_callback(target_index, local_attempt, total_attempts, target_count, accepted_candidate, accepted)
+
+                if enable_live_supervisor:
+                    advice = _supervisor_feedback(
+                        "attempt_finished",
+                        target_index=target_index,
+                        local_attempt=local_attempt,
+                        seed=seed,
+                        accepted=accepted,
+                        duration_s=duration_s,
+                        total_attempts=total_attempts,
+                        tuning=tuning.__dict__,
+                        ratios={COLOR_NAMES[i]: float(accepted_candidate.ratios[i]) for i in range(4)},
+                        metrics={k: float(v) for k, v in accepted_candidate.metrics.items()},
                     )
+                    tuning = _merge_supervisor_tuning(tuning, advice)
 
                 if not accepted:
                     local_attempt += 1
@@ -1941,18 +2270,32 @@ async def async_generate_all(
 
             filename = output_dir / f"camouflage_{target_index:03d}.png"
             await async_save_candidate_image(accepted_candidate, filename)
+            rows.append(candidate_row(target_index, accepted_attempt, total_attempts, accepted_candidate))
 
-            rows.append(
-                candidate_row(
+            if enable_live_supervisor:
+                advice = _supervisor_feedback(
+                    "candidate_accepted",
                     target_index=target_index,
-                    local_attempt=accepted_attempt,
-                    global_attempt=total_attempts,
-                    candidate=accepted_candidate,
+                    accepted_attempt=accepted_attempt,
+                    total_attempts=total_attempts,
+                    tuning=tuning.__dict__,
+                    output_file=str(filename),
                 )
-            )
+                tuning = _merge_supervisor_tuning(tuning, advice)
+
             break
 
     await async_write_report(rows, output_dir)
+
+    if enable_live_supervisor:
+        _supervisor_feedback(
+            "generation_finished",
+            total_rows=len(rows),
+            total_attempts=total_attempts,
+            tuning=tuning.__dict__,
+            output_dir=str(output_dir),
+        )
+
     return rows
 
 
@@ -1966,17 +2309,18 @@ if __name__ == "__main__":
             target_count=N_VARIANTS_REQUIRED,
             output_dir=OUTPUT_DIR,
             base_seed=DEFAULT_BASE_SEED,
-            max_workers=DEFAULT_MAX_WORKERS,
-            attempt_batch_size=DEFAULT_ATTEMPT_BATCH_SIZE,
+            max_workers=None,
+            attempt_batch_size=None,
             parallel_attempts=True,
+            machine_intensity=DEFAULT_MACHINE_INTENSITY,
+            strict_preflight=False,
+            enable_live_supervisor=True,
         )
-
         csv_path = OUTPUT_DIR / "rapport_camouflages.csv"
         print("\nTerminé.")
         print(f"Images validées : {len(rows)}/{N_VARIANTS_REQUIRED}")
         print(f"Dossier : {OUTPUT_DIR.resolve()}")
         print(f"CSV : {csv_path.resolve()}")
-        print(f"Workers : {DEFAULT_MAX_WORKERS}")
-        print(f"Batch size : {DEFAULT_ATTEMPT_BATCH_SIZE}")
+        print(f"Workers max dynamiques : {DEFAULT_MAX_WORKERS}")
     finally:
         shutdown_process_pool()
