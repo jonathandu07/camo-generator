@@ -2,20 +2,22 @@
 """
 main.py
 Camouflage Armée Fédérale Europe
-Version module-friendly + async-friendly + accélération contrôlée.
+Version module-friendly + async-friendly + accélération débridée.
 
 Points clés :
 - API synchrone conservée
 - API asynchrone ajoutée
 - génération séquentielle stricte par image conservée
-- aucun passage à l'image suivante tant que la précédente n'est pas validée
+- aucun passage à l'image suivante tant que la précédente n'est validée
 - accélération par lots de tentatives parallèles pour une même image
 - critères de validation inchangés
 
 Corrections / améliorations :
-- meilleure exploitation CPU via ProcessPoolExecutor plus agressif ;
+- utilisation de tous les CPU logiques par défaut ;
+- plus de plafonds artificiels à 12 workers / 8 batch ;
+- parallélisme maintenu même avec la correction adaptative activée ;
 - pool recréé automatiquement si le nombre de workers change ;
-- limitation des threads BLAS/OpenMP dans les workers pour éviter la sur-saturation ;
+- limitation BLAS/OpenMP configurable dans les workers ;
 - arrêt propre du pool en fin d'exécution ;
 - comportement strictement séquentiel par image conservé ;
 - aucune limite artificielle sur le nombre de tentatives par image.
@@ -25,13 +27,15 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import importlib
 import math
 import os
 import random
+import sys
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -64,12 +68,15 @@ COLOR_NAMES = [
     "vert_de_gris",
 ]
 
-RGB = np.array([
-    (0x81, 0x61, 0x3C),  # Coyote Brown
-    (0x55, 0x54, 0x3F),  # Vert Olive
-    (0x7C, 0x6D, 0x66),  # Terre de France
-    (0x57, 0x5D, 0x57),  # Vert-de-gris
-], dtype=np.uint8)
+RGB = np.array(
+    [
+        (0x81, 0x61, 0x3C),  # Coyote Brown
+        (0x55, 0x54, 0x3F),  # Vert Olive
+        (0x7C, 0x6D, 0x66),  # Terre de France
+        (0x57, 0x5D, 0x57),  # Vert-de-gris
+    ],
+    dtype=np.uint8,
+)
 
 TARGET = np.array([0.32, 0.28, 0.22, 0.18], dtype=float)
 
@@ -149,10 +156,18 @@ MAX_MACRO_PLACEMENT_ATTEMPTS_GRIS = 40
 MAX_TRANSITION_PLACEMENTS = 900
 MAX_MICRO_CLUSTER_PLACEMENTS = 1200
 
-# Accélération contrôlée
+# Accélération débridée
 CPU_COUNT = max(1, os.cpu_count() or 1)
-DEFAULT_MAX_WORKERS = max(1, min(12, CPU_COUNT - 2 if CPU_COUNT > 4 else CPU_COUNT))
-DEFAULT_ATTEMPT_BATCH_SIZE = max(1, min(8, DEFAULT_MAX_WORKERS))
+CPU_HEADROOM = max(0, int(os.environ.get("CAMO_CPU_HEADROOM", "0")))
+CPU_OVERCOMMIT = max(1, int(os.environ.get("CAMO_CPU_OVERCOMMIT", "1")))
+BATCH_MULTIPLIER = max(1, int(os.environ.get("CAMO_BATCH_MULTIPLIER", "1")))
+
+DEFAULT_MAX_WORKERS = max(1, (CPU_COUNT - CPU_HEADROOM) * CPU_OVERCOMMIT)
+DEFAULT_ATTEMPT_BATCH_SIZE = max(1, DEFAULT_MAX_WORKERS * BATCH_MULTIPLIER)
+
+LIMIT_NUMERIC_THREADS_IN_WORKERS = str(
+    os.environ.get("CAMO_LIMIT_NUMERIC_THREADS", "1")
+).strip().lower() not in {"0", "false", "no", "off"}
 
 # Validation perceptive / visuelle
 VISUAL_MIN_SILHOUETTE_COLOR_DIVERSITY = 0.62
@@ -166,6 +181,18 @@ MIN_PERIPHERY_NON_COYOTE_RATIO = 1.05
 MIN_MACRO_OLIVE_VISIBLE_RATIO = 0.16
 MAX_MACRO_TERRE_VISIBLE_RATIO = 0.09
 MAX_MACRO_GRIS_VISIBLE_RATIO = 0.015
+
+# Discipline de génération pilotée
+TARGET_VERTICAL_SHARE = 0.16
+MAX_VERTICAL_SOFT_TARGET = 0.24
+TARGET_PERIPHERY_REPAIR_STEPS = 80
+TARGET_CENTER_REPAIR_STEPS = 56
+SEMANTIC_ALLOWED_COLORS = {
+    ORIGIN_BACKGROUND: (IDX_COYOTE, IDX_OLIVE),
+    ORIGIN_MACRO: (IDX_OLIVE, IDX_TERRE),
+    ORIGIN_TRANSITION: (IDX_COYOTE, IDX_OLIVE, IDX_TERRE),
+    ORIGIN_MICRO: (IDX_TERRE, IDX_GRIS),
+}
 
 
 # ============================================================
@@ -186,6 +213,284 @@ class VariantProfile:
     micro_lateral_jitter: float
     micro_tip_taper: float
     micro_edge_break: float
+    angle_pool: Tuple[int, ...] = field(default_factory=tuple)
+    zone_weight_boosts: Tuple[float, ...] = field(
+        default_factory=lambda: tuple(1.0 for _ in DENSITY_ZONES)
+    )
+    olive_macro_target_scale: float = 1.0
+    terre_macro_target_scale: float = 1.0
+    gris_macro_target_scale: float = 1.0
+    transition_terre_bias: float = 0.0
+    transition_olive_bias: float = 0.0
+    transition_coyote_bias: float = 0.0
+    micro_gris_bias: float = 0.0
+    micro_terre_bias: float = 0.0
+    center_torso_overlap_scale: float = 1.0
+    extra_boundary_nudge_passes: int = 0
+    boundary_sample_ratio_scale: float = 1.0
+
+
+@dataclass
+class AdaptiveGenerationState:
+    consecutive_rejections: int = 0
+    total_rejections: int = 0
+    fail_counter: Dict[str, int] = field(default_factory=dict)
+    olive_pressure: float = 0.0
+    terre_pressure: float = 0.0
+    gris_pressure: float = 0.0
+    coyote_deficit_pressure: float = 0.0
+    coyote_excess_pressure: float = 0.0
+    boundary_low_pressure: float = 0.0
+    boundary_high_pressure: float = 0.0
+    center_relief_pressure: float = 0.0
+    asymmetry_pressure: float = 0.0
+    oblique_pressure: float = 0.0
+    vertical_pressure: float = 0.0
+    vertical_excess_pressure: float = 0.0
+    angle_diversity_pressure: float = 0.0
+    gris_macro_cap_pressure: float = 0.0
+    last_rules: List[str] = field(default_factory=list)
+
+    def _bump(self, name: str, amount: float, cap: float = 6.0) -> None:
+        setattr(
+            self,
+            name,
+            min(cap, float(getattr(self, name)) + max(0.0, float(amount))),
+        )
+
+    def register_success(self) -> None:
+        self.consecutive_rejections = 0
+        self.last_rules = []
+        decay_fields = (
+            "olive_pressure",
+            "terre_pressure",
+            "gris_pressure",
+            "coyote_deficit_pressure",
+            "coyote_excess_pressure",
+            "boundary_low_pressure",
+            "boundary_high_pressure",
+            "center_relief_pressure",
+            "asymmetry_pressure",
+            "oblique_pressure",
+            "vertical_pressure",
+            "vertical_excess_pressure",
+            "angle_diversity_pressure",
+            "gris_macro_cap_pressure",
+        )
+        for name in decay_fields:
+            setattr(self, name, float(getattr(self, name)) * 0.52)
+
+    def register_failures(self, failures: Sequence[Dict[str, Any]]) -> None:
+        self.consecutive_rejections += 1
+        self.total_rejections += 1
+        self.last_rules = []
+
+        for item in failures:
+            rule = str(item.get("rule", "")).strip()
+            if not rule:
+                continue
+
+            self.last_rules.append(rule)
+            self.fail_counter[rule] = int(self.fail_counter.get(rule, 0)) + 1
+
+            delta = _safe_failure_float(item.get("delta"), default=0.05)
+            min_value = item.get("min_value")
+            max_value = item.get("max_value")
+            actual = _safe_failure_float(item.get("actual"), default=0.0)
+            target = _safe_failure_float(item.get("target"), default=0.0)
+            intensity = min(2.4, max(0.30, delta * 18.0 + 0.20))
+
+            if rule in {
+                "ratio_olive",
+                "abs_err_olive",
+                "vert_olive_macro_share",
+                "largest_olive_component_ratio",
+                "largest_olive_component_ratio_small",
+                "olive_multizone_share",
+                "macro_olive_visible_ratio",
+            }:
+                self._bump("olive_pressure", intensity)
+
+            if rule in {
+                "ratio_terre",
+                "abs_err_terre",
+                "terre_de_france_transition_share",
+            }:
+                self._bump("terre_pressure", intensity)
+
+            if rule in {"ratio_gris", "abs_err_gris", "vert_de_gris_micro_share"}:
+                self._bump("gris_pressure", intensity)
+
+            if rule in {"vert_de_gris_macro_share", "macro_gris_visible_ratio"}:
+                self._bump("gris_macro_cap_pressure", intensity)
+
+            if rule in {"ratio_coyote", "abs_err_coyote"}:
+                if (
+                    max_value is not None
+                    and actual > _safe_failure_float(max_value, default=0.0)
+                ) or actual > target:
+                    self._bump("coyote_excess_pressure", intensity)
+                    self._bump("olive_pressure", intensity * 0.42)
+                    self._bump("terre_pressure", intensity * 0.30)
+                    self._bump("gris_pressure", intensity * 0.20)
+                else:
+                    self._bump("coyote_deficit_pressure", intensity)
+
+            if rule == "mean_abs_error":
+                self._bump("angle_diversity_pressure", intensity * 0.60)
+                self._bump("boundary_low_pressure", intensity * 0.30)
+
+            if rule in {"center_empty_ratio", "center_empty_ratio_small"}:
+                self._bump("center_relief_pressure", intensity)
+
+            if rule in {"boundary_density", "boundary_density_small"}:
+                if min_value is not None and actual < _safe_failure_float(
+                    min_value, default=0.0
+                ):
+                    self._bump("boundary_low_pressure", intensity)
+                else:
+                    self._bump("boundary_high_pressure", intensity)
+
+            if rule == "mirror_similarity":
+                self._bump("asymmetry_pressure", intensity)
+                self._bump("angle_diversity_pressure", intensity * 0.50)
+
+            if rule == "oblique_share":
+                self._bump("oblique_pressure", intensity)
+
+            if rule == "vertical_share":
+                if min_value is not None and actual < _safe_failure_float(
+                    min_value, default=0.0
+                ):
+                    self._bump("vertical_pressure", intensity)
+                else:
+                    self._bump("vertical_excess_pressure", intensity)
+
+            if rule == "angle_dominance_ratio":
+                self._bump("angle_diversity_pressure", intensity)
+
+    def to_hint(self) -> Dict[str, Any]:
+        zone_weights = [1.0 for _ in DENSITY_ZONES]
+        edge_gain = min(
+            1.10, 0.14 * self.center_relief_pressure + 0.10 * self.asymmetry_pressure
+        )
+        for idx in (0, 1, 2, 3, 4, 5):
+            zone_weights[idx] += edge_gain
+        zone_weights[6] = max(
+            0.35,
+            zone_weights[6]
+            - (0.28 * self.center_relief_pressure + 0.10 * self.asymmetry_pressure),
+        )
+
+        if self.asymmetry_pressure > 0.0:
+            skew = min(0.45, 0.08 * self.asymmetry_pressure)
+            zone_weights[0] += skew
+            zone_weights[2] += skew * 0.85
+            zone_weights[4] += skew * 0.65
+            zone_weights[1] = max(0.55, zone_weights[1] - skew * 0.30)
+            zone_weights[3] = max(0.55, zone_weights[3] - skew * 0.24)
+
+        return {
+            "prefer_oblique": _clip_float(
+                self.oblique_pressure
+                + 0.40 * self.angle_diversity_pressure
+                + 0.18 * self.asymmetry_pressure,
+                0.0,
+                3.5,
+            ),
+            "prefer_vertical": _clip_float(self.vertical_pressure, 0.0, 3.0),
+            "avoid_vertical": _clip_float(
+                self.vertical_excess_pressure + 0.30 * self.angle_diversity_pressure,
+                0.0,
+                3.0,
+            ),
+            "diversify_angles": _clip_float(
+                self.angle_diversity_pressure + 0.35 * self.asymmetry_pressure,
+                0.0,
+                3.5,
+            ),
+            "olive_macro_target_scale": _clip_float(
+                1.0 + 0.05 * self.olive_pressure + 0.02 * self.boundary_low_pressure,
+                0.90,
+                1.30,
+            ),
+            "terre_macro_target_scale": _clip_float(
+                1.0 + 0.04 * self.terre_pressure,
+                0.88,
+                1.18,
+            ),
+            "gris_macro_target_scale": _clip_float(
+                1.0 - 0.22 * self.gris_macro_cap_pressure,
+                0.10,
+                1.00,
+            ),
+            "transition_terre_bias": _clip_float(
+                0.025 * self.terre_pressure + 0.010 * self.boundary_low_pressure,
+                -0.08,
+                0.18,
+            ),
+            "transition_olive_bias": _clip_float(
+                0.022 * self.olive_pressure,
+                -0.08,
+                0.14,
+            ),
+            "transition_coyote_bias": _clip_float(
+                0.030 * self.coyote_deficit_pressure
+                - 0.022 * self.coyote_excess_pressure,
+                -0.10,
+                0.10,
+            ),
+            "micro_gris_bias": _clip_float(
+                0.028 * self.gris_pressure
+                + 0.015 * self.boundary_low_pressure
+                - 0.030 * self.gris_macro_cap_pressure,
+                -0.05,
+                0.18,
+            ),
+            "micro_terre_bias": _clip_float(
+                0.020 * self.terre_pressure,
+                -0.04,
+                0.10,
+            ),
+            "micro_cluster_bonus": int(
+                round(
+                    _clip_float(
+                        0.40 * self.gris_pressure + 0.35 * self.boundary_low_pressure,
+                        0.0,
+                        2.0,
+                    )
+                )
+            ),
+            "center_torso_overlap_scale": _clip_float(
+                1.0 - 0.10 * self.center_relief_pressure,
+                0.55,
+                1.00,
+            ),
+            "extra_boundary_nudge_passes": int(
+                round(
+                    _clip_float(
+                        0.60 * self.boundary_low_pressure
+                        + 0.20 * self.olive_pressure
+                        + 0.15 * self.terre_pressure
+                        + 0.15 * self.gris_pressure,
+                        0.0,
+                        10.0,
+                    )
+                )
+            ),
+            "boundary_sample_ratio_scale": _clip_float(
+                1.0
+                + 0.08 * self.boundary_low_pressure
+                - 0.05 * self.boundary_high_pressure,
+                0.75,
+                1.80,
+            ),
+            "zone_weight_boosts": tuple(
+                _clip_float(v, 0.35, 2.40) for v in zone_weights
+            ),
+            "consecutive_rejections": int(self.consecutive_rejections),
+            "last_rules": list(self.last_rules[:8]),
+        }
 
 
 @dataclass
@@ -215,13 +520,37 @@ _PROCESS_POOL: Optional[ProcessPoolExecutor] = None
 _PROCESS_POOL_WORKERS: Optional[int] = None
 
 
+def _normalize_workers(value: Optional[int]) -> int:
+    if value is None:
+        return DEFAULT_MAX_WORKERS
+    try:
+        ivalue = int(value)
+    except Exception:
+        return DEFAULT_MAX_WORKERS
+    if ivalue <= 0:
+        return DEFAULT_MAX_WORKERS
+    return ivalue
+
+
+def _normalize_batch_size(value: Optional[int], max_workers: int) -> int:
+    if value is None:
+        return max(1, max_workers * BATCH_MULTIPLIER)
+    try:
+        ivalue = int(value)
+    except Exception:
+        return max(1, max_workers * BATCH_MULTIPLIER)
+    if ivalue <= 0:
+        return max(1, max_workers * BATCH_MULTIPLIER)
+    return ivalue
+
+
 def _worker_initializer() -> None:
-    # Évite qu'un worker CPU lance lui-même plusieurs threads BLAS/OpenMP.
-    os.environ.setdefault("OMP_NUM_THREADS", "1")
-    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-    os.environ.setdefault("MKL_NUM_THREADS", "1")
-    os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
-    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+    if LIMIT_NUMERIC_THREADS_IN_WORKERS:
+        os.environ.setdefault("OMP_NUM_THREADS", "1")
+        os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+        os.environ.setdefault("MKL_NUM_THREADS", "1")
+        os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+        os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 
 
 def ensure_output_dir(output_dir: Path) -> Path:
@@ -233,7 +562,7 @@ def ensure_output_dir(output_dir: Path) -> Path:
 def shutdown_process_pool() -> None:
     global _PROCESS_POOL, _PROCESS_POOL_WORKERS
     if _PROCESS_POOL is not None:
-        _PROCESS_POOL.shutdown(wait=False, cancel_futures=True)
+        _PROCESS_POOL.shutdown(wait=True, cancel_futures=True)
         _PROCESS_POOL = None
         _PROCESS_POOL_WORKERS = None
 
@@ -241,7 +570,7 @@ def shutdown_process_pool() -> None:
 def get_process_pool(max_workers: Optional[int] = None) -> ProcessPoolExecutor:
     global _PROCESS_POOL, _PROCESS_POOL_WORKERS
 
-    wanted = max(1, int(max_workers or DEFAULT_MAX_WORKERS))
+    wanted = _normalize_workers(max_workers)
 
     if _PROCESS_POOL is not None and _PROCESS_POOL_WORKERS != wanted:
         shutdown_process_pool()
@@ -260,29 +589,205 @@ def get_process_pool(max_workers: Optional[int] = None) -> ProcessPoolExecutor:
 # PROFIL
 # ============================================================
 
-def build_seed(target_index: int, local_attempt: int, base_seed: int = DEFAULT_BASE_SEED) -> int:
+def build_seed(
+    target_index: int,
+    local_attempt: int,
+    base_seed: int = DEFAULT_BASE_SEED,
+) -> int:
     return int(base_seed + target_index * 100000 + local_attempt)
 
 
-def make_profile(seed: int) -> VariantProfile:
+def make_profile(
+    seed: int,
+    adaptive_hint: Optional[Dict[str, Any]] = None,
+) -> VariantProfile:
     rng = random.Random(seed)
+    adaptive_hint = dict(adaptive_hint or {})
+
     angles = BASE_ANGLES[:]
     rng.shuffle(angles)
-    allowed = sorted(set([0] + angles[:rng.randint(8, len(BASE_ANGLES))]))
+    allowed = sorted(set([0] + angles[: rng.randint(8, len(BASE_ANGLES))]))
+
+    prefer_oblique = _safe_failure_float(adaptive_hint.get("prefer_oblique"), 0.0)
+    prefer_vertical = _safe_failure_float(adaptive_hint.get("prefer_vertical"), 0.0)
+    avoid_vertical = _safe_failure_float(adaptive_hint.get("avoid_vertical"), 0.0)
+    diversify_angles = _safe_failure_float(adaptive_hint.get("diversify_angles"), 0.0)
+
+    angle_pool: List[int] = list(allowed)
+    obliques = [a for a in allowed if a != 0]
+
+    if prefer_oblique > 0.0 and obliques:
+        repeats = 1 + int(round(min(5.0, prefer_oblique)))
+        angle_pool.extend(obliques * repeats)
+
+    if prefer_vertical > 0.0:
+        angle_pool.extend([0] * (1 + int(round(min(4.0, prefer_vertical)))))
+
+    if avoid_vertical > 0.0 and 0 in angle_pool and len(obliques) >= 2:
+        removal = min(angle_pool.count(0), max(1, int(round(avoid_vertical))))
+        for _ in range(removal):
+            try:
+                angle_pool.remove(0)
+            except ValueError:
+                break
+        if 0 in allowed and avoid_vertical >= 2.2 and len(allowed) > 6:
+            allowed = [a for a in allowed if a != 0]
+
+    if diversify_angles > 0.0 and obliques:
+        diversified = sorted(obliques, key=lambda a: (abs(a), a))
+        angle_pool.extend(diversified[: min(len(diversified), 6)])
+        angle_pool.extend(diversified[-min(len(diversified), 4) :])
+
+    angle_pool = angle_pool or list(allowed) or BASE_ANGLES[:]
+
+    zone_weight_boosts_raw = adaptive_hint.get("zone_weight_boosts")
+    if isinstance(zone_weight_boosts_raw, (list, tuple)) and zone_weight_boosts_raw:
+        zone_weight_boosts = tuple(
+            _clip_float(
+                _safe_failure_float(
+                    zone_weight_boosts_raw[i]
+                    if i < len(zone_weight_boosts_raw)
+                    else 1.0,
+                    1.0,
+                ),
+                0.35,
+                2.40,
+            )
+            for i in range(len(DENSITY_ZONES))
+        )
+    else:
+        zone_weight_boosts = tuple(1.0 for _ in DENSITY_ZONES)
+
+    micro_cluster_bonus = int(
+        round(
+            _clip_float(
+                _safe_failure_float(adaptive_hint.get("micro_cluster_bonus"), 0.0),
+                0.0,
+                2.0,
+            )
+        )
+    )
 
     return VariantProfile(
         seed=seed,
         allowed_angles=allowed,
         micro_cluster_min=2,
-        micro_cluster_max=rng.randint(4, 5),
-        macro_width_variation=rng.uniform(0.22, 0.30),
-        macro_lateral_jitter=rng.uniform(0.14, 0.21),
-        macro_tip_taper=rng.uniform(0.34, 0.43),
-        macro_edge_break=rng.uniform(0.10, 0.15),
-        micro_width_variation=rng.uniform(0.18, 0.25),
-        micro_lateral_jitter=rng.uniform(0.12, 0.18),
-        micro_tip_taper=rng.uniform(0.42, 0.52),
-        micro_edge_break=rng.uniform(0.12, 0.18),
+        micro_cluster_max=rng.randint(4, 5) + micro_cluster_bonus,
+        macro_width_variation=_clip_float(
+            rng.uniform(0.22, 0.30)
+            + 0.008
+            * _safe_failure_float(adaptive_hint.get("olive_macro_target_scale"), 1.0)
+            - 0.008,
+            0.20,
+            0.34,
+        ),
+        macro_lateral_jitter=_clip_float(
+            rng.uniform(0.14, 0.21)
+            + 0.010 * prefer_oblique
+            + 0.008 * diversify_angles
+            - 0.010 * prefer_vertical,
+            0.12,
+            0.26,
+        ),
+        macro_tip_taper=_clip_float(
+            rng.uniform(0.34, 0.43) + 0.012 * prefer_vertical - 0.010 * avoid_vertical,
+            0.30,
+            0.47,
+        ),
+        macro_edge_break=_clip_float(
+            rng.uniform(0.10, 0.15) + 0.006 * diversify_angles + 0.005 * prefer_oblique,
+            0.10,
+            0.18,
+        ),
+        micro_width_variation=_clip_float(
+            rng.uniform(0.18, 0.25)
+            + 0.012 * _safe_failure_float(adaptive_hint.get("micro_gris_bias"), 0.0),
+            0.16,
+            0.30,
+        ),
+        micro_lateral_jitter=_clip_float(
+            rng.uniform(0.12, 0.18)
+            + 0.010 * prefer_oblique
+            + 0.010 * _safe_failure_float(adaptive_hint.get("micro_gris_bias"), 0.0),
+            0.10,
+            0.22,
+        ),
+        micro_tip_taper=_clip_float(
+            rng.uniform(0.42, 0.52) + 0.010 * prefer_vertical - 0.010 * avoid_vertical,
+            0.38,
+            0.58,
+        ),
+        micro_edge_break=_clip_float(
+            rng.uniform(0.12, 0.18)
+            + 0.006 * diversify_angles
+            + 0.006 * _safe_failure_float(adaptive_hint.get("micro_gris_bias"), 0.0),
+            0.10,
+            0.22,
+        ),
+        angle_pool=tuple(int(a) for a in angle_pool),
+        zone_weight_boosts=zone_weight_boosts,
+        olive_macro_target_scale=_clip_float(
+            _safe_failure_float(adaptive_hint.get("olive_macro_target_scale"), 1.0),
+            0.90,
+            1.30,
+        ),
+        terre_macro_target_scale=_clip_float(
+            _safe_failure_float(adaptive_hint.get("terre_macro_target_scale"), 1.0),
+            0.88,
+            1.18,
+        ),
+        gris_macro_target_scale=_clip_float(
+            _safe_failure_float(adaptive_hint.get("gris_macro_target_scale"), 1.0),
+            0.10,
+            1.00,
+        ),
+        transition_terre_bias=_clip_float(
+            _safe_failure_float(adaptive_hint.get("transition_terre_bias"), 0.0),
+            -0.08,
+            0.18,
+        ),
+        transition_olive_bias=_clip_float(
+            _safe_failure_float(adaptive_hint.get("transition_olive_bias"), 0.0),
+            -0.08,
+            0.14,
+        ),
+        transition_coyote_bias=_clip_float(
+            _safe_failure_float(adaptive_hint.get("transition_coyote_bias"), 0.0),
+            -0.10,
+            0.10,
+        ),
+        micro_gris_bias=_clip_float(
+            _safe_failure_float(adaptive_hint.get("micro_gris_bias"), 0.0),
+            -0.05,
+            0.18,
+        ),
+        micro_terre_bias=_clip_float(
+            _safe_failure_float(adaptive_hint.get("micro_terre_bias"), 0.0),
+            -0.04,
+            0.10,
+        ),
+        center_torso_overlap_scale=_clip_float(
+            _safe_failure_float(adaptive_hint.get("center_torso_overlap_scale"), 1.0),
+            0.55,
+            1.00,
+        ),
+        extra_boundary_nudge_passes=int(
+            round(
+                _clip_float(
+                    _safe_failure_float(
+                        adaptive_hint.get("extra_boundary_nudge_passes"),
+                        0.0,
+                    ),
+                    0.0,
+                    10.0,
+                )
+            )
+        ),
+        boundary_sample_ratio_scale=_clip_float(
+            _safe_failure_float(adaptive_hint.get("boundary_sample_ratio_scale"), 1.0),
+            0.75,
+            1.80,
+        ),
     )
 
 
@@ -309,8 +814,21 @@ def rotate(x: float, y: float, deg: float) -> Tuple[float, float]:
     return x * c - y * s, x * s + y * c
 
 
-def choose_biased_center(rng: random.Random) -> Tuple[int, int]:
-    weights = [z[4] for z in DENSITY_ZONES]
+def choose_biased_center(
+    rng: random.Random,
+    zone_weight_boosts: Optional[Sequence[float]] = None,
+) -> Tuple[int, int]:
+    weights: List[float] = []
+    for i, z in enumerate(DENSITY_ZONES):
+        boost = 1.0
+        if zone_weight_boosts is not None and i < len(zone_weight_boosts):
+            boost = _clip_float(
+                _safe_failure_float(zone_weight_boosts[i], 1.0),
+                0.35,
+                2.40,
+            )
+        weights.append(z[4] * boost)
+
     z = rng.choices(DENSITY_ZONES, weights=weights, k=1)[0]
     x = int(rng.uniform(z[0], z[1]) * WIDTH)
     y = int(rng.uniform(z[2], z[3]) * HEIGHT)
@@ -339,17 +857,17 @@ def polygon_mask(poly: Sequence[Tuple[float, float]]) -> np.ndarray:
     local_mask = np.array(img, dtype=np.uint8) > 0
 
     full = np.zeros((HEIGHT, WIDTH), dtype=bool)
-    full[min_y:max_y + 1, min_x:max_x + 1] = local_mask
+    full[min_y : max_y + 1, min_x : max_x + 1] = local_mask
     return full
 
 
 def compute_boundary_mask(canvas: np.ndarray) -> np.ndarray:
     h, w = canvas.shape
     diff = np.zeros((h, w), dtype=bool)
-    diff[1:, :] |= (canvas[1:, :] != canvas[:-1, :])
-    diff[:-1, :] |= (canvas[:-1, :] != canvas[1:, :])
-    diff[:, 1:] |= (canvas[:, 1:] != canvas[:, :-1])
-    diff[:, :-1] |= (canvas[:, :-1] != canvas[:, 1:])
+    diff[1:, :] |= canvas[1:, :] != canvas[:-1, :]
+    diff[:-1, :] |= canvas[:-1, :] != canvas[1:, :]
+    diff[:, 1:] |= canvas[:, 1:] != canvas[:, :-1]
+    diff[:, :-1] |= canvas[:, :-1] != canvas[:, 1:]
     return diff
 
 
@@ -389,6 +907,20 @@ def clamp01(x: float) -> float:
     return max(0.0, min(1.0, float(x)))
 
 
+def _clip_float(value: float, low: float, high: float) -> float:
+    return max(float(low), min(float(high), float(value)))
+
+
+def _safe_failure_float(value: Any, default: float = 0.0) -> float:
+    try:
+        out = float(value)
+    except Exception:
+        return float(default)
+    if math.isnan(out) or math.isinf(out):
+        return float(default)
+    return out
+
+
 def boundary_density(canvas: np.ndarray) -> float:
     return float(np.mean(compute_boundary_mask(canvas)))
 
@@ -396,7 +928,7 @@ def boundary_density(canvas: np.ndarray) -> float:
 def mirror_similarity_score(canvas: np.ndarray) -> float:
     mid = canvas.shape[1] // 2
     left = canvas[:, :mid]
-    right = canvas[:, canvas.shape[1] - mid:]
+    right = canvas[:, canvas.shape[1] - mid :]
     right_flipped = np.fliplr(right)
     h = min(left.shape[0], right_flipped.shape[0])
     w = min(left.shape[1], right_flipped.shape[1])
@@ -568,6 +1100,101 @@ def orientation_score(macro_records: Sequence[MacroRecord]) -> Dict[str, float]:
     }
 
 
+def macro_angle_histogram(macros: Sequence[MacroRecord]) -> Dict[int, int]:
+    counts: Dict[int, int] = {}
+    for item in macros:
+        counts[item.angle_deg] = counts.get(item.angle_deg, 0) + 1
+    return counts
+
+
+def pick_macro_angle(
+    macros: Sequence[MacroRecord],
+    profile: VariantProfile,
+    rng: random.Random,
+    force_vertical_floor: bool = True,
+) -> int:
+    allowed = list(profile.allowed_angles) or BASE_ANGLES[:]
+    if not allowed:
+        allowed = BASE_ANGLES[:]
+
+    counts = macro_angle_histogram(macros)
+    total = len(macros)
+    vertical_count = counts.get(0, 0)
+    vertical_share = (vertical_count / total) if total else 0.0
+
+    obliques = [a for a in allowed if a != 0]
+    if not obliques:
+        obliques = [a for a in BASE_ANGLES if a != 0]
+
+    if (
+        force_vertical_floor
+        and 0 in allowed
+        and total >= 4
+        and vertical_share < TARGET_VERTICAL_SHARE
+    ):
+        return 0
+
+    if 0 in allowed and total >= 5 and vertical_share >= MAX_VERTICAL_SOFT_TARGET:
+        allowed = [a for a in allowed if a != 0] or obliques[:]
+
+    dom_angle = None
+    dom_count = -1
+    for angle, cnt in counts.items():
+        if cnt > dom_count:
+            dom_angle = angle
+            dom_count = cnt
+
+    if (
+        dom_angle is not None
+        and total >= 6
+        and dom_count / total > (MAX_ANGLE_DOMINANCE_RATIO - 0.02)
+    ):
+        filtered = [a for a in allowed if a != dom_angle]
+        if filtered:
+            allowed = filtered
+
+    if total >= 5:
+        local_counts = {a: counts.get(a, 0) for a in allowed}
+        min_count = min(local_counts.values())
+        least_used = [a for a, cnt in local_counts.items() if cnt == min_count]
+        if least_used:
+            allowed = least_used
+
+    return int(rng.choice(allowed or BASE_ANGLES))
+
+
+def preferred_boundary_coordinates(
+    boundary: np.ndarray,
+    preferred_mask: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    if preferred_mask is not None:
+        ys, xs = np.where(boundary & preferred_mask)
+        if len(xs) > 0:
+            return ys, xs
+    ys, xs = np.where(boundary)
+    return ys, xs
+
+
+def choose_semantic_color_for_origin(
+    deficits: np.ndarray,
+    origin_code: int,
+    current_color: int,
+) -> Optional[int]:
+    allowed = SEMANTIC_ALLOWED_COLORS.get(
+        int(origin_code),
+        (IDX_COYOTE, IDX_OLIVE, IDX_TERRE, IDX_GRIS),
+    )
+    candidates = [c for c in allowed if c != current_color and deficits[c] > 0.0]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: (float(deficits[c]), c), reverse=True)
+    return int(candidates[0])
+
+
+def semantic_color_allowed(origin_code: int, color_idx: int) -> bool:
+    return int(color_idx) in SEMANTIC_ALLOWED_COLORS.get(int(origin_code), ())
+
+
 def visible_origin_shares(canvas: np.ndarray, origin_map: np.ndarray) -> Dict[str, float]:
     out = {}
 
@@ -616,7 +1243,11 @@ def jagged_spine_poly(
         t = abs(y) / half_len
         taper = max(0.35, 1.0 - tip_taper * t)
 
-        local_half_w = half_w * rng.uniform(1.0 - width_variation, 1.0 + width_variation) * taper
+        local_half_w = (
+            half_w
+            * rng.uniform(1.0 - width_variation, 1.0 + width_variation)
+            * taper
+        )
         axis_dx = half_w * lateral_jitter * rng.uniform(-1.0, 1.0)
         ejl = local_half_w * edge_break * rng.uniform(-1.0, 1.0)
         ejr = local_half_w * edge_break * rng.uniform(-1.0, 1.0)
@@ -625,7 +1256,6 @@ def jagged_spine_poly(
         right.append((axis_dx + local_half_w + ejr, y))
 
     poly = left + right[::-1]
-    # Le repère local est construit avec l'axe de longueur sur Y : 0° doit donc rester vertical.
     rot = [rotate(x, y, angle_from_vertical_deg) for x, y in poly]
     return [(cx + x, cy + y) for x, y in rot]
 
@@ -746,7 +1376,13 @@ def creates_new_mass(
 # COUCHES
 # ============================================================
 
-def apply_mask(canvas: np.ndarray, origin_map: np.ndarray, mask: np.ndarray, color_idx: int, origin_code: int) -> None:
+def apply_mask(
+    canvas: np.ndarray,
+    origin_map: np.ndarray,
+    mask: np.ndarray,
+    color_idx: int,
+    origin_code: int,
+) -> None:
     canvas[mask] = color_idx
     origin_map[mask] = origin_code
 
@@ -759,18 +1395,27 @@ def add_macros(
 ) -> List[MacroRecord]:
     macros: List[MacroRecord] = []
 
-    target_macro_olive_pixels = int(VISIBLE_MACRO_OLIVE_TARGET * canvas.size)
-    target_macro_terre_pixels = int(VISIBLE_MACRO_TERRE_TARGET * canvas.size)
-    # Le vert-de-gris ne doit pas constituer une vraie masse macro par défaut.
-    target_macro_gris_pixels = int(VISIBLE_MACRO_GRIS_TARGET * canvas.size)
+    target_macro_olive_pixels = int(
+        VISIBLE_MACRO_OLIVE_TARGET * canvas.size * profile.olive_macro_target_scale
+    )
+    target_macro_terre_pixels = int(
+        VISIBLE_MACRO_TERRE_TARGET * canvas.size * profile.terre_macro_target_scale
+    )
+    target_macro_gris_pixels = int(
+        VISIBLE_MACRO_GRIS_TARGET * canvas.size * profile.gris_macro_target_scale
+    )
 
     olive_attempts = 0
-    while int(np.sum((canvas == IDX_OLIVE) & (origin_map == ORIGIN_MACRO))) < target_macro_olive_pixels:
+    while (
+        int(np.sum((canvas == IDX_OLIVE) & (origin_map == ORIGIN_MACRO)))
+        < target_macro_olive_pixels
+    ):
         olive_attempts += 1
         if olive_attempts > MAX_MACRO_PLACEMENT_ATTEMPTS_OLIVE:
             break
-        cx, cy = choose_biased_center(rng)
-        angle = rng.choice(profile.allowed_angles)
+
+        cx, cy = choose_biased_center(rng, profile.zone_weight_boosts)
+        angle = pick_macro_angle(macros, profile, rng, force_vertical_floor=True)
 
         if local_parallel_conflict(macros, (cx, cy), angle):
             continue
@@ -799,21 +1444,36 @@ def add_macros(
         if zc < 2 and rng.random() < 0.75:
             continue
 
-        if zone_overlap_ratio(mask, ANATOMY_ZONES["center_torso"]) > MAX_CENTER_TORSO_OVERLAP_MACRO:
+        max_center_overlap = (
+            MAX_CENTER_TORSO_OVERLAP_MACRO * profile.center_torso_overlap_scale
+        )
+        if angle == 0:
+            max_center_overlap = min(0.42, max_center_overlap + 0.05)
+        if zone_overlap_ratio(mask, ANATOMY_ZONES["center_torso"]) > max_center_overlap:
             continue
 
         apply_mask(canvas, origin_map, mask, IDX_OLIVE, ORIGIN_MACRO)
         macros.append(MacroRecord(IDX_OLIVE, poly, angle, (cx, cy), mask, zc))
 
     terre_attempts = 0
-    while int(np.sum((canvas == IDX_TERRE) & (origin_map == ORIGIN_MACRO))) < target_macro_terre_pixels:
+    while (
+        int(np.sum((canvas == IDX_TERRE) & (origin_map == ORIGIN_MACRO)))
+        < target_macro_terre_pixels
+    ):
         terre_attempts += 1
         if terre_attempts > MAX_MACRO_PLACEMENT_ATTEMPTS_TERRE:
             break
-        cx, cy = choose_biased_center(rng)
-        angle = rng.choice(profile.allowed_angles)
 
-        if local_parallel_conflict(macros, (cx, cy), angle, dist_threshold_px=220, angle_threshold_deg=6):
+        cx, cy = choose_biased_center(rng, profile.zone_weight_boosts)
+        angle = pick_macro_angle(macros, profile, rng, force_vertical_floor=False)
+
+        if local_parallel_conflict(
+            macros,
+            (cx, cy),
+            angle,
+            dist_threshold_px=220,
+            angle_threshold_deg=6,
+        ):
             continue
 
         poly = jagged_spine_poly(
@@ -837,7 +1497,10 @@ def add_macros(
         if float(np.mean(np.isin(cur, [IDX_COYOTE, IDX_OLIVE]))) < 0.65:
             continue
 
-        if zone_overlap_ratio(mask, ANATOMY_ZONES["center_torso"]) > MAX_CENTER_TORSO_OVERLAP_TERRAIN_MACRO:
+        max_center_overlap = (
+            MAX_CENTER_TORSO_OVERLAP_TERRAIN_MACRO * profile.center_torso_overlap_scale
+        )
+        if zone_overlap_ratio(mask, ANATOMY_ZONES["center_torso"]) > max_center_overlap:
             continue
 
         zc = macro_zone_count(mask)
@@ -848,12 +1511,16 @@ def add_macros(
         macros.append(MacroRecord(IDX_TERRE, poly, angle, (cx, cy), mask, zc))
 
     gris_attempts = 0
-    while int(np.sum((canvas == IDX_GRIS) & (origin_map == ORIGIN_MACRO))) < target_macro_gris_pixels:
+    while (
+        int(np.sum((canvas == IDX_GRIS) & (origin_map == ORIGIN_MACRO)))
+        < target_macro_gris_pixels
+    ):
         gris_attempts += 1
         if gris_attempts > MAX_MACRO_PLACEMENT_ATTEMPTS_GRIS:
             break
-        cx, cy = choose_biased_center(rng)
-        angle = rng.choice(profile.allowed_angles)
+
+        cx, cy = choose_biased_center(rng, profile.zone_weight_boosts)
+        angle = pick_macro_angle(macros, profile, rng, force_vertical_floor=False)
 
         poly = jagged_spine_poly(
             rng=rng,
@@ -890,24 +1557,47 @@ def add_transitions(
     canvas: np.ndarray,
     origin_map: np.ndarray,
     macros: Sequence[MacroRecord],
+    profile: VariantProfile,
     rng: random.Random,
 ) -> None:
+    if not macros:
+        return
+
     placement_attempts = 0
     while True:
         placement_attempts += 1
         if placement_attempts > MAX_TRANSITION_PLACEMENTS:
             break
+
         rs = compute_ratios(canvas)
         visible = visible_origin_shares(canvas, origin_map)
+        spatial = spatial_discipline_metrics(canvas)
 
         enough_terre = rs[IDX_TERRE] >= VISIBLE_TOTAL_TERRE_TARGET
         enough_olive = rs[IDX_OLIVE] >= VISIBLE_TOTAL_OLIVE_TARGET * 0.985
-        enough_trans_share = visible["terre_de_france_transition_share"] >= MIN_VISIBLE_TERRE_TRANS_SHARE
+        enough_trans_share = (
+            visible["terre_de_france_transition_share"] >= MIN_VISIBLE_TERRE_TRANS_SHARE
+        )
+        enough_periphery = (
+            spatial["periphery_boundary_density_ratio"]
+            >= MIN_PERIPHERY_BOUNDARY_DENSITY_RATIO
+            and spatial["periphery_non_coyote_ratio"] >= MIN_PERIPHERY_NON_COYOTE_RATIO
+        )
 
-        if enough_terre and enough_olive and enough_trans_share:
+        if enough_terre and enough_olive and enough_trans_share and enough_periphery:
             break
 
+        prefer_periphery = not enough_periphery
         parent_pool = [m for m in macros if m.color_idx in (IDX_OLIVE, IDX_TERRE)]
+        if prefer_periphery:
+            periphery_pool = [
+                m
+                for m in parent_pool
+                if float(np.mean(HIGH_DENSITY_ZONE_MASK[m.mask])) >= 0.40
+            ]
+            if periphery_pool:
+                parent_pool = periphery_pool
+
         parent = rng.choice(parent_pool or list(macros))
 
         poly = attached_transition(
@@ -920,6 +1610,9 @@ def add_transitions(
         if mask.sum() == 0:
             continue
 
+        if prefer_periphery and float(np.mean(HIGH_DENSITY_ZONE_MASK[mask])) < 0.35:
+            continue
+
         if not transition_is_attached(parent.mask, mask):
             continue
 
@@ -929,16 +1622,34 @@ def add_transitions(
         olive_need = max(0.0, deficits[IDX_OLIVE])
         coyote_need = max(0.0, deficits[IDX_COYOTE])
 
-        # Terre de France doit rester la couleur dominante des transitions.
         if terre_need >= olive_need:
             p_terre, p_olive, p_coyote = 0.74, 0.18, 0.08
         else:
-            p_terre, p_olive, p_coyote = 0.68, 0.22, 0.10
+            p_terre, p_olive, p_coyote = 0.66, 0.24, 0.10
+
+        if prefer_periphery:
+            p_terre += 0.04
+            p_olive += 0.03
+            p_coyote -= 0.07
+
+        p_terre += profile.transition_terre_bias
+        p_olive += profile.transition_olive_bias
+        p_coyote += profile.transition_coyote_bias
 
         if coyote_need > max(terre_need, olive_need) * 1.4:
             p_coyote += 0.06
             p_terre -= 0.04
             p_olive -= 0.02
+
+        p_terre = max(0.05, p_terre)
+        p_olive = max(0.05, p_olive)
+        p_coyote = max(0.03, p_coyote)
+        total_p = p_terre + p_olive + p_coyote
+        p_terre, p_olive, p_coyote = (
+            p_terre / total_p,
+            p_olive / total_p,
+            p_coyote / total_p,
+        )
 
         r = rng.random()
         if r < p_terre:
@@ -951,7 +1662,13 @@ def add_transitions(
         if color == IDX_TERRE and float(np.mean(cur != IDX_COYOTE)) < 0.18:
             continue
 
-        if creates_new_mass(canvas, mask, color, local_radius=38, max_local_area_ratio=0.74):
+        if creates_new_mass(
+            canvas,
+            mask,
+            color,
+            local_radius=38,
+            max_local_area_ratio=0.74,
+        ):
             continue
 
         if color == IDX_COYOTE and float(np.mean(cur == IDX_COYOTE)) > 0.90:
@@ -967,29 +1684,59 @@ def add_micro_clusters(
     rng: random.Random,
 ) -> None:
     placement_attempts = 0
+    stalled_rounds = 0
+
     while True:
         placement_attempts += 1
         if placement_attempts > MAX_MICRO_CLUSTER_PLACEMENTS:
             break
+
         rs = compute_ratios(canvas)
         visible = visible_origin_shares(canvas, origin_map)
+        spatial = spatial_discipline_metrics(canvas)
+        center_empty = center_empty_ratio(canvas)
 
         enough_gris = rs[IDX_GRIS] >= VISIBLE_TOTAL_GRIS_TARGET
         enough_terre = rs[IDX_TERRE] >= VISIBLE_TOTAL_TERRE_TARGET
         enough_micro_share = visible["vert_de_gris_micro_share"] >= MIN_VISIBLE_GRIS_MICRO_SHARE
+        enough_periphery = (
+            spatial["periphery_boundary_density_ratio"]
+            >= MIN_PERIPHERY_BOUNDARY_DENSITY_RATIO
+            and spatial["periphery_non_coyote_ratio"] >= MIN_PERIPHERY_NON_COYOTE_RATIO
+        )
 
-        if enough_gris and enough_terre and enough_micro_share:
+        if (
+            enough_gris
+            and enough_terre
+            and enough_micro_share
+            and enough_periphery
+            and center_empty <= MAX_COYOTE_CENTER_EMPTY_RATIO
+        ):
             break
 
         boundary = compute_boundary_mask(canvas)
-        ys, xs = np.where(boundary)
+        prefer_periphery = not enough_periphery
+        prefer_center = (not prefer_periphery) and (
+            center_empty > MAX_COYOTE_CENTER_EMPTY_RATIO
+        )
+
+        preferred_mask = None
+        if prefer_periphery:
+            preferred_mask = HIGH_DENSITY_ZONE_MASK
+        elif prefer_center:
+            preferred_mask = CENTER_TORSO_MASK
+
+        ys, xs = preferred_boundary_coordinates(boundary, preferred_mask=preferred_mask)
         if len(xs) == 0:
             break
 
         idx = rng.randint(0, len(xs) - 1)
         bx, by = int(xs[idx]), int(ys[idx])
 
-        cluster_count = rng.randint(profile.micro_cluster_min, profile.micro_cluster_max)
+        cluster_count = rng.randint(
+            profile.micro_cluster_min,
+            max(profile.micro_cluster_min, profile.micro_cluster_max),
+        )
         placed_any = False
 
         for _ in range(cluster_count):
@@ -1006,7 +1753,9 @@ def add_micro_clusters(
                 cy=oy,
                 length_px=size * rng.uniform(1.2, 2.0),
                 width_px=size * rng.uniform(0.45, 0.90),
-                angle_from_vertical_deg=rng.choice(profile.allowed_angles),
+                angle_from_vertical_deg=rng.choice(
+                    profile.angle_pool or tuple(profile.allowed_angles)
+                ),
                 segments=rng.randint(4, 6),
                 width_variation=profile.micro_width_variation,
                 lateral_jitter=profile.micro_lateral_jitter,
@@ -1015,6 +1764,12 @@ def add_micro_clusters(
             )
             mask = polygon_mask(poly)
             if mask.sum() == 0:
+                continue
+
+            if (
+                preferred_mask is not None
+                and float(np.mean(preferred_mask[mask])) < 0.30
+            ):
                 continue
 
             cur = canvas[mask]
@@ -1029,22 +1784,67 @@ def add_micro_clusters(
             gris_need = max(0.0, deficits[IDX_GRIS])
             terre_need = max(0.0, deficits[IDX_TERRE])
 
-            if gris_need >= terre_need:
-                color = IDX_GRIS if rng.random() < 0.88 else IDX_TERRE
-            else:
-                color = IDX_GRIS if rng.random() < 0.82 else IDX_TERRE
+            p_gris = 0.88 if gris_need >= terre_need else 0.82
+            p_gris += profile.micro_gris_bias
+            p_terre = (1.0 - p_gris) + profile.micro_terre_bias
+
+            if prefer_periphery:
+                p_gris += 0.03
+                p_terre += 0.02
+            if prefer_center:
+                p_terre += 0.05
+
+            total_p = max(0.10, p_gris) + max(0.10, p_terre)
+            p_gris = max(0.10, p_gris) / total_p
+
+            color = IDX_GRIS if rng.random() < p_gris else IDX_TERRE
 
             apply_mask(canvas, origin_map, mask, color, ORIGIN_MICRO)
             placed_any = True
 
-        if not placed_any and rs[IDX_GRIS] >= VISIBLE_TOTAL_GRIS_TARGET * 0.96:
-            break
+        if placed_any:
+            stalled_rounds = 0
+        else:
+            stalled_rounds += 1
+            if stalled_rounds >= 20 and enough_gris and enough_micro_share:
+                break
 
 
-def nudge_proportions(canvas: np.ndarray, origin_map: np.ndarray, rng: random.Random) -> None:
+def nudge_proportions(
+    canvas: np.ndarray,
+    origin_map: np.ndarray,
+    profile_or_rng: VariantProfile | random.Random,
+    rng: Optional[random.Random] = None,
+) -> None:
+    if isinstance(profile_or_rng, VariantProfile):
+        profile = profile_or_rng
+        local_rng = rng if rng is not None else random.Random(profile.seed ^ 0x5A17)
+    else:
+        profile = VariantProfile(
+            seed=0,
+            allowed_angles=list(BASE_ANGLES),
+            micro_cluster_min=2,
+            micro_cluster_max=4,
+            macro_width_variation=0.24,
+            macro_lateral_jitter=0.16,
+            macro_tip_taper=0.40,
+            macro_edge_break=0.12,
+            micro_width_variation=0.20,
+            micro_lateral_jitter=0.14,
+            micro_tip_taper=0.48,
+            micro_edge_break=0.14,
+        )
+        local_rng = profile_or_rng
+
     h, w = canvas.shape
+    nudge_passes = max(1, int(BOUNDARY_NUDGE_PASSES + profile.extra_boundary_nudge_passes))
+    sample_ratio = _clip_float(
+        BOUNDARY_NUDGE_SAMPLE_RATIO * profile.boundary_sample_ratio_scale,
+        0.0015,
+        0.0085,
+    )
 
-    for _ in range(BOUNDARY_NUDGE_PASSES):
+    for _ in range(nudge_passes):
         rs = compute_ratios(canvas)
         deficits = TARGET - rs
 
@@ -1056,41 +1856,63 @@ def nudge_proportions(canvas: np.ndarray, origin_map: np.ndarray, rng: random.Ra
         if len(xs) == 0:
             break
 
-        sample_count = min(len(xs), int(canvas.size * BOUNDARY_NUDGE_SAMPLE_RATIO))
+        sample_count = min(len(xs), int(canvas.size * sample_ratio))
         if sample_count <= 0:
             break
 
-        picks = rng.sample(range(len(xs)), k=sample_count)
+        picks = local_rng.sample(range(len(xs)), k=sample_count)
 
         for j in picks:
             x = int(xs[j])
             y = int(ys[j])
-
             current = int(canvas[y, x])
-            if deficits[current] >= 0:
+            origin = int(origin_map[y, x])
+
+            allowed = SEMANTIC_ALLOWED_COLORS.get(origin, (current,))
+            if current not in allowed:
                 continue
 
-            wanted = np.where(deficits > 0)[0]
-            if len(wanted) == 0:
-                break
+            chosen = choose_semantic_color_for_origin(deficits, origin, current)
+            if chosen is None:
+                continue
 
-            chosen = int(wanted[np.argmax(deficits[wanted])])
+            if deficits[current] > -0.002 and semantic_color_allowed(origin, current):
+                continue
 
             y1, y2 = max(0, y - 2), min(h, y + 3)
             x1, x2 = max(0, x - 2), min(w, x + 3)
             neigh = canvas[y1:y2, x1:x2]
 
-            if chosen not in neigh and rng.random() < 0.72:
+            if chosen not in neigh and local_rng.random() < 0.60:
                 continue
 
-            if chosen in (IDX_TERRE, IDX_GRIS) and local_color_variety(canvas, x, y, radius=2) < 2:
+            if (
+                origin == ORIGIN_MACRO
+                and chosen == IDX_TERRE
+                and local_color_variety(canvas, x, y, radius=2) < 2
+            ):
+                continue
+            if (
+                origin == ORIGIN_MICRO
+                and chosen == IDX_GRIS
+                and local_color_variety(canvas, x, y, radius=2) < 2
+            ):
                 continue
 
-            fallback_origin = int(origin_map[y, x])
-            new_origin = infer_origin_from_neighbors(canvas, origin_map, x, y, chosen, fallback_origin)
+            if origin == ORIGIN_BACKGROUND and chosen not in (IDX_COYOTE, IDX_OLIVE):
+                continue
+            if origin == ORIGIN_MACRO and chosen not in (IDX_OLIVE, IDX_TERRE):
+                continue
+            if origin == ORIGIN_TRANSITION and chosen not in (
+                IDX_COYOTE,
+                IDX_OLIVE,
+                IDX_TERRE,
+            ):
+                continue
+            if origin == ORIGIN_MICRO and chosen not in (IDX_TERRE, IDX_GRIS):
+                continue
 
             canvas[y, x] = chosen
-            origin_map[y, x] = new_origin
 
 
 # ============================================================
@@ -1282,7 +2104,11 @@ def main_metrics_score(metrics: Dict[str, float]) -> float:
     return float(np.mean(parts))
 
 
-def evaluate_visual_metrics(index_canvas: np.ndarray, rs: np.ndarray, metrics: Dict[str, float]) -> Dict[str, float]:
+def evaluate_visual_metrics(
+    index_canvas: np.ndarray,
+    rs: np.ndarray,
+    metrics: Dict[str, float],
+) -> Dict[str, float]:
     sil_div = silhouette_color_diversity_score(index_canvas)
     contour_score, outline_band_div = contour_break_score(index_canvas)
     small_scale_score = small_scale_structural_score(index_canvas)
@@ -1292,12 +2118,7 @@ def evaluate_visual_metrics(index_canvas: np.ndarray, rs: np.ndarray, metrics: D
     s_sil = sil_div
     s_contour = clamp01(0.65 * contour_score + 0.35 * outline_band_div)
 
-    final_score = (
-        0.28 * s_ratio
-        + 0.30 * s_sil
-        + 0.24 * s_contour
-        + 0.18 * s_main
-    )
+    final_score = 0.28 * s_ratio + 0.30 * s_sil + 0.24 * s_contour + 0.18 * s_main
 
     visual_valid = (
         sil_div >= VISUAL_MIN_SILHOUETTE_COLOR_DIVERSITY
@@ -1321,14 +2142,27 @@ def evaluate_visual_metrics(index_canvas: np.ndarray, rs: np.ndarray, metrics: D
     }
 
 
-def absolute_origin_color_ratios(canvas: np.ndarray, origin_map: np.ndarray) -> Dict[str, float]:
+def absolute_origin_color_ratios(
+    canvas: np.ndarray,
+    origin_map: np.ndarray,
+) -> Dict[str, float]:
     total = float(canvas.size)
     return {
-        "macro_olive_visible_ratio": float(np.sum((canvas == IDX_OLIVE) & (origin_map == ORIGIN_MACRO)) / total),
-        "macro_terre_visible_ratio": float(np.sum((canvas == IDX_TERRE) & (origin_map == ORIGIN_MACRO)) / total),
-        "macro_gris_visible_ratio": float(np.sum((canvas == IDX_GRIS) & (origin_map == ORIGIN_MACRO)) / total),
-        "transition_terre_visible_ratio": float(np.sum((canvas == IDX_TERRE) & (origin_map == ORIGIN_TRANSITION)) / total),
-        "micro_gris_visible_ratio": float(np.sum((canvas == IDX_GRIS) & (origin_map == ORIGIN_MICRO)) / total),
+        "macro_olive_visible_ratio": float(
+            np.sum((canvas == IDX_OLIVE) & (origin_map == ORIGIN_MACRO)) / total
+        ),
+        "macro_terre_visible_ratio": float(
+            np.sum((canvas == IDX_TERRE) & (origin_map == ORIGIN_MACRO)) / total
+        ),
+        "macro_gris_visible_ratio": float(
+            np.sum((canvas == IDX_GRIS) & (origin_map == ORIGIN_MACRO)) / total
+        ),
+        "transition_terre_visible_ratio": float(
+            np.sum((canvas == IDX_TERRE) & (origin_map == ORIGIN_TRANSITION)) / total
+        ),
+        "micro_gris_visible_ratio": float(
+            np.sum((canvas == IDX_GRIS) & (origin_map == ORIGIN_MICRO)) / total
+        ),
     }
 
 
@@ -1338,7 +2172,10 @@ def spatial_discipline_metrics(canvas: np.ndarray) -> Dict[str, float]:
 
     periphery_boundary_density = float(np.mean(boundary[HIGH_DENSITY_ZONE_MASK]))
     center_boundary_density = float(np.mean(boundary[CENTER_TORSO_MASK]))
-    periphery_boundary_ratio = periphery_boundary_density / max(center_boundary_density, 1e-6)
+    periphery_boundary_ratio = periphery_boundary_density / max(
+        center_boundary_density,
+        1e-6,
+    )
 
     periphery_non_coyote = float(np.mean(non_coyote[HIGH_DENSITY_ZONE_MASK]))
     center_non_coyote = float(np.mean(non_coyote[CENTER_TORSO_MASK]))
@@ -1373,8 +2210,537 @@ def military_visual_discipline_score(metrics: Dict[str, float]) -> Dict[str, flo
 
 
 # ============================================================
+# DIAGNOSTIC DES REJETS + ADAPTATION EN DIRECT
+# ============================================================
+
+_ADAPTIVE_PROFILE_OVERRIDES: Dict[int, Dict[str, Any]] = {}
+_LOG_MODULE_CACHE: Any = None
+_LOG_MODULE_ATTEMPTED = False
+
+
+def _register_profile_override(seed: int, adaptive_hint: Optional[Dict[str, Any]]) -> None:
+    if adaptive_hint:
+        _ADAPTIVE_PROFILE_OVERRIDES[int(seed)] = dict(adaptive_hint)
+
+
+def _consume_profile_override(seed: int) -> Optional[Dict[str, Any]]:
+    return _ADAPTIVE_PROFILE_OVERRIDES.pop(int(seed), None)
+
+
+def _get_log_module() -> Any:
+    global _LOG_MODULE_CACHE, _LOG_MODULE_ATTEMPTED
+    if _LOG_MODULE_CACHE is not None:
+        return _LOG_MODULE_CACHE
+    if _LOG_MODULE_ATTEMPTED:
+        return None
+    _LOG_MODULE_ATTEMPTED = True
+
+    module = sys.modules.get("log")
+    if module is not None:
+        _LOG_MODULE_CACHE = module
+        return module
+
+    try:
+        module = importlib.import_module("log")
+    except Exception:
+        module = None
+
+    _LOG_MODULE_CACHE = module
+    return module
+
+
+def _runtime_log(level: str, source: str, message: str, **payload: Any) -> None:
+    mod = _get_log_module()
+    log_event = getattr(mod, "log_event", None) if mod is not None else None
+    if callable(log_event):
+        try:
+            log_event(level, source, message, **payload)
+        except Exception:
+            pass
+
+
+def _failure_payload(
+    rule: str,
+    actual: float,
+    delta: float,
+    min_value: Optional[float] = None,
+    max_value: Optional[float] = None,
+    target: Optional[float] = None,
+) -> Dict[str, Any]:
+    return {
+        "rule": str(rule),
+        "actual": float(actual),
+        "delta": float(delta),
+        "min_value": None if min_value is None else float(min_value),
+        "max_value": None if max_value is None else float(max_value),
+        "target": None if target is None else float(target),
+    }
+
+
+def _append_failure_range(
+    failures: List[Dict[str, Any]],
+    rule: str,
+    actual: float,
+    min_value: float,
+    max_value: float,
+) -> None:
+    if actual < min_value:
+        failures.append(
+            _failure_payload(
+                rule,
+                actual,
+                min_value - actual,
+                min_value=min_value,
+                max_value=max_value,
+            )
+        )
+    elif actual > max_value:
+        failures.append(
+            _failure_payload(
+                rule,
+                actual,
+                actual - max_value,
+                min_value=min_value,
+                max_value=max_value,
+            )
+        )
+
+
+def _append_failure_min(
+    failures: List[Dict[str, Any]],
+    rule: str,
+    actual: float,
+    min_value: float,
+) -> None:
+    if actual < min_value:
+        failures.append(
+            _failure_payload(rule, actual, min_value - actual, min_value=min_value)
+        )
+
+
+def _append_failure_max(
+    failures: List[Dict[str, Any]],
+    rule: str,
+    actual: float,
+    max_value: float,
+) -> None:
+    if actual > max_value:
+        failures.append(
+            _failure_payload(rule, actual, actual - max_value, max_value=max_value)
+        )
+
+
+def _append_failure_abs_target(
+    failures: List[Dict[str, Any]],
+    rule: str,
+    actual: float,
+    target: float,
+    max_abs_error: float,
+) -> None:
+    delta = abs(actual - target)
+    if delta > max_abs_error:
+        failures.append(
+            _failure_payload(
+                rule,
+                actual,
+                delta - max_abs_error,
+                max_value=max_abs_error,
+                target=target,
+            )
+        )
+
+
+def _fallback_analyze_candidate_failures(candidate: CandidateResult) -> List[Dict[str, Any]]:
+    rs = np.asarray(candidate.ratios, dtype=float)
+    m = dict(candidate.metrics)
+    failures: List[Dict[str, Any]] = []
+
+    abs_err = np.abs(rs - TARGET)
+    mean_abs_err = float(np.mean(abs_err))
+
+    _append_failure_abs_target(
+        failures,
+        "abs_err_coyote",
+        float(rs[IDX_COYOTE]),
+        float(TARGET[IDX_COYOTE]),
+        float(MAX_ABS_ERROR_PER_COLOR[IDX_COYOTE]),
+    )
+    _append_failure_abs_target(
+        failures,
+        "abs_err_olive",
+        float(rs[IDX_OLIVE]),
+        float(TARGET[IDX_OLIVE]),
+        float(MAX_ABS_ERROR_PER_COLOR[IDX_OLIVE]),
+    )
+    _append_failure_abs_target(
+        failures,
+        "abs_err_terre",
+        float(rs[IDX_TERRE]),
+        float(TARGET[IDX_TERRE]),
+        float(MAX_ABS_ERROR_PER_COLOR[IDX_TERRE]),
+    )
+    _append_failure_abs_target(
+        failures,
+        "abs_err_gris",
+        float(rs[IDX_GRIS]),
+        float(TARGET[IDX_GRIS]),
+        float(MAX_ABS_ERROR_PER_COLOR[IDX_GRIS]),
+    )
+    _append_failure_max(failures, "mean_abs_error", mean_abs_err, float(MAX_MEAN_ABS_ERROR))
+
+    _append_failure_range(failures, "ratio_coyote", float(rs[IDX_COYOTE]), 0.27, 0.37)
+    _append_failure_range(failures, "ratio_olive", float(rs[IDX_OLIVE]), 0.24, 0.33)
+    _append_failure_range(failures, "ratio_terre", float(rs[IDX_TERRE]), 0.19, 0.26)
+    _append_failure_range(failures, "ratio_gris", float(rs[IDX_GRIS]), 0.14, 0.21)
+
+    _append_failure_min(
+        failures,
+        "largest_olive_component_ratio",
+        _safe_failure_float(m.get("largest_olive_component_ratio")),
+        float(MIN_OLIVE_CONNECTED_COMPONENT_RATIO),
+    )
+    _append_failure_min(
+        failures,
+        "largest_olive_component_ratio_small",
+        _safe_failure_float(m.get("largest_olive_component_ratio_small")),
+        0.12,
+    )
+    _append_failure_min(
+        failures,
+        "olive_multizone_share",
+        _safe_failure_float(m.get("olive_multizone_share")),
+        float(MIN_OLIVE_MULTIZONE_SHARE),
+    )
+    _append_failure_min(
+        failures,
+        "boundary_density",
+        _safe_failure_float(m.get("boundary_density")),
+        float(MIN_BOUNDARY_DENSITY),
+    )
+    _append_failure_min(
+        failures,
+        "boundary_density_small",
+        _safe_failure_float(m.get("boundary_density_small")),
+        float(MIN_BOUNDARY_DENSITY_SMALL),
+    )
+    _append_failure_min(
+        failures,
+        "oblique_share",
+        _safe_failure_float(m.get("oblique_share")),
+        float(MIN_OBLIQUE_SHARE),
+    )
+    _append_failure_min(
+        failures,
+        "vert_olive_macro_share",
+        _safe_failure_float(m.get("vert_olive_macro_share")),
+        float(MIN_VISIBLE_OLIVE_MACRO_SHARE),
+    )
+    _append_failure_min(
+        failures,
+        "terre_de_france_transition_share",
+        _safe_failure_float(m.get("terre_de_france_transition_share")),
+        float(MIN_VISIBLE_TERRE_TRANS_SHARE),
+    )
+    _append_failure_min(
+        failures,
+        "vert_de_gris_micro_share",
+        _safe_failure_float(m.get("vert_de_gris_micro_share")),
+        float(MIN_VISIBLE_GRIS_MICRO_SHARE),
+    )
+
+    _append_failure_max(
+        failures,
+        "center_empty_ratio",
+        _safe_failure_float(m.get("center_empty_ratio")),
+        float(MAX_COYOTE_CENTER_EMPTY_RATIO),
+    )
+    _append_failure_max(
+        failures,
+        "center_empty_ratio_small",
+        _safe_failure_float(m.get("center_empty_ratio_small")),
+        float(MAX_COYOTE_CENTER_EMPTY_RATIO_SMALL),
+    )
+    _append_failure_max(
+        failures,
+        "boundary_density",
+        _safe_failure_float(m.get("boundary_density")),
+        float(MAX_BOUNDARY_DENSITY),
+    )
+    _append_failure_max(
+        failures,
+        "boundary_density_small",
+        _safe_failure_float(m.get("boundary_density_small")),
+        float(MAX_BOUNDARY_DENSITY_SMALL),
+    )
+    _append_failure_max(
+        failures,
+        "mirror_similarity",
+        _safe_failure_float(m.get("mirror_similarity")),
+        float(MAX_MIRROR_SIMILARITY),
+    )
+    _append_failure_max(
+        failures,
+        "angle_dominance_ratio",
+        _safe_failure_float(m.get("angle_dominance_ratio")),
+        float(MAX_ANGLE_DOMINANCE_RATIO),
+    )
+    _append_failure_max(
+        failures,
+        "vert_de_gris_macro_share",
+        _safe_failure_float(m.get("vert_de_gris_macro_share")),
+        float(MAX_VISIBLE_GRIS_MACRO_SHARE),
+    )
+    _append_failure_range(
+        failures,
+        "vertical_share",
+        _safe_failure_float(m.get("vertical_share")),
+        float(MIN_VERTICAL_SHARE),
+        float(MAX_VERTICAL_SHARE),
+    )
+
+    if "macro_olive_visible_ratio" in m:
+        _append_failure_min(
+            failures,
+            "macro_olive_visible_ratio",
+            _safe_failure_float(m.get("macro_olive_visible_ratio")),
+            float(MIN_MACRO_OLIVE_VISIBLE_RATIO),
+        )
+    if "macro_gris_visible_ratio" in m:
+        _append_failure_max(
+            failures,
+            "macro_gris_visible_ratio",
+            _safe_failure_float(m.get("macro_gris_visible_ratio")),
+            float(MAX_MACRO_GRIS_VISIBLE_RATIO),
+        )
+
+    return failures
+
+
+def extract_rejection_failures(
+    candidate: CandidateResult,
+    target_index: int,
+    local_attempt: int,
+) -> List[Dict[str, Any]]:
+    mod = _get_log_module()
+    analyze = getattr(mod, "analyze_candidate", None) if mod is not None else None
+
+    if callable(analyze):
+        try:
+            diagnostic = analyze(
+                candidate,
+                target_index=target_index,
+                local_attempt=local_attempt,
+            )
+            failures = []
+            for failure in getattr(diagnostic, "failures", []) or []:
+                failures.append(
+                    {
+                        "rule": str(getattr(failure, "rule", "")),
+                        "actual": _safe_failure_float(getattr(failure, "actual", 0.0)),
+                        "target": getattr(failure, "target", None),
+                        "min_value": getattr(failure, "min_value", None),
+                        "max_value": getattr(failure, "max_value", None),
+                        "delta": _safe_failure_float(getattr(failure, "delta", 0.0)),
+                    }
+                )
+            return failures
+        except Exception:
+            pass
+
+    return _fallback_analyze_candidate_failures(candidate)
+
+
+def build_adaptive_hint(state: AdaptiveGenerationState) -> Dict[str, Any]:
+    return state.to_hint()
+
+
+def generate_candidate_from_seed_with_hint(
+    seed: int,
+    adaptive_hint: Optional[Dict[str, Any]] = None,
+) -> CandidateResult:
+    profile = make_profile(seed, adaptive_hint=adaptive_hint)
+    image, ratios, metrics = generate_one_variant(profile)
+    return CandidateResult(
+        seed=seed,
+        profile=profile,
+        image=image,
+        ratios=ratios,
+        metrics=metrics,
+    )
+
+
+def generate_and_validate_from_seed_with_hint(
+    seed: int,
+    adaptive_hint: Optional[Dict[str, Any]] = None,
+) -> Tuple[CandidateResult, bool]:
+    candidate = generate_candidate_from_seed_with_hint(seed, adaptive_hint=adaptive_hint)
+    accepted = validate_candidate_result(candidate)
+    return candidate, accepted
+
+
+def update_adaptive_state_after_attempt(
+    state: Optional[AdaptiveGenerationState],
+    candidate: CandidateResult,
+    accepted: bool,
+    target_index: int,
+    local_attempt: int,
+) -> List[Dict[str, Any]]:
+    if state is None:
+        return []
+
+    if accepted:
+        state.register_success()
+        return []
+
+    failures = extract_rejection_failures(
+        candidate,
+        target_index=target_index,
+        local_attempt=local_attempt,
+    )
+    state.register_failures(failures)
+
+    hint = state.to_hint()
+    _runtime_log(
+        "WARNING",
+        "main_adaptive",
+        "Rejet analysé et réglages ajustés",
+        target_index=target_index,
+        local_attempt=local_attempt,
+        seed=int(candidate.seed),
+        fail_rules=[item.get("rule") for item in failures],
+        consecutive_rejections=state.consecutive_rejections,
+        adaptive_hint={
+            "prefer_oblique": hint.get("prefer_oblique"),
+            "prefer_vertical": hint.get("prefer_vertical"),
+            "avoid_vertical": hint.get("avoid_vertical"),
+            "olive_macro_target_scale": hint.get("olive_macro_target_scale"),
+            "terre_macro_target_scale": hint.get("terre_macro_target_scale"),
+            "micro_gris_bias": hint.get("micro_gris_bias"),
+            "extra_boundary_nudge_passes": hint.get("extra_boundary_nudge_passes"),
+        },
+    )
+    return failures
+
+
+# ============================================================
 # GÉNÉRATION D'UNE VARIANTE
 # ============================================================
+
+def repair_spatial_discipline(
+    canvas: np.ndarray,
+    origin_map: np.ndarray,
+    profile: VariantProfile,
+    rng: random.Random,
+) -> None:
+    for _ in range(TARGET_PERIPHERY_REPAIR_STEPS):
+        spatial = spatial_discipline_metrics(canvas)
+        center_empty = center_empty_ratio(canvas)
+
+        need_periphery = (
+            spatial["periphery_boundary_density_ratio"]
+            < MIN_PERIPHERY_BOUNDARY_DENSITY_RATIO
+            or spatial["periphery_non_coyote_ratio"] < MIN_PERIPHERY_NON_COYOTE_RATIO
+        )
+        need_center_fill = center_empty > MAX_COYOTE_CENTER_EMPTY_RATIO
+
+        if not need_periphery and not need_center_fill:
+            break
+
+        boundary = compute_boundary_mask(canvas)
+        if need_periphery:
+            ys, xs = preferred_boundary_coordinates(boundary, HIGH_DENSITY_ZONE_MASK)
+            origin_code = ORIGIN_TRANSITION if rng.random() < 0.70 else ORIGIN_MICRO
+            color = IDX_TERRE if rng.random() < 0.55 else IDX_OLIVE
+        else:
+            ys, xs = preferred_boundary_coordinates(boundary, CENTER_TORSO_MASK)
+            origin_code = ORIGIN_TRANSITION
+            color = IDX_OLIVE if rng.random() < 0.65 else IDX_TERRE
+
+        if len(xs) == 0:
+            break
+
+        idx = rng.randint(0, len(xs) - 1)
+        cx, cy = int(xs[idx]), int(ys[idx])
+        size = cm_to_px(rng.uniform(2.0, 6.0))
+        angle = (
+            0
+            if need_center_fill and 0 in profile.allowed_angles
+            else rng.choice(profile.angle_pool or tuple(profile.allowed_angles))
+        )
+        poly = jagged_spine_poly(
+            rng=rng,
+            cx=cx,
+            cy=cy,
+            length_px=size * rng.uniform(1.6, 2.6),
+            width_px=size * rng.uniform(0.55, 0.95),
+            angle_from_vertical_deg=angle,
+            segments=rng.randint(4, 6),
+            width_variation=profile.micro_width_variation,
+            lateral_jitter=profile.micro_lateral_jitter,
+            tip_taper=profile.micro_tip_taper,
+            edge_break=profile.micro_edge_break,
+        )
+        mask = polygon_mask(poly)
+        if mask.sum() == 0:
+            continue
+
+        if need_periphery and float(np.mean(HIGH_DENSITY_ZONE_MASK[mask])) < 0.30:
+            continue
+        if need_center_fill and float(np.mean(CENTER_TORSO_MASK[mask])) < 0.30:
+            continue
+
+        apply_mask(canvas, origin_map, mask, color, origin_code)
+
+
+def enforce_macro_angle_discipline(
+    canvas: np.ndarray,
+    origin_map: np.ndarray,
+    macros: List[MacroRecord],
+    profile: VariantProfile,
+    rng: random.Random,
+) -> None:
+    repair_attempts = 0
+    while repair_attempts < TARGET_CENTER_REPAIR_STEPS:
+        repair_attempts += 1
+        orient = orientation_score(macros)
+        if (
+            orient["oblique_share"] >= MIN_OBLIQUE_SHARE
+            and MIN_VERTICAL_SHARE <= orient["vertical_share"] <= MAX_VERTICAL_SHARE
+            and orient["dominance_ratio"] <= MAX_ANGLE_DOMINANCE_RATIO
+        ):
+            break
+
+        if orient["vertical_share"] < MIN_VERTICAL_SHARE and 0 in profile.allowed_angles:
+            angle = 0
+        else:
+            angle = pick_macro_angle(macros, profile, rng, force_vertical_floor=False)
+
+        cx, cy = choose_biased_center(rng, profile.zone_weight_boosts)
+        poly = jagged_spine_poly(
+            rng=rng,
+            cx=cx,
+            cy=cy,
+            length_px=cm_to_px(rng.uniform(22, 42)),
+            width_px=cm_to_px(rng.uniform(8, 16)),
+            angle_from_vertical_deg=angle,
+            segments=rng.randint(5, 7),
+            width_variation=max(0.16, profile.macro_width_variation - 0.04),
+            lateral_jitter=max(0.11, profile.macro_lateral_jitter - 0.02),
+            tip_taper=profile.macro_tip_taper,
+            edge_break=profile.macro_edge_break,
+        )
+        mask = polygon_mask(poly)
+        if mask.sum() == 0:
+            continue
+        if zone_overlap_ratio(mask, ANATOMY_ZONES["center_torso"]) > 0.46:
+            continue
+        if float(np.mean(canvas[mask] == IDX_OLIVE)) > 0.65:
+            continue
+
+        color = IDX_OLIVE if rng.random() < 0.78 else IDX_TERRE
+        apply_mask(canvas, origin_map, mask, color, ORIGIN_MACRO)
+        macros.append(MacroRecord(color, poly, angle, (cx, cy), mask, macro_zone_count(mask)))
+
 
 def generate_one_variant(profile: VariantProfile) -> Tuple[Image.Image, np.ndarray, Dict[str, float]]:
     rng = random.Random(profile.seed)
@@ -1383,9 +2749,13 @@ def generate_one_variant(profile: VariantProfile) -> Tuple[Image.Image, np.ndarr
     origin_map = np.full((HEIGHT, WIDTH), ORIGIN_BACKGROUND, dtype=np.uint8)
 
     macros = add_macros(canvas, origin_map, profile, rng)
-    add_transitions(canvas, origin_map, macros, rng)
+    enforce_macro_angle_discipline(canvas, origin_map, macros, profile, rng)
+    add_transitions(canvas, origin_map, macros, profile, rng)
     add_micro_clusters(canvas, origin_map, profile, rng)
-    nudge_proportions(canvas, origin_map, rng)
+    repair_spatial_discipline(canvas, origin_map, profile, rng)
+    nudge_proportions(canvas, origin_map, profile, rng)
+    repair_spatial_discipline(canvas, origin_map, profile, rng)
+    nudge_proportions(canvas, origin_map, profile, rng)
 
     rs = compute_ratios(canvas)
     orient = orientation_score(macros)
@@ -1418,15 +2788,8 @@ def generate_one_variant(profile: VariantProfile) -> Tuple[Image.Image, np.ndarr
 
 
 def generate_candidate_from_seed(seed: int) -> CandidateResult:
-    profile = make_profile(seed)
-    image, ratios, metrics = generate_one_variant(profile)
-    return CandidateResult(
-        seed=seed,
-        profile=profile,
-        image=image,
-        ratios=ratios,
-        metrics=metrics,
-    )
+    adaptive_hint = _consume_profile_override(seed)
+    return generate_candidate_from_seed_with_hint(seed, adaptive_hint=adaptive_hint)
 
 
 async def async_generate_candidate_from_seed(seed: int) -> CandidateResult:
@@ -1496,7 +2859,6 @@ def variant_is_valid(rs: np.ndarray, metrics: Dict[str, float]) -> bool:
     if metrics["vert_de_gris_macro_share"] > MAX_VISIBLE_GRIS_MACRO_SHARE:
         return False
 
-    # Validation perceptive optionnelle mais activée automatiquement quand les scores sont présents.
     if "visual_silhouette_color_diversity" in metrics:
         if metrics["visual_silhouette_color_diversity"] < VISUAL_MIN_SILHOUETTE_COLOR_DIVERSITY:
             return False
@@ -1593,6 +2955,7 @@ def candidate_row(
         "gris_macro_share": round(metrics["vert_de_gris_macro_share"], 5),
         "angles": " ".join(map(str, candidate.profile.allowed_angles)),
     }
+
     for key in (
         "visual_score_final",
         "visual_score_ratio",
@@ -1620,10 +2983,15 @@ def candidate_row(
     ):
         if key in metrics:
             row[key] = round(float(metrics[key]), 5)
+
     return row
 
 
-def write_report(rows: List[Dict[str, object]], output_dir: Path, filename: str = "rapport_camouflages.csv") -> Path:
+def write_report(
+    rows: List[Dict[str, object]],
+    output_dir: Path,
+    filename: str = "rapport_camouflages.csv",
+) -> Path:
     output_dir = ensure_output_dir(output_dir)
     csv_path = output_dir / filename
 
@@ -1684,19 +3052,29 @@ def generate_all(
     max_workers: int = DEFAULT_MAX_WORKERS,
     attempt_batch_size: int = DEFAULT_ATTEMPT_BATCH_SIZE,
     parallel_attempts: bool = True,
+    adaptive_rejection_correction: bool = True,
 ) -> List[Dict[str, object]]:
     output_dir = ensure_output_dir(output_dir)
 
     rows: List[Dict[str, object]] = []
     total_attempts = 0
-    max_workers = max(1, int(max_workers))
-    attempt_batch_size = max(1, int(attempt_batch_size))
+    max_workers = _normalize_workers(max_workers)
+    attempt_batch_size = _normalize_batch_size(attempt_batch_size, max_workers)
 
     use_parallel = parallel_attempts and max_workers > 1 and attempt_batch_size > 1
     pool = get_process_pool(max_workers) if use_parallel else None
 
     for target_index in range(1, target_count + 1):
         local_attempt = 1
+        adaptive_state = AdaptiveGenerationState() if adaptive_rejection_correction else None
+
+        _runtime_log(
+            "INFO",
+            "main_adaptive",
+            "Initialisation du réglage adaptatif",
+            target_index=target_index,
+            enabled=bool(adaptive_state),
+        )
 
         while True:
             if stop_requested is not None and stop_requested():
@@ -1710,8 +3088,20 @@ def generate_all(
                     batch_size=attempt_batch_size,
                     base_seed=base_seed,
                 )
+                adaptive_hint = (
+                    build_adaptive_hint(adaptive_state)
+                    if adaptive_state is not None
+                    else None
+                )
 
-                futures = [pool.submit(generate_and_validate_from_seed, seed) for _, seed in batch]
+                futures = [
+                    pool.submit(
+                        generate_and_validate_from_seed_with_hint,
+                        seed,
+                        adaptive_hint,
+                    )
+                    for _, seed in batch
+                ]
 
                 batch_results: List[Tuple[int, CandidateResult, bool]] = []
                 for (attempt_no, _seed), fut in zip(batch, futures):
@@ -1729,7 +3119,18 @@ def generate_all(
                             accepted,
                         )
 
-                accepted_result = next(((a, c) for a, c, ok in batch_results if ok), None)
+                    update_adaptive_state_after_attempt(
+                        adaptive_state,
+                        candidate,
+                        accepted,
+                        target_index=target_index,
+                        local_attempt=attempt_no,
+                    )
+
+                accepted_result = next(
+                    ((a, c) for a, c, ok in batch_results if ok),
+                    None,
+                )
                 if accepted_result is None:
                     local_attempt += attempt_batch_size
                     continue
@@ -1738,6 +3139,12 @@ def generate_all(
 
             else:
                 seed = build_seed(target_index, local_attempt, base_seed=base_seed)
+                adaptive_hint = (
+                    build_adaptive_hint(adaptive_state)
+                    if adaptive_state is not None
+                    else None
+                )
+                _register_profile_override(seed, adaptive_hint)
                 accepted_candidate = generate_candidate_from_seed(seed)
                 accepted = validate_candidate_result(accepted_candidate)
                 total_attempts += 1
@@ -1751,6 +3158,14 @@ def generate_all(
                         accepted_candidate,
                         accepted,
                     )
+
+                update_adaptive_state_after_attempt(
+                    adaptive_state,
+                    accepted_candidate,
+                    accepted,
+                    target_index=target_index,
+                    local_attempt=local_attempt,
+                )
 
                 if not accepted:
                     local_attempt += 1
@@ -1779,7 +3194,10 @@ def generate_all(
 # GÉNÉRATION SÉQUENTIELLE ASYNCHRONE
 # ============================================================
 
-AsyncProgressCallback = Callable[[int, int, int, int, CandidateResult, bool], Awaitable[None]]
+AsyncProgressCallback = Callable[
+    [int, int, int, int, CandidateResult, bool],
+    Awaitable[None],
+]
 AsyncStopCallable = Callable[[], Awaitable[bool]]
 
 
@@ -1792,6 +3210,7 @@ async def async_generate_all(
     max_workers: int = DEFAULT_MAX_WORKERS,
     attempt_batch_size: int = DEFAULT_ATTEMPT_BATCH_SIZE,
     parallel_attempts: bool = True,
+    adaptive_rejection_correction: bool = True,
 ) -> List[Dict[str, object]]:
     """
     Version asynchrone séquentielle stricte.
@@ -1805,8 +3224,8 @@ async def async_generate_all(
 
     rows: List[Dict[str, object]] = []
     total_attempts = 0
-    max_workers = max(1, int(max_workers))
-    attempt_batch_size = max(1, int(attempt_batch_size))
+    max_workers = _normalize_workers(max_workers)
+    attempt_batch_size = _normalize_batch_size(attempt_batch_size, max_workers)
 
     use_parallel = parallel_attempts and max_workers > 1 and attempt_batch_size > 1
     loop = asyncio.get_running_loop()
@@ -1814,6 +3233,15 @@ async def async_generate_all(
 
     for target_index in range(1, target_count + 1):
         local_attempt = 1
+        adaptive_state = AdaptiveGenerationState() if adaptive_rejection_correction else None
+
+        _runtime_log(
+            "INFO",
+            "main_adaptive",
+            "Initialisation du réglage adaptatif",
+            target_index=target_index,
+            enabled=bool(adaptive_state),
+        )
 
         while True:
             if stop_requested is not None and await stop_requested():
@@ -1827,9 +3255,19 @@ async def async_generate_all(
                     batch_size=attempt_batch_size,
                     base_seed=base_seed,
                 )
+                adaptive_hint = (
+                    build_adaptive_hint(adaptive_state)
+                    if adaptive_state is not None
+                    else None
+                )
 
                 tasks = [
-                    loop.run_in_executor(pool, generate_and_validate_from_seed, seed)
+                    loop.run_in_executor(
+                        pool,
+                        generate_and_validate_from_seed_with_hint,
+                        seed,
+                        adaptive_hint,
+                    )
                     for _, seed in batch
                 ]
                 raw_results = await asyncio.gather(*tasks)
@@ -1849,7 +3287,18 @@ async def async_generate_all(
                             accepted,
                         )
 
-                accepted_result = next(((a, c) for a, c, ok in batch_results if ok), None)
+                    update_adaptive_state_after_attempt(
+                        adaptive_state,
+                        candidate,
+                        accepted,
+                        target_index=target_index,
+                        local_attempt=attempt_no,
+                    )
+
+                accepted_result = next(
+                    ((a, c) for a, c, ok in batch_results if ok),
+                    None,
+                )
                 if accepted_result is None:
                     local_attempt += attempt_batch_size
                     continue
@@ -1858,6 +3307,12 @@ async def async_generate_all(
 
             else:
                 seed = build_seed(target_index, local_attempt, base_seed=base_seed)
+                adaptive_hint = (
+                    build_adaptive_hint(adaptive_state)
+                    if adaptive_state is not None
+                    else None
+                )
+                _register_profile_override(seed, adaptive_hint)
                 accepted_candidate = await async_generate_candidate_from_seed(seed)
                 accepted = await async_validate_candidate_result(accepted_candidate)
                 total_attempts += 1
@@ -1871,6 +3326,14 @@ async def async_generate_all(
                         accepted_candidate,
                         accepted,
                     )
+
+                update_adaptive_state_after_attempt(
+                    adaptive_state,
+                    accepted_candidate,
+                    accepted,
+                    target_index=target_index,
+                    local_attempt=local_attempt,
+                )
 
                 if not accepted:
                     local_attempt += 1
@@ -1908,6 +3371,7 @@ if __name__ == "__main__":
             max_workers=DEFAULT_MAX_WORKERS,
             attempt_batch_size=DEFAULT_ATTEMPT_BATCH_SIZE,
             parallel_attempts=True,
+            adaptive_rejection_correction=True,
         )
 
         csv_path = OUTPUT_DIR / "rapport_camouflages.csv"
@@ -1916,7 +3380,9 @@ if __name__ == "__main__":
         print(f"Images validées : {len(rows)}/{N_VARIANTS_REQUIRED}")
         print(f"Dossier : {OUTPUT_DIR.resolve()}")
         print(f"CSV : {csv_path.resolve()}")
+        print(f"CPU logiques détectés : {CPU_COUNT}")
         print(f"Workers : {DEFAULT_MAX_WORKERS}")
         print(f"Batch size : {DEFAULT_ATTEMPT_BATCH_SIZE}")
+        print(f"BLAS/OpenMP limités dans les workers : {LIMIT_NUMERIC_THREADS_IN_WORKERS}")
     finally:
         shutdown_process_pool()
