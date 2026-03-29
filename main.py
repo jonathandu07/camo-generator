@@ -171,6 +171,14 @@ MIN_MACRO_GRIS_VISIBLE_RATIO = 0.07
 MAX_MACRO_TERRE_VISIBLE_RATIO = 0.16
 MAX_MACRO_GRIS_VISIBLE_RATIO = 0.12
 MAX_CENTRAL_BROWN_CONTINUITY = 0.38
+MIN_OLIVE_MACRO_HEIGHT_SPAN_RATIO = 0.16
+MIN_TERRE_MACRO_HEIGHT_SPAN_RATIO = 0.11
+MIN_GRIS_MACRO_HEIGHT_SPAN_RATIO = 0.09
+MIN_OLIVE_HIGH_DENSITY_OVERLAP = 0.22
+MIN_TERRE_HIGH_DENSITY_OVERLAP = 0.16
+MIN_GRIS_HIGH_DENSITY_OVERLAP = 0.12
+MIN_STRUCTURAL_CORE_OVERLAP = 0.06
+MAX_MACRO_EDGE_LOCK_RATIO = 0.82
 
 
 # Discipline de génération pilotée
@@ -1144,7 +1152,7 @@ def enforce_secondary_macro_budgets(
     rng: random.Random,
 ) -> None:
     repair_attempts = 0
-    while repair_attempts < 180:
+    while repair_attempts < 200:
         repair_attempts += 1
         macro_ratios = absolute_origin_color_ratios(canvas, origin_map)
         terre_need = macro_ratios["macro_terre_visible_ratio"] < MIN_MACRO_TERRE_VISIBLE_RATIO
@@ -1152,24 +1160,17 @@ def enforce_secondary_macro_budgets(
         if not terre_need and not gris_need:
             break
 
-        if gris_need and (not terre_need or rng.random() < 0.48):
+        if gris_need and (not terre_need or rng.random() < 0.44):
             color = IDX_GRIS
-            length_cm = (26, 50)
-            width_cm = (9, 18)
-            overlap_limit = 0.20
-            zone_min = 1
+            length_cm = (30, 54)
+            width_cm = (10, 19)
         else:
             color = IDX_TERRE
-            length_cm = (34, 62)
-            width_cm = (11, 22)
-            overlap_limit = 0.28 * profile.center_torso_overlap_scale
-            zone_min = 1
+            length_cm = (38, 66)
+            width_cm = (12, 24)
 
         cx, cy = choose_biased_center(rng, profile.zone_weight_boosts)
         angle = pick_macro_angle(macros, profile, rng, force_vertical_floor=False)
-        if local_parallel_conflict(macros, (cx, cy), angle, dist_threshold_px=210, angle_threshold_deg=7):
-            continue
-
         poly = jagged_spine_poly(
             rng=rng,
             cx=cx,
@@ -1184,22 +1185,83 @@ def enforce_secondary_macro_budgets(
             edge_break=profile.macro_edge_break,
         )
         mask = polygon_mask(poly)
-        if mask.sum() == 0:
+        if not macro_candidate_is_valid(mask, color, angle, canvas, macros, require_cross_core=False):
             continue
-
-        cur = canvas[mask]
-        if color == IDX_TERRE and float(np.mean(np.isin(cur, [IDX_COYOTE, IDX_OLIVE, IDX_TERRE]))) < 0.55:
+        if zone_overlap_ratio(mask, ANATOMY_ZONES["center_torso"]) > (0.30 if color == IDX_TERRE else 0.22):
             continue
-        if color == IDX_GRIS and float(np.mean(np.isin(cur, [IDX_OLIVE, IDX_TERRE, IDX_GRIS]))) < 0.45:
-            continue
-        if zone_overlap_ratio(mask, ANATOMY_ZONES["center_torso"]) > overlap_limit:
-            continue
-        if macro_zone_count(mask) < zone_min and rng.random() < 0.55:
-            continue
-
         apply_mask(canvas, origin_map, mask, color, ORIGIN_MACRO)
         macros.append(MacroRecord(color, poly, angle, (cx, cy), mask, macro_zone_count(mask)))
 
+
+CORE_CORRIDOR_MASK = rect_mask(0.28, 0.72, 0.15, 0.84)
+
+
+def macro_candidate_diagnostics(mask: np.ndarray) -> Dict[str, float]:
+    ys, xs = np.where(mask)
+    if len(xs) == 0:
+        return {
+            "zone_count": 0.0,
+            "height_span_ratio": 0.0,
+            "width_span_ratio": 0.0,
+            "high_density_overlap": 0.0,
+            "center_overlap": 0.0,
+            "core_overlap": 0.0,
+            "edge_lock_ratio": 1.0,
+        }
+    x_span = float((xs.max() - xs.min() + 1) / WIDTH)
+    y_span = float((ys.max() - ys.min() + 1) / HEIGHT)
+    left_edge = np.mean(xs <= int(WIDTH * 0.14))
+    right_edge = np.mean(xs >= int(WIDTH * 0.86))
+    return {
+        "zone_count": float(macro_zone_count(mask)),
+        "height_span_ratio": y_span,
+        "width_span_ratio": x_span,
+        "high_density_overlap": float(np.mean(HIGH_DENSITY_ZONE_MASK[mask])),
+        "center_overlap": float(np.mean(CENTER_TORSO_MASK[mask])),
+        "core_overlap": float(np.mean(CORE_CORRIDOR_MASK[mask])),
+        "edge_lock_ratio": float(max(left_edge, right_edge)),
+    }
+
+
+def macro_candidate_is_valid(
+    mask: np.ndarray,
+    color_idx: int,
+    angle_deg: int,
+    canvas: np.ndarray,
+    macros: Sequence[MacroRecord],
+    require_cross_core: bool = False,
+) -> bool:
+    if mask.sum() == 0:
+        return False
+    diag = macro_candidate_diagnostics(mask)
+    if diag["edge_lock_ratio"] > MAX_MACRO_EDGE_LOCK_RATIO:
+        return False
+
+    ys, xs = np.where(mask)
+    center = (int(np.mean(xs)), int(np.mean(ys)))
+
+    if color_idx == IDX_OLIVE:
+        if diag["zone_count"] < 2.0 or diag["height_span_ratio"] < MIN_OLIVE_MACRO_HEIGHT_SPAN_RATIO or diag["high_density_overlap"] < MIN_OLIVE_HIGH_DENSITY_OVERLAP:
+            return False
+        if float(np.mean(canvas[mask] == IDX_OLIVE)) > 0.45:
+            return False
+    elif color_idx == IDX_TERRE:
+        if diag["zone_count"] < 1.0 or diag["height_span_ratio"] < MIN_TERRE_MACRO_HEIGHT_SPAN_RATIO or diag["high_density_overlap"] < MIN_TERRE_HIGH_DENSITY_OVERLAP:
+            return False
+    else:
+        if diag["zone_count"] < 1.0 or diag["height_span_ratio"] < MIN_GRIS_MACRO_HEIGHT_SPAN_RATIO or diag["high_density_overlap"] < MIN_GRIS_HIGH_DENSITY_OVERLAP:
+            return False
+
+    if require_cross_core and diag["core_overlap"] < MIN_STRUCTURAL_CORE_OVERLAP:
+        return False
+
+    center_count = sum(1 for m in macros if zone_overlap_ratio(m.mask, CENTER_TORSO_MASK) > 0.14)
+    if diag["center_overlap"] > 0.48 and center_count >= 2:
+        return False
+
+    if local_parallel_conflict(macros, center, angle_deg, dist_threshold_px=240, angle_threshold_deg=7):
+        return False
+    return True
 def zone_center(name: str) -> Tuple[int, int]:
     ys, xs = np.where(ANATOMY_ZONES[name])
     return int(np.mean(xs)), int(np.mean(ys))
@@ -1227,19 +1289,19 @@ def add_forced_structural_macros(
     other_side = "right" if main_side == "left" else "left"
 
     plan = [
-        (IDX_OLIVE, (f"{main_side}_shoulder", f"{main_side}_thigh"), (52, 92), (18, 30)),
-        (IDX_TERRE, (f"{other_side}_shoulder", f"{other_side}_flank"), (42, 70), (14, 24)),
-        (IDX_GRIS, (f"{other_side}_flank", f"{other_side}_thigh"), (34, 56), (10, 18)),
+        (IDX_OLIVE, (f"{main_side}_shoulder", f"{other_side}_flank"), (52, 92), (18, 30), True),
+        (IDX_TERRE, (f"{other_side}_shoulder", f"{main_side}_flank"), (42, 70), (14, 24), True),
+        (IDX_GRIS, (f"{other_side}_flank", f"{main_side}_thigh"), (34, 56), (10, 18), False),
     ]
 
-    for color_idx, (z1, z2), length_range, width_range in plan:
+    for color_idx, (z1, z2), length_range, width_range, require_cross_core in plan:
         p1 = zone_center(z1)
         p2 = zone_center(z2)
-        cx = (p1[0] + p2[0]) / 2.0 + rng.uniform(-28.0, 28.0)
-        cy = (p1[1] + p2[1]) / 2.0 + rng.uniform(-40.0, 40.0)
+        cx = (p1[0] + p2[0]) / 2.0 + rng.uniform(-22.0, 22.0)
+        cy = (p1[1] + p2[1]) / 2.0 + rng.uniform(-32.0, 32.0)
         base_angle = angle_from_points_vertical(p1, p2)
-        angle = nearest_allowed_angle(base_angle + rng.uniform(-7.0, 7.0), profile.allowed_angles)
-        length_px = max(cm_to_px(rng.uniform(*length_range)), int(math.hypot(p2[0]-p1[0], p2[1]-p1[1]) * 1.05))
+        angle = nearest_allowed_angle(base_angle + rng.uniform(-6.0, 6.0), profile.allowed_angles)
+        length_px = max(cm_to_px(rng.uniform(*length_range)), int(math.hypot(p2[0] - p1[0], p2[1] - p1[1]) * 1.08))
         width_px = cm_to_px(rng.uniform(*width_range))
 
         poly = jagged_spine_poly(
@@ -1256,13 +1318,8 @@ def add_forced_structural_macros(
             edge_break=profile.macro_edge_break,
         )
         mask = polygon_mask(poly)
-        if mask.sum() == 0:
+        if not macro_candidate_is_valid(mask, color_idx, angle, canvas, macros, require_cross_core=require_cross_core):
             continue
-        if color_idx == IDX_OLIVE and macro_zone_count(mask) < 2:
-            continue
-        if color_idx in (IDX_TERRE, IDX_GRIS) and macro_zone_count(mask) < 1:
-            continue
-
         apply_mask(canvas, origin_map, mask, color_idx, ORIGIN_MACRO)
         macros.append(MacroRecord(color_idx, poly, angle, (int(cx), int(cy)), mask, macro_zone_count(mask)))
 def add_macros(
@@ -1282,17 +1339,10 @@ def add_macros(
         olive_attempts += 1
         if olive_attempts > MAX_MACRO_PLACEMENT_ATTEMPTS_OLIVE:
             break
-
         cx, cy = choose_biased_center(rng, profile.zone_weight_boosts)
         angle = pick_macro_angle(macros, profile, rng, force_vertical_floor=True)
-
-        if local_parallel_conflict(macros, (cx, cy), angle):
-            continue
-
         poly = jagged_spine_poly(
-            rng=rng,
-            cx=cx,
-            cy=cy,
+            rng=rng, cx=cx, cy=cy,
             length_px=cm_to_px(rng.uniform(*MACRO_LENGTH_CM)),
             width_px=cm_to_px(rng.uniform(*MACRO_WIDTH_CM)),
             angle_from_vertical_deg=angle,
@@ -1303,24 +1353,15 @@ def add_macros(
             edge_break=profile.macro_edge_break,
         )
         mask = polygon_mask(poly)
-        if mask.sum() == 0:
+        if not macro_candidate_is_valid(mask, IDX_OLIVE, angle, canvas, macros):
             continue
-
-        if float(np.mean(canvas[mask] == IDX_OLIVE)) > 0.45:
-            continue
-
-        zc = macro_zone_count(mask)
-        if zc < 2 and rng.random() < 0.75:
-            continue
-
         max_center_overlap = MAX_CENTER_TORSO_OVERLAP_MACRO * profile.center_torso_overlap_scale
         if angle == 0:
             max_center_overlap = min(0.42, max_center_overlap + 0.05)
         if zone_overlap_ratio(mask, ANATOMY_ZONES["center_torso"]) > max_center_overlap:
             continue
-
         apply_mask(canvas, origin_map, mask, IDX_OLIVE, ORIGIN_MACRO)
-        macros.append(MacroRecord(IDX_OLIVE, poly, angle, (cx, cy), mask, zc))
+        macros.append(MacroRecord(IDX_OLIVE, poly, angle, (cx, cy), mask, macro_zone_count(mask)))
 
     terre_attempts = 0
     while int(np.sum((canvas == IDX_TERRE) & (origin_map == ORIGIN_MACRO))) < target_macro_terre_pixels:
@@ -1329,14 +1370,8 @@ def add_macros(
             break
         cx, cy = choose_biased_center(rng, profile.zone_weight_boosts)
         angle = pick_macro_angle(macros, profile, rng, force_vertical_floor=False)
-
-        if local_parallel_conflict(macros, (cx, cy), angle, dist_threshold_px=220, angle_threshold_deg=6):
-            continue
-
         poly = jagged_spine_poly(
-            rng=rng,
-            cx=cx,
-            cy=cy,
+            rng=rng, cx=cx, cy=cy,
             length_px=cm_to_px(rng.uniform(40, 66)),
             width_px=cm_to_px(rng.uniform(12, 24)),
             angle_from_vertical_deg=angle,
@@ -1347,23 +1382,15 @@ def add_macros(
             edge_break=profile.macro_edge_break,
         )
         mask = polygon_mask(poly)
-        if mask.sum() == 0:
+        if not macro_candidate_is_valid(mask, IDX_TERRE, angle, canvas, macros):
             continue
-
+        if zone_overlap_ratio(mask, ANATOMY_ZONES["center_torso"]) > MAX_CENTER_TORSO_OVERLAP_TERRAIN_MACRO * profile.center_torso_overlap_scale:
+            continue
         cur = canvas[mask]
-        if float(np.mean(np.isin(cur, [IDX_COYOTE, IDX_OLIVE]))) < 0.65:
+        if float(np.mean(np.isin(cur, [IDX_COYOTE, IDX_OLIVE, IDX_TERRE]))) < 0.55:
             continue
-
-        max_center_overlap = MAX_CENTER_TORSO_OVERLAP_TERRAIN_MACRO * profile.center_torso_overlap_scale
-        if zone_overlap_ratio(mask, ANATOMY_ZONES["center_torso"]) > max_center_overlap:
-            continue
-
-        zc = macro_zone_count(mask)
-        if zc < 1 and rng.random() < 0.65:
-            continue
-
         apply_mask(canvas, origin_map, mask, IDX_TERRE, ORIGIN_MACRO)
-        macros.append(MacroRecord(IDX_TERRE, poly, angle, (cx, cy), mask, zc))
+        macros.append(MacroRecord(IDX_TERRE, poly, angle, (cx, cy), mask, macro_zone_count(mask)))
 
     gris_attempts = 0
     while int(np.sum((canvas == IDX_GRIS) & (origin_map == ORIGIN_MACRO))) < target_macro_gris_pixels:
@@ -1372,13 +1399,10 @@ def add_macros(
             break
         cx, cy = choose_biased_center(rng, profile.zone_weight_boosts)
         angle = pick_macro_angle(macros, profile, rng, force_vertical_floor=False)
-
         poly = jagged_spine_poly(
-            rng=rng,
-            cx=cx,
-            cy=cy,
-            length_px=cm_to_px(rng.uniform(34, 46)),
-            width_px=cm_to_px(rng.uniform(9, 14)),
+            rng=rng, cx=cx, cy=cy,
+            length_px=cm_to_px(rng.uniform(34, 52)),
+            width_px=cm_to_px(rng.uniform(10, 18)),
             angle_from_vertical_deg=angle,
             segments=rng.randint(5, 7),
             width_variation=max(0.15, profile.macro_width_variation - 0.08),
@@ -1387,23 +1411,17 @@ def add_macros(
             edge_break=profile.macro_edge_break,
         )
         mask = polygon_mask(poly)
-        if mask.sum() == 0:
+        if not macro_candidate_is_valid(mask, IDX_GRIS, angle, canvas, macros):
             continue
-
+        if zone_overlap_ratio(mask, ANATOMY_ZONES["center_torso"]) > 0.20:
+            continue
         cur = canvas[mask]
-        if float(np.mean(np.isin(cur, [IDX_OLIVE, IDX_TERRE]))) < 0.55:
+        if float(np.mean(np.isin(cur, [IDX_OLIVE, IDX_TERRE, IDX_GRIS]))) < 0.42:
             continue
-
-        if zone_overlap_ratio(mask, ANATOMY_ZONES["center_torso"]) > 0.18:
-            continue
-
-        zc = macro_zone_count(mask)
         apply_mask(canvas, origin_map, mask, IDX_GRIS, ORIGIN_MACRO)
-        macros.append(MacroRecord(IDX_GRIS, poly, angle, (cx, cy), mask, zc))
+        macros.append(MacroRecord(IDX_GRIS, poly, angle, (cx, cy), mask, macro_zone_count(mask)))
 
     return macros
-
-
 def add_transitions(
     canvas: np.ndarray,
     origin_map: np.ndarray,
@@ -1693,7 +1711,7 @@ def nudge_proportions(
 
             if origin == ORIGIN_BACKGROUND and chosen not in (IDX_COYOTE, IDX_OLIVE):
                 continue
-            if origin == ORIGIN_MACRO and chosen not in (IDX_OLIVE, IDX_TERRE):
+            if origin == ORIGIN_MACRO and chosen not in (IDX_OLIVE, IDX_TERRE, IDX_GRIS):
                 continue
             if origin == ORIGIN_TRANSITION and chosen not in (IDX_COYOTE, IDX_OLIVE, IDX_TERRE):
                 continue
