@@ -1121,3 +1121,71 @@
 2026-03-29 06:31:42 | WARNING  | camo_log | [start_worker] Arrêt demandé | payload={"accepted_count": 0, "total_attempts": 133}
 2026-03-29 06:33:01 | INFO     | camo_log | [start] Arrêt de l'interface Kivy
 2026-03-29 06:34:19 | ERROR    | camo_log | [start_worker] Erreur de génération | payload={"accepted_count": 0, "error_message": "cannot schedule new futures after shutdown", "total_attempts": 133}
+2026-03-29 06:48:13 | INFO     | camo_log | [start] Interface Kivy démarrée
+2026-03-29 06:48:15 | INFO     | camo_log | [start_preflight] Préflight lancé depuis le front | payload={"mode": "bloquant", "modules": ["test_main", "test_start"], "timeout_s": null}
+2026-03-29 06:48:15 | INFO     | camo_log | [tests] Début préflight asynchrone | payload={"modules": ["test_main", "test_start"], "parallel": true, "timeout_s": null}
+2026-03-29 06:48:15 | INFO     | camo_log | [tests] Lancement module de test | payload={"command": ["C:\\Users\\alpha\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\python.exe", "-m", "unittest", "-v", "test_main"], "mode": "async-subprocess", "module": "test_main", "timeout_s": null}
+2026-03-29 06:48:15 | INFO     | camo_log | [tests] Lancement module de test | payload={"command": ["C:\\Users\\alpha\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\python.exe", "-m", "unittest", "-v", "test_start"], "mode": "async-subprocess", "module": "test_start", "timeout_s": null}
+2026-03-29 06:48:16 | WARNING  | camo_log | [diagnostic] Candidat analysé | payload={"accepted": false, "fail_count": 9, "fail_rules": ["abs_err_coyote", "abs_err_olive", "abs_err_gris", "mean_abs_error", "ratio_coyote", "ratio_olive", "ratio_gris", "oblique_share", "center_empty_ratio"], "local_attempt": 1, "seed": 777, "target_index": 1}
+2026-03-29 06:48:16 | INFO     | camo_log | [main_adaptive] Initialisation du réglage adaptatif | payload={"enabled": true, "target_index": 1}
+2026-03-29 06:48:16 | INFO     | camo_log | [main_adaptive] Initialisation du réglage adaptatif | payload={"enabled": true, "target_index": 1}
+2026-03-29 06:48:16 | INFO     | camo_log | [main_adaptive] Initialisation du réglage adaptatif | payload={"enabled": true, "target_index": 1}
+2026-03-29 06:48:16 | INFO     | camo_log | [main_adaptive] Initialisation du réglage adaptatif | payload={"enabled": true, "target_index": 1}
+2026-03-29 06:48:16 | INFO     | camo_log | [diagnostic] Candidat analysé | payload={"accepted": true, "fail_count": 0, "fail_rules": [], "local_attempt": 1, "seed": 201, "target_index": 1}
+2026-03-29 06:48:16 | WARNING  | camo_log | [main_adaptive] Rejet analysé et réglages ajustés | payload={"adaptive_hint": {"avoid_vertical": 0.0, "extra_boundary_nudge_passes": 0, "micro_gris_bias": 0.0, "olive_macro_target_scale": 1.0, "prefer_oblique": 0.0, "prefer_vertical": 0.0, "terre_macro_target_scale": 1.0}, "consecutive_rejections": 1, "fail_rules": [], "local_attempt": 1, "seed": 201, "target_index": 1}
+2026-03-29 06:48:16 | INFO     | camo_log | [main_adaptive] Initialisation du réglage adaptatif | payload={"enabled": true, "target_index": 1}
+2026-03-29 06:48:17 | INFO     | camo_log | [start_worker] Tentative en cours | payload={"global_attempt": 1, "local_attempt": 1, "seed": 202603220001, "target_index": 1}
+2026-03-29 06:48:17 | INFO     | camo_log | [start_worker] Tentative en cours | payload={"global_attempt": 1, "local_attempt": 1, "seed": 202603220001, "target_index": 1}
+2026-03-29 06:48:18 | INFO     | camo_log | [start_worker] Candidat accepté | payload={"global_attempt": 1, "image_path": "C:\\Users\\alpha\\AppData\\Local\\Temp\\test_start_le5wswur\\camouflage_001.png", "local_attempt": 1, "score_final": 0.92, "seed": 123, "target_index": 1}
+2026-03-29 06:48:18 | INFO     | camo_log | [tests] Fin module de test | payload={"completed": true, "duration_s": 2.524234, "module": "test_main", "ok": true, "returncode": 0, "timed_out": false}
+2026-03-29 06:48:18 | WARNING  | camo_log | [start_worker] Génération arrêtée | payload={"accepted_count": 0, "total_attempts": 0}
+2026-03-29 06:48:18 | WARNING  | camo_log | [start_worker] Génération arrêtée | payload={"accepted_count": 1, "total_attempts": 0}
+2026-03-29 06:48:18 | INFO     | camo_log | [start_worker] Génération terminée avec succès | payload={"accepted_count": 1, "total_attempts": 0}
+2026-03-29 06:48:18 | INFO     | camo_log | [start_preflight] Préflight lancé depuis le front | payload={"mode": "bloquant", "modules": ["test_main", "test_start"], "timeout_s": null}
+2026-03-29 06:48:18 | INFO     | camo_log | [start_preflight] Préflight terminé | payload={"ok": true, "summary": "12 tests OK"}
+2026-03-29 06:48:18 | INFO     | camo_log | [start_worker] Génération démarrée | payload={"output_dir": "D:\\Documents\\GitHub\\camo-generator\\camouflages_federale_europe", "run_mode": "blocking", "target_count": 2}
+2026-03-29 06:48:18 | ERROR    | camo_log | [start_preflight] Préflight en échec | payload={"blocking": true, "ok": false, "summary": "KO"}
+2026-03-29 06:48:18 | INFO     | camo_log | [start_preflight] Préflight terminé | payload={"ok": true, "summary": "9 tests OK"}
+2026-03-29 06:48:18 | INFO     | camo_log | [start_preflight] Préflight terminé | payload={"ok": true, "summary": "9 tests OK"}
+2026-03-29 06:48:18 | INFO     | camo_log | [start] Arrêt de l'interface Kivy
+2026-03-29 06:48:18 | INFO     | camo_log | [start] Arrêt de l'interface Kivy
+2026-03-29 06:48:18 | INFO     | camo_log | [start_worker] Génération démarrée | payload={"output_dir": "D:\\Documents\\GitHub\\camo-generator\\camouflages_federale_europe", "run_mode": "blocking", "target_count": 2}
+2026-03-29 06:48:18 | WARNING  | camo_log | [start_worker] Arrêt demandé | payload={"accepted_count": 0, "total_attempts": 0}
+2026-03-29 06:48:18 | ERROR    | camo_log | [tests] Fin module de test | payload={"completed": true, "duration_s": 3.340599, "module": "test_start", "ok": false, "returncode": 1, "timed_out": false}
+2026-03-29 06:48:19 | ERROR    | camo_log | [tests] Fin préflight asynchrone | payload={"completed": true, "duration_s": 3.395322, "errors": 1, "failures": 1, "ok": false, "parallel": true, "timed_out": false, "timed_out_modules": [], "total": 160}
+2026-03-29 06:48:19 | ERROR    | camo_log | [start_preflight] Préflight en échec | payload={"blocking": true, "ok": false, "summary": "160 tests exécutés | 1 échec(s) | 1 erreur(s)"}
+2026-03-29 06:48:23 | INFO     | camo_log | [start_mode] Mode de démarrage mis à jour | payload={"mode": "non_blocking"}
+2026-03-29 06:48:24 | INFO     | camo_log | [start_preflight] Préflight lancé depuis le front | payload={"mode": "non bloquant", "modules": ["test_main", "test_start"], "timeout_s": null}
+2026-03-29 06:48:24 | INFO     | camo_log | [tests] Début préflight asynchrone | payload={"modules": ["test_main", "test_start"], "parallel": true, "timeout_s": null}
+2026-03-29 06:48:24 | INFO     | camo_log | [tests] Lancement module de test | payload={"command": ["C:\\Users\\alpha\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\python.exe", "-m", "unittest", "-v", "test_main"], "mode": "async-subprocess", "module": "test_main", "timeout_s": null}
+2026-03-29 06:48:24 | INFO     | camo_log | [tests] Lancement module de test | payload={"command": ["C:\\Users\\alpha\\AppData\\Local\\Microsoft\\WindowsApps\\PythonSoftwareFoundation.Python.3.13_qbz5n2kfra8p0\\python.exe", "-m", "unittest", "-v", "test_start"], "mode": "async-subprocess", "module": "test_start", "timeout_s": null}
+2026-03-29 06:48:24 | INFO     | camo_log | [start_worker] Génération démarrée | payload={"output_dir": "D:\\Documents\\GitHub\\camo-generator\\camouflages_federale_europe", "run_mode": "non_blocking", "target_count": 100}
+2026-03-29 06:48:24 | INFO     | camo_log | [start_worker] Tentative en cours | payload={"global_attempt": 1, "local_attempt": 1, "seed": 202603220001, "target_index": 1}
+2026-03-29 06:48:25 | WARNING  | camo_log | [diagnostic] Candidat analysé | payload={"accepted": false, "fail_count": 9, "fail_rules": ["abs_err_coyote", "abs_err_olive", "abs_err_gris", "mean_abs_error", "ratio_coyote", "ratio_olive", "ratio_gris", "oblique_share", "center_empty_ratio"], "local_attempt": 1, "seed": 777, "target_index": 1}
+2026-03-29 06:48:25 | INFO     | camo_log | [main_adaptive] Initialisation du réglage adaptatif | payload={"enabled": true, "target_index": 1}
+2026-03-29 06:48:25 | INFO     | camo_log | [main_adaptive] Initialisation du réglage adaptatif | payload={"enabled": true, "target_index": 1}
+2026-03-29 06:48:25 | INFO     | camo_log | [main_adaptive] Initialisation du réglage adaptatif | payload={"enabled": true, "target_index": 1}
+2026-03-29 06:48:26 | INFO     | camo_log | [main_adaptive] Initialisation du réglage adaptatif | payload={"enabled": true, "target_index": 1}
+2026-03-29 06:48:26 | INFO     | camo_log | [diagnostic] Candidat analysé | payload={"accepted": true, "fail_count": 0, "fail_rules": [], "local_attempt": 1, "seed": 201, "target_index": 1}
+2026-03-29 06:48:26 | WARNING  | camo_log | [main_adaptive] Rejet analysé et réglages ajustés | payload={"adaptive_hint": {"avoid_vertical": 0.0, "extra_boundary_nudge_passes": 0, "micro_gris_bias": 0.0, "olive_macro_target_scale": 1.0, "prefer_oblique": 0.0, "prefer_vertical": 0.0, "terre_macro_target_scale": 1.0}, "consecutive_rejections": 1, "fail_rules": [], "local_attempt": 1, "seed": 201, "target_index": 1}
+2026-03-29 06:48:26 | INFO     | camo_log | [main_adaptive] Initialisation du réglage adaptatif | payload={"enabled": true, "target_index": 1}
+2026-03-29 06:48:27 | INFO     | camo_log | [tests] Fin module de test | payload={"completed": true, "duration_s": 2.462119, "module": "test_main", "ok": true, "returncode": 0, "timed_out": false}
+2026-03-29 06:48:27 | INFO     | camo_log | [start_worker] Tentative en cours | payload={"global_attempt": 1, "local_attempt": 1, "seed": 202603220001, "target_index": 1}
+2026-03-29 06:48:27 | INFO     | camo_log | [start_worker] Tentative en cours | payload={"global_attempt": 1, "local_attempt": 1, "seed": 202603220001, "target_index": 1}
+2026-03-29 06:48:27 | INFO     | camo_log | [start_worker] Candidat accepté | payload={"global_attempt": 1, "image_path": "C:\\Users\\alpha\\AppData\\Local\\Temp\\test_start_cx4r17im\\camouflage_001.png", "local_attempt": 1, "score_final": 0.92, "seed": 123, "target_index": 1}
+2026-03-29 06:48:28 | WARNING  | camo_log | [start_worker] Génération arrêtée | payload={"accepted_count": 0, "total_attempts": 0}
+2026-03-29 06:48:28 | WARNING  | camo_log | [start_worker] Génération arrêtée | payload={"accepted_count": 1, "total_attempts": 0}
+2026-03-29 06:48:28 | INFO     | camo_log | [start_worker] Génération terminée avec succès | payload={"accepted_count": 1, "total_attempts": 0}
+2026-03-29 06:48:28 | INFO     | camo_log | [start_preflight] Préflight lancé depuis le front | payload={"mode": "bloquant", "modules": ["test_main", "test_start"], "timeout_s": null}
+2026-03-29 06:48:28 | INFO     | camo_log | [start_preflight] Préflight terminé | payload={"ok": true, "summary": "12 tests OK"}
+2026-03-29 06:48:28 | INFO     | camo_log | [start_worker] Génération démarrée | payload={"output_dir": "D:\\Documents\\GitHub\\camo-generator\\camouflages_federale_europe", "run_mode": "blocking", "target_count": 2}
+2026-03-29 06:48:28 | ERROR    | camo_log | [start_preflight] Préflight en échec | payload={"blocking": true, "ok": false, "summary": "KO"}
+2026-03-29 06:48:28 | INFO     | camo_log | [start_preflight] Préflight terminé | payload={"ok": true, "summary": "9 tests OK"}
+2026-03-29 06:48:28 | INFO     | camo_log | [start_preflight] Préflight terminé | payload={"ok": true, "summary": "9 tests OK"}
+2026-03-29 06:48:28 | INFO     | camo_log | [start] Arrêt de l'interface Kivy
+2026-03-29 06:48:28 | INFO     | camo_log | [start] Arrêt de l'interface Kivy
+2026-03-29 06:48:28 | INFO     | camo_log | [start_worker] Génération démarrée | payload={"output_dir": "D:\\Documents\\GitHub\\camo-generator\\camouflages_federale_europe", "run_mode": "blocking", "target_count": 2}
+2026-03-29 06:48:28 | WARNING  | camo_log | [start_worker] Arrêt demandé | payload={"accepted_count": 0, "total_attempts": 0}
+2026-03-29 06:48:28 | ERROR    | camo_log | [tests] Fin module de test | payload={"completed": true, "duration_s": 3.88893, "module": "test_start", "ok": false, "returncode": 1, "timed_out": false}
+2026-03-29 06:48:28 | ERROR    | camo_log | [tests] Fin préflight asynchrone | payload={"completed": true, "duration_s": 3.893099, "errors": 1, "failures": 1, "ok": false, "parallel": true, "timed_out": false, "timed_out_modules": [], "total": 160}
+2026-03-29 06:48:28 | ERROR    | camo_log | [start_preflight] Préflight en échec | payload={"blocking": false, "ok": false, "summary": "160 tests exécutés | 1 échec(s) | 1 erreur(s)"}
