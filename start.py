@@ -20,6 +20,7 @@ import json
 import math
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -195,6 +196,64 @@ class AsyncioThreadRunner:
             self.loop.call_soon_threadsafe(self.loop.stop)
         if self.thread.is_alive():
             self.thread.join(timeout=1.0)
+        if not self.loop.is_closed():
+            try:
+                self.loop.close()
+            except Exception:
+                pass
+
+
+def _parse_unittest_counts(text: str) -> Dict[str, int]:
+    raw = str(text or "")
+    if not raw:
+        return {"total": 0, "failures": 0, "errors": 0}
+
+    clean = raw.replace("\r", "\n")
+    total = 0
+    failures = 0
+    errors = 0
+
+    ran_matches = re.findall(r"Ran\s+(\d+)\s+tests?\s+in", clean, flags=re.IGNORECASE)
+    if ran_matches:
+        total = max(int(x) for x in ran_matches)
+
+    failed_match = re.search(r"FAILED\s*\((.*?)\)", clean, flags=re.IGNORECASE | re.DOTALL)
+    if failed_match:
+        details = failed_match.group(1)
+        fail_match = re.search(r"failures\s*=\s*(\d+)", details, flags=re.IGNORECASE)
+        err_match = re.search(r"errors\s*=\s*(\d+)", details, flags=re.IGNORECASE)
+        if fail_match:
+            failures = int(fail_match.group(1))
+        if err_match:
+            errors = int(err_match.group(1))
+
+    return {"total": int(total), "failures": int(failures), "errors": int(errors)}
+
+
+def _preflight_counts_from_summary(summary: Dict[str, Any]) -> Dict[str, int]:
+    total = int(summary.get("total", 0) or 0)
+    failures = int(summary.get("failures", 0) or 0)
+    errors = int(summary.get("errors", 0) or 0)
+
+    if total > 0 or failures > 0 or errors > 0:
+        return {"total": total, "failures": failures, "errors": errors}
+
+    modules = summary.get("modules")
+    if not isinstance(modules, list):
+        return {"total": total, "failures": failures, "errors": errors}
+
+    agg_total = 0
+    agg_failures = 0
+    agg_errors = 0
+    for module in modules:
+        if not isinstance(module, dict):
+            continue
+        parsed = _parse_unittest_counts("\n".join([str(module.get("stdout", "")), str(module.get("stderr", ""))]))
+        agg_total += int(parsed["total"])
+        agg_failures += int(parsed["failures"])
+        agg_errors += int(parsed["errors"])
+
+    return {"total": int(agg_total), "failures": int(agg_failures), "errors": int(agg_errors)}
 
 
 def open_folder(path: Path) -> None:
@@ -1057,10 +1116,8 @@ class CamouflageApp(App):
                 return bool(getattr(summary, "ok", False)), str(summary.short_text())
             if isinstance(summary, dict):
                 ok = bool(summary.get("ok", False))
-                total = int(summary.get("total", 0))
-                failures = int(summary.get("failures", 0))
-                errors = int(summary.get("errors", 0))
-                return ok, f"{total} tests | {failures} échec(s) | {errors} erreur(s)"
+                counts = _preflight_counts_from_summary(summary)
+                return ok, f"{counts['total']} tests | {counts['failures']} échec(s) | {counts['errors']} erreur(s)"
             return False, "Préflight : réponse inattendue."
         except Exception as exc:
             return False, f"Préflight impossible : {exc}"
