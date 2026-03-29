@@ -42,7 +42,7 @@ except Exception:
 # CONFIGURATION GLOBALE
 # ============================================================
 
-OUTPUT_DIR = Path("camouflages_federale_europe_macro_only")
+OUTPUT_DIR = Path("camouflages_federale_europe")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 WIDTH = 1400
