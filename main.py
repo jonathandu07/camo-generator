@@ -170,6 +170,19 @@ MAX_MACRO_TERRE_VISIBLE_RATIO = 0.09
 MAX_MACRO_GRIS_VISIBLE_RATIO = 0.015
 
 
+# Discipline de génération pilotée
+TARGET_VERTICAL_SHARE = 0.16
+MAX_VERTICAL_SOFT_TARGET = 0.24
+TARGET_PERIPHERY_REPAIR_STEPS = 80
+TARGET_CENTER_REPAIR_STEPS = 56
+SEMANTIC_ALLOWED_COLORS = {
+    ORIGIN_BACKGROUND: (IDX_COYOTE, IDX_OLIVE),
+    ORIGIN_MACRO: (IDX_OLIVE, IDX_TERRE),
+    ORIGIN_TRANSITION: (IDX_COYOTE, IDX_OLIVE, IDX_TERRE),
+    ORIGIN_MICRO: (IDX_TERRE, IDX_GRIS),
+}
+
+
 # ============================================================
 # STRUCTURES
 # ============================================================
@@ -827,6 +840,7 @@ def largest_component_ratio(mask: np.ndarray) -> float:
     return best / total
 
 
+
 def orientation_score(macro_records: Sequence[MacroRecord]) -> Dict[str, float]:
     if not macro_records:
         return {"oblique_share": 0.0, "vertical_share": 0.0, "dominance_ratio": 1.0}
@@ -847,6 +861,80 @@ def orientation_score(macro_records: Sequence[MacroRecord]) -> Dict[str, float]:
     }
 
 
+def macro_angle_histogram(macros: Sequence[MacroRecord]) -> Dict[int, int]:
+    counts: Dict[int, int] = {}
+    for item in macros:
+        counts[item.angle_deg] = counts.get(item.angle_deg, 0) + 1
+    return counts
+
+
+def pick_macro_angle(
+    macros: Sequence[MacroRecord],
+    profile: VariantProfile,
+    rng: random.Random,
+    force_vertical_floor: bool = True,
+) -> int:
+    allowed = list(profile.allowed_angles) or BASE_ANGLES[:]
+    if not allowed:
+        allowed = BASE_ANGLES[:]
+
+    counts = macro_angle_histogram(macros)
+    total = len(macros)
+    vertical_count = counts.get(0, 0)
+    vertical_share = (vertical_count / total) if total else 0.0
+
+    obliques = [a for a in allowed if a != 0]
+    if not obliques:
+        obliques = [a for a in BASE_ANGLES if a != 0]
+
+    if force_vertical_floor and 0 in allowed and total >= 4 and vertical_share < TARGET_VERTICAL_SHARE:
+        return 0
+
+    if 0 in allowed and total >= 5 and vertical_share >= MAX_VERTICAL_SOFT_TARGET:
+        allowed = [a for a in allowed if a != 0] or obliques[:]
+
+    dom_angle = None
+    dom_count = -1
+    for angle, cnt in counts.items():
+        if cnt > dom_count:
+            dom_angle = angle
+            dom_count = cnt
+
+    if dom_angle is not None and total >= 6 and dom_count / total > (MAX_ANGLE_DOMINANCE_RATIO - 0.02):
+        filtered = [a for a in allowed if a != dom_angle]
+        if filtered:
+            allowed = filtered
+
+    if total >= 5:
+        local_counts = {a: counts.get(a, 0) for a in allowed}
+        min_count = min(local_counts.values())
+        least_used = [a for a, cnt in local_counts.items() if cnt == min_count]
+        if least_used:
+            allowed = least_used
+
+    return int(rng.choice(allowed or BASE_ANGLES))
+
+
+def preferred_boundary_coordinates(boundary: np.ndarray, preferred_mask: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
+    if preferred_mask is not None:
+        ys, xs = np.where(boundary & preferred_mask)
+        if len(xs) > 0:
+            return ys, xs
+    ys, xs = np.where(boundary)
+    return ys, xs
+
+
+def choose_semantic_color_for_origin(deficits: np.ndarray, origin_code: int, current_color: int) -> Optional[int]:
+    allowed = SEMANTIC_ALLOWED_COLORS.get(int(origin_code), (IDX_COYOTE, IDX_OLIVE, IDX_TERRE, IDX_GRIS))
+    candidates = [c for c in allowed if c != current_color and deficits[c] > 0.0]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: (float(deficits[c]), c), reverse=True)
+    return int(candidates[0])
+
+
+def semantic_color_allowed(origin_code: int, color_idx: int) -> bool:
+    return int(color_idx) in SEMANTIC_ALLOWED_COLORS.get(int(origin_code), ())
 def visible_origin_shares(canvas: np.ndarray, origin_map: np.ndarray) -> Dict[str, float]:
     out = {}
 
@@ -1030,6 +1118,7 @@ def apply_mask(canvas: np.ndarray, origin_map: np.ndarray, mask: np.ndarray, col
     origin_map[mask] = origin_code
 
 
+
 def add_macros(
     canvas: np.ndarray,
     origin_map: np.ndarray,
@@ -1040,7 +1129,6 @@ def add_macros(
 
     target_macro_olive_pixels = int(VISIBLE_MACRO_OLIVE_TARGET * canvas.size * profile.olive_macro_target_scale)
     target_macro_terre_pixels = int(VISIBLE_MACRO_TERRE_TARGET * canvas.size * profile.terre_macro_target_scale)
-    # Le vert-de-gris ne doit pas constituer une vraie masse macro par défaut.
     target_macro_gris_pixels = int(VISIBLE_MACRO_GRIS_TARGET * canvas.size * profile.gris_macro_target_scale)
 
     olive_attempts = 0
@@ -1048,8 +1136,9 @@ def add_macros(
         olive_attempts += 1
         if olive_attempts > MAX_MACRO_PLACEMENT_ATTEMPTS_OLIVE:
             break
+
         cx, cy = choose_biased_center(rng, profile.zone_weight_boosts)
-        angle = rng.choice(profile.angle_pool or tuple(profile.allowed_angles))
+        angle = pick_macro_angle(macros, profile, rng, force_vertical_floor=True)
 
         if local_parallel_conflict(macros, (cx, cy), angle):
             continue
@@ -1078,7 +1167,10 @@ def add_macros(
         if zc < 2 and rng.random() < 0.75:
             continue
 
-        if zone_overlap_ratio(mask, ANATOMY_ZONES["center_torso"]) > (MAX_CENTER_TORSO_OVERLAP_MACRO * profile.center_torso_overlap_scale):
+        max_center_overlap = MAX_CENTER_TORSO_OVERLAP_MACRO * profile.center_torso_overlap_scale
+        if angle == 0:
+            max_center_overlap = min(0.42, max_center_overlap + 0.05)
+        if zone_overlap_ratio(mask, ANATOMY_ZONES["center_torso"]) > max_center_overlap:
             continue
 
         apply_mask(canvas, origin_map, mask, IDX_OLIVE, ORIGIN_MACRO)
@@ -1090,7 +1182,7 @@ def add_macros(
         if terre_attempts > MAX_MACRO_PLACEMENT_ATTEMPTS_TERRE:
             break
         cx, cy = choose_biased_center(rng, profile.zone_weight_boosts)
-        angle = rng.choice(profile.angle_pool or tuple(profile.allowed_angles))
+        angle = pick_macro_angle(macros, profile, rng, force_vertical_floor=False)
 
         if local_parallel_conflict(macros, (cx, cy), angle, dist_threshold_px=220, angle_threshold_deg=6):
             continue
@@ -1116,7 +1208,8 @@ def add_macros(
         if float(np.mean(np.isin(cur, [IDX_COYOTE, IDX_OLIVE]))) < 0.65:
             continue
 
-        if zone_overlap_ratio(mask, ANATOMY_ZONES["center_torso"]) > (MAX_CENTER_TORSO_OVERLAP_TERRAIN_MACRO * profile.center_torso_overlap_scale):
+        max_center_overlap = MAX_CENTER_TORSO_OVERLAP_TERRAIN_MACRO * profile.center_torso_overlap_scale
+        if zone_overlap_ratio(mask, ANATOMY_ZONES["center_torso"]) > max_center_overlap:
             continue
 
         zc = macro_zone_count(mask)
@@ -1132,7 +1225,7 @@ def add_macros(
         if gris_attempts > MAX_MACRO_PLACEMENT_ATTEMPTS_GRIS:
             break
         cx, cy = choose_biased_center(rng, profile.zone_weight_boosts)
-        angle = rng.choice(profile.angle_pool or tuple(profile.allowed_angles))
+        angle = pick_macro_angle(macros, profile, rng, force_vertical_floor=False)
 
         poly = jagged_spine_poly(
             rng=rng,
@@ -1164,7 +1257,6 @@ def add_macros(
 
     return macros
 
-
 def add_transitions(
     canvas: np.ndarray,
     origin_map: np.ndarray,
@@ -1172,6 +1264,9 @@ def add_transitions(
     profile: VariantProfile,
     rng: random.Random,
 ) -> None:
+    if not macros:
+        return
+
     placement_attempts = 0
     while True:
         placement_attempts += 1
@@ -1179,15 +1274,26 @@ def add_transitions(
             break
         rs = compute_ratios(canvas)
         visible = visible_origin_shares(canvas, origin_map)
+        spatial = spatial_discipline_metrics(canvas)
 
         enough_terre = rs[IDX_TERRE] >= VISIBLE_TOTAL_TERRE_TARGET
         enough_olive = rs[IDX_OLIVE] >= VISIBLE_TOTAL_OLIVE_TARGET * 0.985
         enough_trans_share = visible["terre_de_france_transition_share"] >= MIN_VISIBLE_TERRE_TRANS_SHARE
+        enough_periphery = (
+            spatial["periphery_boundary_density_ratio"] >= MIN_PERIPHERY_BOUNDARY_DENSITY_RATIO
+            and spatial["periphery_non_coyote_ratio"] >= MIN_PERIPHERY_NON_COYOTE_RATIO
+        )
 
-        if enough_terre and enough_olive and enough_trans_share:
+        if enough_terre and enough_olive and enough_trans_share and enough_periphery:
             break
 
+        prefer_periphery = not enough_periphery
         parent_pool = [m for m in macros if m.color_idx in (IDX_OLIVE, IDX_TERRE)]
+        if prefer_periphery:
+            periphery_pool = [m for m in parent_pool if float(np.mean(HIGH_DENSITY_ZONE_MASK[m.mask])) >= 0.40]
+            if periphery_pool:
+                parent_pool = periphery_pool
+
         parent = rng.choice(parent_pool or list(macros))
 
         poly = attached_transition(
@@ -1198,6 +1304,9 @@ def add_transitions(
         )
         mask = polygon_mask(poly)
         if mask.sum() == 0:
+            continue
+
+        if prefer_periphery and float(np.mean(HIGH_DENSITY_ZONE_MASK[mask])) < 0.35:
             continue
 
         if not transition_is_attached(parent.mask, mask):
@@ -1212,7 +1321,12 @@ def add_transitions(
         if terre_need >= olive_need:
             p_terre, p_olive, p_coyote = 0.74, 0.18, 0.08
         else:
-            p_terre, p_olive, p_coyote = 0.68, 0.22, 0.10
+            p_terre, p_olive, p_coyote = 0.66, 0.24, 0.10
+
+        if prefer_periphery:
+            p_terre += 0.04
+            p_olive += 0.03
+            p_coyote -= 0.07
 
         p_terre += profile.transition_terre_bias
         p_olive += profile.transition_olive_bias
@@ -1248,7 +1362,6 @@ def add_transitions(
 
         apply_mask(canvas, origin_map, mask, color, ORIGIN_TRANSITION)
 
-
 def add_micro_clusters(
     canvas: np.ndarray,
     origin_map: np.ndarray,
@@ -1256,22 +1369,40 @@ def add_micro_clusters(
     rng: random.Random,
 ) -> None:
     placement_attempts = 0
+    stalled_rounds = 0
+
     while True:
         placement_attempts += 1
         if placement_attempts > MAX_MICRO_CLUSTER_PLACEMENTS:
             break
+
         rs = compute_ratios(canvas)
         visible = visible_origin_shares(canvas, origin_map)
+        spatial = spatial_discipline_metrics(canvas)
+        center_empty = center_empty_ratio(canvas)
 
         enough_gris = rs[IDX_GRIS] >= VISIBLE_TOTAL_GRIS_TARGET
         enough_terre = rs[IDX_TERRE] >= VISIBLE_TOTAL_TERRE_TARGET
         enough_micro_share = visible["vert_de_gris_micro_share"] >= MIN_VISIBLE_GRIS_MICRO_SHARE
+        enough_periphery = (
+            spatial["periphery_boundary_density_ratio"] >= MIN_PERIPHERY_BOUNDARY_DENSITY_RATIO
+            and spatial["periphery_non_coyote_ratio"] >= MIN_PERIPHERY_NON_COYOTE_RATIO
+        )
 
-        if enough_gris and enough_terre and enough_micro_share:
+        if enough_gris and enough_terre and enough_micro_share and enough_periphery and center_empty <= MAX_COYOTE_CENTER_EMPTY_RATIO:
             break
 
         boundary = compute_boundary_mask(canvas)
-        ys, xs = np.where(boundary)
+        prefer_periphery = not enough_periphery
+        prefer_center = (not prefer_periphery) and (center_empty > MAX_COYOTE_CENTER_EMPTY_RATIO)
+
+        preferred_mask = None
+        if prefer_periphery:
+            preferred_mask = HIGH_DENSITY_ZONE_MASK
+        elif prefer_center:
+            preferred_mask = CENTER_TORSO_MASK
+
+        ys, xs = preferred_boundary_coordinates(boundary, preferred_mask=preferred_mask)
         if len(xs) == 0:
             break
 
@@ -1306,6 +1437,9 @@ def add_micro_clusters(
             if mask.sum() == 0:
                 continue
 
+            if preferred_mask is not None and float(np.mean(preferred_mask[mask])) < 0.30:
+                continue
+
             cur = canvas[mask]
             if len(np.unique(cur)) < 2:
                 continue
@@ -1321,6 +1455,13 @@ def add_micro_clusters(
             p_gris = 0.88 if gris_need >= terre_need else 0.82
             p_gris += profile.micro_gris_bias
             p_terre = (1.0 - p_gris) + profile.micro_terre_bias
+
+            if prefer_periphery:
+                p_gris += 0.03
+                p_terre += 0.02
+            if prefer_center:
+                p_terre += 0.05
+
             total_p = max(0.10, p_gris) + max(0.10, p_terre)
             p_gris = max(0.10, p_gris) / total_p
 
@@ -1329,9 +1470,12 @@ def add_micro_clusters(
             apply_mask(canvas, origin_map, mask, color, ORIGIN_MICRO)
             placed_any = True
 
-        if not placed_any and rs[IDX_GRIS] >= VISIBLE_TOTAL_GRIS_TARGET * 0.96:
-            break
-
+        if placed_any:
+            stalled_rounds = 0
+        else:
+            stalled_rounds += 1
+            if stalled_rounds >= 20 and enough_gris and enough_micro_share:
+                break
 
 def nudge_proportions(
     canvas: np.ndarray,
@@ -1384,34 +1528,44 @@ def nudge_proportions(
         for j in picks:
             x = int(xs[j])
             y = int(ys[j])
-
             current = int(canvas[y, x])
-            if deficits[current] >= 0:
+            origin = int(origin_map[y, x])
+
+            allowed = SEMANTIC_ALLOWED_COLORS.get(origin, (current,))
+            if current not in allowed:
                 continue
 
-            wanted = np.where(deficits > 0)[0]
-            if len(wanted) == 0:
-                break
+            chosen = choose_semantic_color_for_origin(deficits, origin, current)
+            if chosen is None:
+                continue
 
-            chosen = int(wanted[np.argmax(deficits[wanted])])
+            if deficits[current] > -0.002 and semantic_color_allowed(origin, current):
+                continue
 
             y1, y2 = max(0, y - 2), min(h, y + 3)
             x1, x2 = max(0, x - 2), min(w, x + 3)
             neigh = canvas[y1:y2, x1:x2]
 
-            if chosen not in neigh and local_rng.random() < 0.72:
+            if chosen not in neigh and local_rng.random() < 0.60:
                 continue
 
-            if chosen in (IDX_TERRE, IDX_GRIS) and local_color_variety(canvas, x, y, radius=2) < 2:
+            if origin == ORIGIN_MACRO and chosen == IDX_TERRE and local_color_variety(canvas, x, y, radius=2) < 2:
+                continue
+            if origin == ORIGIN_MICRO and chosen == IDX_GRIS and local_color_variety(canvas, x, y, radius=2) < 2:
                 continue
 
-            fallback_origin = int(origin_map[y, x])
-            new_origin = infer_origin_from_neighbors(canvas, origin_map, x, y, chosen, fallback_origin)
+            if origin == ORIGIN_BACKGROUND and chosen not in (IDX_COYOTE, IDX_OLIVE):
+                continue
+            if origin == ORIGIN_MACRO and chosen not in (IDX_OLIVE, IDX_TERRE):
+                continue
+            if origin == ORIGIN_TRANSITION and chosen not in (IDX_COYOTE, IDX_OLIVE, IDX_TERRE):
+                continue
+            if origin == ORIGIN_MICRO and chosen not in (IDX_TERRE, IDX_GRIS):
+                continue
 
             canvas[y, x] = chosen
-            origin_map[y, x] = new_origin
 
-
+# ============================================================
 # ============================================================
 # MÉTRIQUES MULTI-ÉCHELLE
 # ============================================================
@@ -1913,6 +2067,116 @@ def update_adaptive_state_after_attempt(
 # GÉNÉRATION D'UNE VARIANTE
 # ============================================================
 
+def repair_spatial_discipline(
+    canvas: np.ndarray,
+    origin_map: np.ndarray,
+    profile: VariantProfile,
+    rng: random.Random,
+) -> None:
+    for _ in range(TARGET_PERIPHERY_REPAIR_STEPS):
+        spatial = spatial_discipline_metrics(canvas)
+        center_empty = center_empty_ratio(canvas)
+
+        need_periphery = (
+            spatial["periphery_boundary_density_ratio"] < MIN_PERIPHERY_BOUNDARY_DENSITY_RATIO
+            or spatial["periphery_non_coyote_ratio"] < MIN_PERIPHERY_NON_COYOTE_RATIO
+        )
+        need_center_fill = center_empty > MAX_COYOTE_CENTER_EMPTY_RATIO
+
+        if not need_periphery and not need_center_fill:
+            break
+
+        boundary = compute_boundary_mask(canvas)
+        if need_periphery:
+            ys, xs = preferred_boundary_coordinates(boundary, HIGH_DENSITY_ZONE_MASK)
+            origin_code = ORIGIN_TRANSITION if rng.random() < 0.70 else ORIGIN_MICRO
+            color = IDX_TERRE if rng.random() < 0.55 else IDX_OLIVE
+        else:
+            ys, xs = preferred_boundary_coordinates(boundary, CENTER_TORSO_MASK)
+            origin_code = ORIGIN_TRANSITION
+            color = IDX_OLIVE if rng.random() < 0.65 else IDX_TERRE
+
+        if len(xs) == 0:
+            break
+
+        idx = rng.randint(0, len(xs) - 1)
+        cx, cy = int(xs[idx]), int(ys[idx])
+        size = cm_to_px(rng.uniform(2.0, 6.0))
+        angle = 0 if need_center_fill and 0 in profile.allowed_angles else rng.choice(profile.angle_pool or tuple(profile.allowed_angles))
+        poly = jagged_spine_poly(
+            rng=rng,
+            cx=cx,
+            cy=cy,
+            length_px=size * rng.uniform(1.6, 2.6),
+            width_px=size * rng.uniform(0.55, 0.95),
+            angle_from_vertical_deg=angle,
+            segments=rng.randint(4, 6),
+            width_variation=profile.micro_width_variation,
+            lateral_jitter=profile.micro_lateral_jitter,
+            tip_taper=profile.micro_tip_taper,
+            edge_break=profile.micro_edge_break,
+        )
+        mask = polygon_mask(poly)
+        if mask.sum() == 0:
+            continue
+
+        if need_periphery and float(np.mean(HIGH_DENSITY_ZONE_MASK[mask])) < 0.30:
+            continue
+        if need_center_fill and float(np.mean(CENTER_TORSO_MASK[mask])) < 0.30:
+            continue
+
+        apply_mask(canvas, origin_map, mask, color, origin_code)
+
+
+def enforce_macro_angle_discipline(
+    canvas: np.ndarray,
+    origin_map: np.ndarray,
+    macros: List[MacroRecord],
+    profile: VariantProfile,
+    rng: random.Random,
+) -> None:
+    repair_attempts = 0
+    while repair_attempts < TARGET_CENTER_REPAIR_STEPS:
+        repair_attempts += 1
+        orient = orientation_score(macros)
+        if (
+            orient["oblique_share"] >= MIN_OBLIQUE_SHARE
+            and MIN_VERTICAL_SHARE <= orient["vertical_share"] <= MAX_VERTICAL_SHARE
+            and orient["dominance_ratio"] <= MAX_ANGLE_DOMINANCE_RATIO
+        ):
+            break
+
+        if orient["vertical_share"] < MIN_VERTICAL_SHARE and 0 in profile.allowed_angles:
+            angle = 0
+        else:
+            angle = pick_macro_angle(macros, profile, rng, force_vertical_floor=False)
+
+        cx, cy = choose_biased_center(rng, profile.zone_weight_boosts)
+        poly = jagged_spine_poly(
+            rng=rng,
+            cx=cx,
+            cy=cy,
+            length_px=cm_to_px(rng.uniform(22, 42)),
+            width_px=cm_to_px(rng.uniform(8, 16)),
+            angle_from_vertical_deg=angle,
+            segments=rng.randint(5, 7),
+            width_variation=max(0.16, profile.macro_width_variation - 0.04),
+            lateral_jitter=max(0.11, profile.macro_lateral_jitter - 0.02),
+            tip_taper=profile.macro_tip_taper,
+            edge_break=profile.macro_edge_break,
+        )
+        mask = polygon_mask(poly)
+        if mask.sum() == 0:
+            continue
+        if zone_overlap_ratio(mask, ANATOMY_ZONES["center_torso"]) > 0.46:
+            continue
+        if float(np.mean(canvas[mask] == IDX_OLIVE)) > 0.65:
+            continue
+
+        color = IDX_OLIVE if rng.random() < 0.78 else IDX_TERRE
+        apply_mask(canvas, origin_map, mask, color, ORIGIN_MACRO)
+        macros.append(MacroRecord(color, poly, angle, (cx, cy), mask, macro_zone_count(mask)))
+
 def generate_one_variant(profile: VariantProfile) -> Tuple[Image.Image, np.ndarray, Dict[str, float]]:
     rng = random.Random(profile.seed)
 
@@ -1920,10 +2184,13 @@ def generate_one_variant(profile: VariantProfile) -> Tuple[Image.Image, np.ndarr
     origin_map = np.full((HEIGHT, WIDTH), ORIGIN_BACKGROUND, dtype=np.uint8)
 
     macros = add_macros(canvas, origin_map, profile, rng)
+    enforce_macro_angle_discipline(canvas, origin_map, macros, profile, rng)
     add_transitions(canvas, origin_map, macros, profile, rng)
     add_micro_clusters(canvas, origin_map, profile, rng)
+    repair_spatial_discipline(canvas, origin_map, profile, rng)
     nudge_proportions(canvas, origin_map, profile, rng)
-
+    repair_spatial_discipline(canvas, origin_map, profile, rng)
+    nudge_proportions(canvas, origin_map, profile, rng)
     rs = compute_ratios(canvas)
     orient = orientation_score(macros)
     visible_shares = visible_origin_shares(canvas, origin_map)
@@ -2223,7 +2490,7 @@ def generate_all(
     max_workers = max(1, int(max_workers))
     attempt_batch_size = max(1, int(attempt_batch_size))
 
-    use_parallel = parallel_attempts and max_workers > 1 and attempt_batch_size > 1
+    use_parallel = parallel_attempts and max_workers > 1 and attempt_batch_size > 1 and not adaptive_rejection_correction
     pool = get_process_pool(max_workers) if use_parallel else None
 
     for target_index in range(1, target_count + 1):
@@ -2370,7 +2637,7 @@ async def async_generate_all(
     max_workers = max(1, int(max_workers))
     attempt_batch_size = max(1, int(attempt_batch_size))
 
-    use_parallel = parallel_attempts and max_workers > 1 and attempt_batch_size > 1
+    use_parallel = parallel_attempts and max_workers > 1 and attempt_batch_size > 1 and not adaptive_rejection_correction
     loop = asyncio.get_running_loop()
     pool = get_process_pool(max_workers) if use_parallel else None
 
