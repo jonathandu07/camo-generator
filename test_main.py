@@ -42,7 +42,7 @@ import main as mut
 # LOGGING
 # ============================================================
 
-LOG_DIR = Path(__file__).resolve().parent / "logs_tests"
+LOG_DIR = Path(os.getenv("LOG_OUTPUT_DIR", Path(__file__).resolve().parent / "logs")).resolve()
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / "test_main.log"
 
