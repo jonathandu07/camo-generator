@@ -22,6 +22,7 @@ import sys
 import tempfile
 import types
 import unittest
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
@@ -35,8 +36,12 @@ from PIL import Image as PILImage
 # ============================================================
 
 def _install_fake_kivy() -> None:
-    if "kivy" in sys.modules:
-        return
+    # Les tests doivent rester déterministes, même si Kivy est installé
+    # sur la machine. On retire donc tout module Kivy déjà chargé puis
+    # on injecte une implémentation minimale contrôlée.
+    for name in list(sys.modules):
+        if name == "kivy" or name.startswith("kivy."):
+            sys.modules.pop(name, None)
 
     class _CanvasCtx:
         def __enter__(self):
@@ -199,10 +204,21 @@ def _install_fake_kivy() -> None:
         sys.modules[name] = mod
 
 
-try:
-    import kivy  # type: ignore # noqa: F401
-except Exception:
+USE_REAL_KIVY = os.getenv("CAMO_TEST_USE_REAL_KIVY", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+if not USE_REAL_KIVY:
     _install_fake_kivy()
+else:
+    try:
+        import kivy  # type: ignore # noqa: F401
+    except Exception:
+        _install_fake_kivy()
+
+# start.py peut laisser des ResourceWarning liés à des boucles asyncio non
+# fermées selon la plateforme et la politique warnings locale. Les tests
+# nettoient eux-mêmes les runners quand c'est possible ; ce filtre évite
+# qu'un environnement plus strict rende la suite non déterministe.
+warnings.filterwarnings("ignore", category=ResourceWarning, message=r"unclosed event loop.*")
 
 import start as sut
 
@@ -357,6 +373,30 @@ def make_submit_closing_coroutines(fake_future: Any):
     return _submit
 
 
+
+
+def stop_async_runner_safely(runner: Any) -> None:
+    if runner is None:
+        return
+    try:
+        stop = getattr(runner, "stop", None)
+        if callable(stop):
+            stop()
+    except Exception:
+        pass
+
+    loop = getattr(runner, "loop", None)
+    if loop is not None:
+        try:
+            is_closed = getattr(loop, "is_closed", None)
+            if callable(is_closed):
+                if not is_closed():
+                    loop.close()
+            else:
+                loop.close()
+        except Exception:
+            pass
+
 class FakeProcess:
     def cpu_percent(self, interval=None) -> float:
         return 12.0
@@ -383,10 +423,7 @@ class AppMixin(TempDirMixin):
     def setUp(self) -> None:
         super().setUp()
         self.app = sut.CamouflageApp()
-        try:
-            self.app.async_runner.stop()
-        except Exception:
-            pass
+        stop_async_runner_safely(getattr(self.app, "async_runner", None))
         self.app.async_runner = types.SimpleNamespace(submit=make_submit_closing_coroutines(MagicMock()), stop=Mock())
         self.app.current_output_dir = self.tmpdir
         self.app.process = FakeProcess()
@@ -425,10 +462,7 @@ class AppMixin(TempDirMixin):
         self.app.gallery_grid = make_fake_grid()
 
     def tearDown(self) -> None:
-        try:
-            self.app.async_runner.stop()
-        except Exception:
-            pass
+        stop_async_runner_safely(getattr(self.app, "async_runner", None))
         super().tearDown()
 
 
@@ -517,7 +551,7 @@ class TestUtilities(unittest.TestCase):
             fut = runner.submit(asyncio.sleep(0, result=42))
             self.assertEqual(fut.result(timeout=2), 42)
         finally:
-            runner.stop()
+            stop_async_runner_safely(runner)
 
 
 # ============================================================
