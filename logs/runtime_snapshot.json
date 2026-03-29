@@ -40,5 +40,12 @@
         "failed_modules": []
       }
     }
+  },
+  {
+    "ts": 1774813117.6030302,
+    "level": "INFO",
+    "source": "start",
+    "message": "Arrêt de l'interface Kivy",
+    "payload": {}
   }
 ]
