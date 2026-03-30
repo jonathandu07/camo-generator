@@ -3,7 +3,7 @@
 """
 log.py
 Supervision continue, analyse des rejets et préflight pour le générateur
-de camouflage macro-only.
+de camouflage organique 8K.
 
 Rôles :
 - centraliser les logs runtime continus ;
@@ -388,62 +388,31 @@ def analyze_candidate(candidate: camo.CandidateResult, target_index: int, local_
     if fail is not None:
         failures.append(fail)
 
-    ratio_checks = [
-        ("ratio_coyote", float(rs[camo.IDX_COYOTE]), 0.27, 0.37),
-        ("ratio_olive", float(rs[camo.IDX_OLIVE]), 0.24, 0.33),
-        ("ratio_terre", float(rs[camo.IDX_TERRE]), 0.19, 0.26),
-        ("ratio_gris", float(rs[camo.IDX_GRIS]), 0.14, 0.21),
+    range_checks = [
+        ("boundary_density", _metric(m, "boundary_density"), float(camo.MIN_BOUNDARY_DENSITY), float(camo.MAX_BOUNDARY_DENSITY)),
+        ("boundary_density_small", _metric(m, "boundary_density_small"), float(camo.MIN_BOUNDARY_DENSITY_SMALL), float(camo.MAX_BOUNDARY_DENSITY_SMALL)),
+        ("boundary_density_tiny", _metric(m, "boundary_density_tiny"), float(camo.MIN_BOUNDARY_DENSITY_TINY), float(camo.MAX_BOUNDARY_DENSITY_TINY)),
     ]
-    for name, actual, min_v, max_v in ratio_checks:
+    for name, actual, min_v, max_v in range_checks:
         fail = _fail_range(name, actual, min_v, max_v)
         if fail is not None:
             failures.append(fail)
 
-    checks_min = [
-        ("largest_olive_component_ratio", _metric(m, "largest_olive_component_ratio"), camo.MIN_OLIVE_CONNECTED_COMPONENT_RATIO),
-        ("largest_olive_component_ratio_small", _metric(m, "largest_olive_component_ratio_small"), 0.12),
-        ("olive_multizone_share", _metric(m, "olive_multizone_share"), camo.MIN_OLIVE_MULTIZONE_SHARE),
-        ("oblique_share", _metric(m, "oblique_share"), camo.MIN_OBLIQUE_SHARE),
-        ("macro_olive_visible_ratio", _metric(m, "macro_olive_visible_ratio"), camo.MIN_MACRO_OLIVE_VISIBLE_RATIO),
-        ("macro_terre_visible_ratio", _metric(m, "macro_terre_visible_ratio"), camo.MIN_MACRO_TERRE_VISIBLE_RATIO),
-        ("macro_gris_visible_ratio", _metric(m, "macro_gris_visible_ratio"), camo.MIN_MACRO_GRIS_VISIBLE_RATIO),
-        ("macro_total_count", _metric(m, "macro_total_count"), camo.MIN_TOTAL_MACRO_COUNT),
-        ("macro_olive_count", _metric(m, "macro_olive_count"), camo.MIN_OLIVE_MACRO_COUNT),
-        ("macro_terre_count", _metric(m, "macro_terre_count"), camo.MIN_TERRE_MACRO_COUNT),
-        ("macro_gris_count", _metric(m, "macro_gris_count"), camo.MIN_GRIS_MACRO_COUNT),
-        ("macro_multizone_ratio", _metric(m, "macro_multizone_ratio"), camo.MIN_GLOBAL_MACRO_MULTIZONE_RATIO),
-        ("periphery_boundary_density_ratio", _metric(m, "periphery_boundary_density_ratio"), camo.MIN_PERIPHERY_BOUNDARY_DENSITY_RATIO),
-        ("periphery_non_coyote_ratio", _metric(m, "periphery_non_coyote_ratio"), camo.MIN_PERIPHERY_NON_COYOTE_RATIO),
-        ("visual_silhouette_color_diversity", _metric(m, "visual_silhouette_color_diversity"), camo.VISUAL_MIN_SILHOUETTE_COLOR_DIVERSITY),
-        ("visual_contour_break_score", _metric(m, "visual_contour_break_score"), camo.VISUAL_MIN_CONTOUR_BREAK_SCORE),
-        ("visual_outline_band_diversity", _metric(m, "visual_outline_band_diversity"), camo.VISUAL_MIN_OUTLINE_BAND_DIVERSITY),
-        ("visual_small_scale_structural_score", _metric(m, "visual_small_scale_structural_score"), camo.VISUAL_MIN_SMALL_SCALE_STRUCTURAL_SCORE),
-        ("visual_score_final", _metric(m, "visual_score_final"), camo.VISUAL_MIN_FINAL_SCORE),
-        ("visual_military_score", _metric(m, "visual_military_score"), camo.VISUAL_MIN_MILITARY_SCORE),
-    ]
-    for name, actual, min_v in checks_min:
-        fail = _fail_min(name, actual, float(min_v))
-        if fail is not None:
-            failures.append(fail)
-
-    checks_max = [
-        ("center_empty_ratio", _metric(m, "center_empty_ratio"), camo.MAX_COYOTE_CENTER_EMPTY_RATIO),
-        ("center_empty_ratio_small", _metric(m, "center_empty_ratio_small"), camo.MAX_COYOTE_CENTER_EMPTY_RATIO_SMALL),
-        ("boundary_density", _metric(m, "boundary_density"), camo.MAX_BOUNDARY_DENSITY),
-        ("boundary_density_small", _metric(m, "boundary_density_small"), camo.MAX_BOUNDARY_DENSITY_SMALL),
-        ("mirror_similarity", _metric(m, "mirror_similarity"), camo.MAX_MIRROR_SIMILARITY),
-        ("central_brown_continuity", _metric(m, "central_brown_continuity"), camo.MAX_CENTRAL_BROWN_CONTINUITY),
-        ("angle_dominance_ratio", _metric(m, "angle_dominance_ratio"), camo.MAX_ANGLE_DOMINANCE_RATIO),
-        ("largest_macro_mask_ratio", _metric(m, "largest_macro_mask_ratio"), camo.MAX_SINGLE_MACRO_MASK_RATIO),
-    ]
-    for name, actual, max_v in checks_max:
-        fail = _fail_max(name, actual, float(max_v))
-        if fail is not None:
-            failures.append(fail)
-
-    fail = _fail_range("vertical_share", _metric(m, "vertical_share"), camo.MIN_VERTICAL_SHARE, camo.MAX_VERTICAL_SHARE)
+    fail = _fail_max("mirror_similarity", _metric(m, "mirror_similarity"), float(camo.MAX_MIRROR_SIMILARITY))
     if fail is not None:
         failures.append(fail)
+
+    fail = _fail_min("largest_olive_component_ratio", _metric(m, "largest_olive_component_ratio"), float(camo.MIN_LARGEST_OLIVE_COMPONENT_RATIO))
+    if fail is not None:
+        failures.append(fail)
+
+    fail = _fail_max("edge_contact_ratio", _metric(m, "edge_contact_ratio"), float(camo.MAX_EDGE_CONTACT_RATIO))
+    if fail is not None:
+        failures.append(fail)
+
+    motif_scale = _metric(m, "motif_scale", float(getattr(camo, "MOTIF_SCALE", getattr(camo, "DEFAULT_MOTIF_SCALE", 1.0))))
+    if motif_scale <= 0.0:
+        failures.append(RuleFailure("motif_scale", motif_scale, None, 0.0, None, abs(motif_scale)))
 
     return CandidateDiagnostic(
         seed=int(candidate.seed),
@@ -451,9 +420,13 @@ def analyze_candidate(candidate: camo.CandidateResult, target_index: int, local_
         local_attempt=int(local_attempt),
         accepted=not failures,
         ratios={camo.COLOR_NAMES[i]: float(rs[i]) for i in range(4)},
-        metrics={k: float(v) for k, v in m.items()},
+        metrics={k: _safe_float(v) for k, v in m.items()},
         failures=failures,
     )
+
+
+def deep_rejection_analysis(candidate: camo.CandidateResult, target_index: int = 0, local_attempt: int = 0) -> CandidateDiagnostic:
+    return analyze_candidate(candidate, target_index=target_index, local_attempt=local_attempt)
 
 
 def export_candidate_diagnostics(diags: Sequence[CandidateDiagnostic], output_dir: Path = DEFAULT_OUTPUT_DIR) -> Dict[str, str]:
@@ -618,9 +591,11 @@ class RuntimeSupervisor:
                 decision=decision,
                 ratios=ratios,
                 metrics_subset={
-                    "visual_score_final": metrics.get("visual_score_final"),
-                    "macro_total_count": metrics.get("macro_total_count"),
-                    "periphery_non_coyote_ratio": metrics.get("periphery_non_coyote_ratio"),
+                    "boundary_density": metrics.get("boundary_density"),
+                    "boundary_density_small": metrics.get("boundary_density_small"),
+                    "mirror_similarity": metrics.get("mirror_similarity"),
+                    "edge_contact_ratio": metrics.get("edge_contact_ratio"),
+                    "motif_scale": metrics.get("motif_scale"),
                 },
             )
         elif event_type in {"generation_started", "generation_finished", "candidate_accepted", "resource_snapshot", "batch_finished"}:
