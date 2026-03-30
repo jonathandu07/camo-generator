@@ -40,8 +40,6 @@ if str(TEST_DIR) not in sys.path:
     sys.path.insert(0, str(TEST_DIR))
 
 
-ndefault = object()
-
 
 def _import_mut():
     candidates = []
@@ -145,11 +143,15 @@ class GeometryMixin:
             mut.HEIGHT,
             mut.PHYSICAL_WIDTH_CM,
             mut.PHYSICAL_HEIGHT_CM,
+            getattr(mut, "MOTIF_SCALE", None),
         )
 
     def tearDown(self) -> None:
-        width, height, physical_width_cm, physical_height_cm = self._orig_geometry
-        mut.set_canvas_geometry(width, height, physical_width_cm, physical_height_cm)
+        width, height, physical_width_cm, physical_height_cm, motif_scale = self._orig_geometry
+        if motif_scale is None:
+            mut.set_canvas_geometry(width, height, physical_width_cm, physical_height_cm)
+        else:
+            mut.set_canvas_geometry(width, height, physical_width_cm, physical_height_cm, motif_scale)
         super().tearDown()
 
 
@@ -184,6 +186,7 @@ REQUIRED_METRIC_KEYS = {
     "physical_width_cm",
     "physical_height_cm",
     "px_per_cm",
+    "motif_scale",
 }
 
 
@@ -201,6 +204,7 @@ VALID_METRICS = {
     "physical_width_cm": 40.0,
     "physical_height_cm": 22.5,
     "px_per_cm": 3.2,
+    "motif_scale": mut.DEFAULT_MOTIF_SCALE,
 }
 
 
@@ -374,12 +378,15 @@ class TestSystemHelpers(GlobalStateMixin, TempDirMixin, AssertionsMixin, Geometr
         self.assertTrue(out.is_dir())
 
     def test_set_canvas_geometry_updates_globals(self) -> None:
-        mut.set_canvas_geometry(320, 180, 100.0, 56.25)
+        mut.set_canvas_geometry(320, 180, 100.0, 56.25, 0.65)
         self.assertEqual(mut.WIDTH, 320)
         self.assertEqual(mut.HEIGHT, 180)
         self.assertFloatClose(mut.PX_PER_CM, 3.2)
+        self.assertFloatClose(mut.MOTIF_SCALE, 0.65)
         with self.assertRaises(ValueError):
             mut.set_canvas_geometry(0, 180, 100.0, 56.25)
+        with self.assertRaises(ValueError):
+            mut.set_canvas_geometry(320, 180, 100.0, 56.25, 0.0)
 
     def test_shutdown_process_pool_calls_shutdown(self) -> None:
         pool = Mock()
@@ -466,6 +473,14 @@ class TestPureUtilities(TempDirMixin, AssertionsMixin, GeometryMixin, unittest.T
         self.assertGreaterEqual(mut.edge_contact_ratio(canvas), 0.0)
         self.assertLessEqual(mut.edge_contact_ratio(canvas), 1.0)
 
+    def test_scaled_patch_size(self) -> None:
+        sx, sy = mut.scaled_patch_size(10.0, 5.0, 0.5)
+        self.assertFloatClose(sx, 5.0)
+        self.assertFloatClose(sy, 2.5)
+        sx2, sy2 = mut.scaled_patch_size(10.0, 5.0, 0.0)
+        self.assertFloatClose(sx2, 2.5)
+        self.assertFloatClose(sy2, 1.25)
+
     def test_downsample_center_crop_shift_reflect_and_cells(self) -> None:
         arr = np.arange(16, dtype=np.uint8).reshape(4, 4)
         ds = mut.downsample_nearest(arr, factor=2)
@@ -511,6 +526,13 @@ class TestGeneratorInternals(AssertionsMixin, GeometryMixin, unittest.TestCase):
         self.assertEqual(fields.shape, (4, 72, 128))
         self.assertEqual(fields.dtype, np.float16)
 
+    def test_build_all_fields_accepts_custom_motif_scale(self) -> None:
+        profile = mut.make_profile(124)
+        fields_default = mut.build_all_fields(160, 96, profile, crop_height=72, crop_width=128, motif_scale=mut.DEFAULT_MOTIF_SCALE)
+        fields_small = mut.build_all_fields(160, 96, profile, crop_height=72, crop_width=128, motif_scale=0.55)
+        self.assertEqual(fields_default.shape, fields_small.shape)
+        self.assertFalse(np.array_equal(fields_default, fields_small))
+
     def test_sequential_assign_respects_target_counts(self) -> None:
         fields = np.zeros((4, 2, 4), dtype=np.float16)
         fields[mut.IDX_OLIVE] = np.array([[0.9, 0.8, 0.1, 0.1], [0.7, 0.6, 0.2, 0.2]], dtype=np.float16)
@@ -550,6 +572,7 @@ class TestGeneratorInternals(AssertionsMixin, GeometryMixin, unittest.TestCase):
         self.assertEqual(ratios.shape, (4,))
         self.assertEqual(set(REQUIRED_METRIC_KEYS).issubset(set(metrics.keys())), True)
         self.assertAlmostEqual(float(ratios.sum()), 1.0, places=6)
+        self.assertFloatClose(metrics["motif_scale"], mut.MOTIF_SCALE)
 
     def test_generate_candidate_from_seed_returns_candidate_result(self) -> None:
         candidate = mut.generate_candidate_from_seed(12345)
@@ -592,6 +615,7 @@ class TestValidationAndExports(TempDirMixin, AssertionsMixin, GeometryMixin, uni
         self.assertEqual(row["attempts_for_this_image"], 2)
         self.assertIn("largest_olive_component_ratio", row)
         self.assertIn("physical_width_cm", row)
+        self.assertIn("motif_scale", row)
 
     def test_write_report_with_rows_and_empty_rows(self) -> None:
         row = mut.candidate_row(1, 1, 1, make_candidate())
@@ -736,7 +760,7 @@ class TestAsyncHelpersAndOrchestrator(GlobalStateMixin, TempDirMixin, GeometryMi
         self.assertGreaterEqual(supervisor_mock.call_count, 2)
 
 
-class TestCliEntrypoints(GlobalStateMixin, TempDirMixin, GeometryMixin, unittest.TestCase):
+class TestCliEntrypoints(GlobalStateMixin, TempDirMixin, GeometryMixin, AssertionsMixin, unittest.TestCase):
     def test_parse_cli_args_defaults(self) -> None:
         with patch.object(sys, "argv", ["prog"]):
             args = mut.parse_cli_args()
@@ -744,6 +768,7 @@ class TestCliEntrypoints(GlobalStateMixin, TempDirMixin, GeometryMixin, unittest
         self.assertEqual(args.width, mut.DEFAULT_WIDTH)
         self.assertEqual(args.height, mut.DEFAULT_HEIGHT)
         self.assertFalse(args.disable_parallel_attempts)
+        self.assertFloatClose(args.motif_scale, mut.DEFAULT_MOTIF_SCALE)
 
     def test_main_calls_async_generate_all_and_shutdown_pool(self) -> None:
         with patch.object(sys, "argv", [
@@ -754,13 +779,14 @@ class TestCliEntrypoints(GlobalStateMixin, TempDirMixin, GeometryMixin, unittest
             "--height", "72",
             "--physical-width-cm", "40",
             "--physical-height-cm", "22.5",
+            "--motif-scale", "0.61",
             "--no-live-console",
         ]), \
              patch.object(mut, "async_generate_all", return_value=[{"index": 1}]) as async_mock, \
              patch.object(mut, "shutdown_process_pool") as shutdown_mock, \
              patch.object(mut, "set_canvas_geometry") as geometry_mock:
             mut.main()
-        geometry_mock.assert_called_once_with(width=128, height=72, physical_width_cm=40.0, physical_height_cm=22.5)
+        geometry_mock.assert_called_once_with(width=128, height=72, physical_width_cm=40.0, physical_height_cm=22.5, motif_scale=0.61)
         async_mock.assert_called_once()
         shutdown_mock.assert_called_once()
 
