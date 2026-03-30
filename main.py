@@ -5,6 +5,12 @@ Camouflage Armée Fédérale Europe — générateur 8K horizontal, asynchrone,
 strict, orienté production, avec suivi temps réel, rejet/acceptation en direct,
 et exploitation forte de la machine sous contrainte mémoire.
 
+Corrections principales :
+- motifs globalement plus petits ;
+- proportions des couleurs verrouillées par une passe finale stricte ;
+- compteurs live corrigés ;
+- quelques garde-fous de robustesse supplémentaires.
+
 Principes :
 - 8K horizontal par défaut : 7680 x 4320
 - échelle physique par défaut : 240 cm x 135 cm
@@ -12,7 +18,7 @@ Principes :
 - génération overscan + crop central pour éviter les artefacts de bord
 - génération mémoire-maîtrisée : une couche à la fois, crop avant empilement
 - pipeline asynchrone + ProcessPoolExecutor
-- compteurs live : acceptés, rejetés, tentatives, en cours
+- compteurs live : validés, rejetés, tentatives, en cours
 - validation stricte mais adaptée au moteur organique
 """
 
@@ -29,7 +35,7 @@ import shutil
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -90,7 +96,9 @@ DEFAULT_ATTEMPT_BATCH_SIZE = max(1, DEFAULT_MAX_WORKERS)
 DEFAULT_MACHINE_INTENSITY = 0.98
 DEFAULT_RESOURCE_SAMPLE_EVERY_BATCHES = 1
 DEFAULT_OVERSCAN = 1.10
-DEFAULT_MOTIF_SCALE = 0.78
+
+# Réduit pour obtenir des motifs plus fins tout en conservant une lecture multi-distance.
+DEFAULT_MOTIF_SCALE = 0.58
 MOTIF_SCALE = DEFAULT_MOTIF_SCALE
 
 # Validation stricte adaptée au moteur organique 8K.
@@ -177,11 +185,12 @@ class RuntimeTuning:
 @dataclass
 class LiveCounters:
     target_count: int
-    accepted: int = 0
+    accepted: int = 0                  # images effectivement retenues et sauvegardées
+    passed_validation: int = 0         # tentatives passées en validation
     rejected: int = 0
     attempts: int = 0
     in_flight: int = 0
-    start_ts: float = time.time()
+    start_ts: float = field(default_factory=time.time)
 
     def line(self, current_target: int, workers: int) -> str:
         elapsed = max(0.001, time.time() - self.start_ts)
@@ -189,6 +198,7 @@ class LiveCounters:
         return (
             f"\r[{time.strftime('%H:%M:%S')}] "
             f"fait={self.accepted}/{self.target_count} "
+            f"valides={self.passed_validation} "
             f"rejets={self.rejected} "
             f"tentatives={self.attempts} "
             f"en_cours={self.in_flight} "
@@ -373,7 +383,10 @@ def _clip_float(value: float, low: float, high: float) -> float:
     return max(float(low), min(float(high), float(value)))
 
 
-def sample_process_resources(machine_intensity: float = DEFAULT_MACHINE_INTENSITY, output_dir: Path = OUTPUT_DIR) -> ResourceSnapshot:
+def sample_process_resources(
+    machine_intensity: float = DEFAULT_MACHINE_INTENSITY,
+    output_dir: Path = OUTPUT_DIR,
+) -> ResourceSnapshot:
     machine_intensity = _clip_float(float(machine_intensity), 0.10, 1.00)
     disk = shutil.disk_usage(str(Path(output_dir).resolve()))
     process_cpu = 0.0
@@ -489,12 +502,16 @@ def build_seed(target_index: int, local_attempt: int, base_seed: int = DEFAULT_B
 def make_profile(seed: int) -> VariantProfile:
     rng = random.Random(seed)
     overscan = _clip_float(DEFAULT_OVERSCAN + rng.uniform(-0.02, 0.03), 1.08, 1.16)
-    shift_strength = _clip_float(rng.uniform(0.75, 1.15), 0.55, 1.35)
+
+    # Shift un peu réduit pour éviter que les masses fines ne fusionnent trop.
+    shift_strength = _clip_float(rng.uniform(0.68, 0.98), 0.50, 1.10)
+
+    # Léger biais de palette, volontairement modéré car les proportions sont verrouillées ensuite.
     palette_bias = (
-        rng.uniform(-0.008, 0.008),
-        rng.uniform(-0.008, 0.008),
-        rng.uniform(-0.008, 0.008),
-        rng.uniform(-0.008, 0.008),
+        rng.uniform(-0.006, 0.006),
+        rng.uniform(-0.006, 0.006),
+        rng.uniform(-0.006, 0.006),
+        rng.uniform(-0.006, 0.006),
     )
     return VariantProfile(seed=seed, overscan=overscan, shift_strength=shift_strength, palette_bias=palette_bias)
 
@@ -610,8 +627,9 @@ def shift_reflect(arr: np.ndarray, dy: int, dx: int) -> np.ndarray:
 
 
 def cells_for_patch_size(patch_cm_x: float, patch_cm_y: float, width_px: int, height_px: int) -> Tuple[int, int]:
-    patch_px_x = max(8.0, float(patch_cm_x) * PX_PER_CM)
-    patch_px_y = max(8.0, float(patch_cm_y) * PX_PER_CM)
+    # On abaisse le plancher pour permettre des motifs réellement plus fins en 8K.
+    patch_px_x = max(4.0, float(patch_cm_x) * PX_PER_CM)
+    patch_px_y = max(4.0, float(patch_cm_y) * PX_PER_CM)
     cells_x = max(3, int(round(width_px / patch_px_x)))
     cells_y = max(3, int(round(height_px / patch_px_y)))
     return cells_x, cells_y
@@ -663,8 +681,9 @@ def build_field(
     field = np.zeros((height, width), dtype=np.float16)
     total_weight = np.float16(0.0)
 
-    max_shift_x = max(1, int((width // 18) * shift_strength))
-    max_shift_y = max(1, int((height // 18) * shift_strength))
+    # Réduction légère du décalage maximum pour éviter des masses trop larges.
+    max_shift_x = max(1, int((width // 24) * shift_strength))
+    max_shift_y = max(1, int((height // 24) * shift_strength))
 
     for cells_x, cells_y, angle, weight in plan:
         layer = random_blob_layer(width, height, rng, cells_x, cells_y, angle)
@@ -693,47 +712,53 @@ def build_all_fields(
 ) -> np.ndarray:
     rng = np.random.default_rng(profile.seed)
 
-    # Échelles en centimètres pour lecture multi-distance sur silhouette humaine.
-    # Réduit par défaut pour obtenir des masses plus fines tout en gardant une lecture
-    # exploitable à longue, moyenne et courte distance.
-    s1x, s1y = scaled_patch_size(78, 58, motif_scale)
-    s2x, s2y = scaled_patch_size(46, 34, motif_scale)
-    s3x, s3y = scaled_patch_size(18, 13, motif_scale)
-    s4x, s4y = scaled_patch_size(5.5, 4.0, motif_scale)
-    s5x, s5y = scaled_patch_size(2.6, 1.9, motif_scale)
+    # Motifs globalement plus petits, mais toujours multi-distance.
+    s1x, s1y = scaled_patch_size(54.0, 39.0, motif_scale)   # macro réduite
+    s2x, s2y = scaled_patch_size(30.0, 22.0, motif_scale)   # moyenne
+    s3x, s3y = scaled_patch_size(12.0, 8.8, motif_scale)    # intermédiaire
+    s4x, s4y = scaled_patch_size(4.4, 3.2, motif_scale)     # micro
+    s5x, s5y = scaled_patch_size(2.0, 1.5, motif_scale)     # mini
+    s6x, s6y = scaled_patch_size(1.0, 0.75, motif_scale)    # très fin
 
-    c1x, c1y = cells_for_patch_size(s1x, s1y, work_width, work_height)   # macro longue distance
-    c2x, c2y = cells_for_patch_size(s2x, s2y, work_width, work_height)   # moyenne distance
-    c3x, c3y = cells_for_patch_size(s3x, s3y, work_width, work_height)   # intermédiaire
-    c4x, c4y = cells_for_patch_size(s4x, s4y, work_width, work_height)   # micro courte distance
-    c5x, c5y = cells_for_patch_size(s5x, s5y, work_width, work_height)   # ultra-micro rapprochement
+    c1x, c1y = cells_for_patch_size(s1x, s1y, work_width, work_height)
+    c2x, c2y = cells_for_patch_size(s2x, s2y, work_width, work_height)
+    c3x, c3y = cells_for_patch_size(s3x, s3y, work_width, work_height)
+    c4x, c4y = cells_for_patch_size(s4x, s4y, work_width, work_height)
+    c5x, c5y = cells_for_patch_size(s5x, s5y, work_width, work_height)
+    c6x, c6y = cells_for_patch_size(s6x, s6y, work_width, work_height)
 
     plans = {
         IDX_COYOTE: [
             (c1x, c1y, -18.0, 1.00),
-            (c2x, c2y, 22.0, 0.52),
-            (c3x, c3y, -8.0, 0.24),
-            (c4x, c4y, 0.0, 0.09),
-            (c5x, c5y, -11.0, 0.04),
+            (c2x, c2y,  22.0, 0.64),
+            (c3x, c3y,  -8.0, 0.32),
+            (c4x, c4y,   0.0, 0.14),
+            (c5x, c5y, -11.0, 0.07),
+            (c6x, c6y,  15.0, 0.03),
         ],
         IDX_OLIVE: [
-            (c1x, c1y, 16.0, 1.00),
-            (c2x, c2y, -26.0, 0.54),
-            (c3x, c3y, 7.0, 0.23),
-            (c4x, c4y, 12.0, 0.10),
-            (c5x, c5y, 24.0, 0.04),
+            (c1x, c1y,  16.0, 1.00),
+            (c2x, c2y, -26.0, 0.64),
+            (c3x, c3y,   7.0, 0.31),
+            (c4x, c4y,  12.0, 0.15),
+            (c5x, c5y,  24.0, 0.07),
+            (c6x, c6y, -18.0, 0.03),
         ],
         IDX_TERRE: [
-            (c2x, c2y, -12.0, 0.96),
-            (c3x, c3y, 26.0, 0.48),
-            (c4x, c4y, -4.0, 0.15),
-            (c5x, c5y, 9.0, 0.05),
+            (c1x, c1y, -10.0, 0.78),
+            (c2x, c2y, -12.0, 0.92),
+            (c3x, c3y,  26.0, 0.50),
+            (c4x, c4y,  -4.0, 0.19),
+            (c5x, c5y,   9.0, 0.08),
+            (c6x, c6y, -21.0, 0.03),
         ],
         IDX_GRIS: [
-            (c2x, c2y, 20.0, 0.90),
-            (c3x, c3y, -24.0, 0.48),
-            (c4x, c4y, 0.0, 0.20),
-            (c5x, c5y, -15.0, 0.06),
+            (c1x, c1y,  18.0, 0.74),
+            (c2x, c2y,  20.0, 0.90),
+            (c3x, c3y, -24.0, 0.52),
+            (c4x, c4y,   0.0, 0.22),
+            (c5x, c5y, -15.0, 0.09),
+            (c6x, c6y,  11.0, 0.03),
         ],
     }
 
@@ -741,11 +766,11 @@ def build_all_fields(
     for idx in range(4):
         local_seed = int(rng.integers(0, 2**31 - 1))
         local_rng = np.random.default_rng(local_seed)
-        field = build_field(work_width, work_height, local_rng, plans[idx], profile.shift_strength)
-        field = center_crop(field, crop_height, crop_width)
-        field = field + np.float16(profile.palette_bias[idx])
-        fields.append(field.astype(np.float16, copy=False))
-        del field
+        field_i = build_field(work_width, work_height, local_rng, plans[idx], profile.shift_strength)
+        field_i = center_crop(field_i, crop_height, crop_width)
+        field_i = field_i + np.float16(profile.palette_bias[idx])
+        fields.append(field_i.astype(np.float16, copy=False))
+        del field_i
 
     return np.stack(fields, axis=0)
 
@@ -811,20 +836,96 @@ def exactify_proportions(labels: np.ndarray, fields: np.ndarray, target_counts: 
     return labels.astype(np.uint8)
 
 
+def force_exact_target_counts(labels: np.ndarray, fields: np.ndarray, target_counts: np.ndarray) -> np.ndarray:
+    """
+    Passe finale stricte :
+    force exactement les comptes cibles par couleur.
+    """
+    labels = labels.copy()
+    flat_labels = labels.ravel()
+    flat_fields = fields.reshape(fields.shape[0], -1).astype(np.float32, copy=False)
+    shape = labels.shape
+
+    for _ in range(16):
+        counts = np.bincount(flat_labels, minlength=fields.shape[0]).astype(int)
+        delta = target_counts.astype(int) - counts
+        if np.all(delta == 0):
+            break
+
+        boundary = boundary_mask(flat_labels.reshape(shape)).ravel()
+        under = [int(c) for c in np.where(delta > 0)[0]]
+        over = [int(c) for c in np.where(delta < 0)[0]]
+        moved = False
+
+        for dst in under:
+            need = int(delta[dst])
+            if need <= 0:
+                continue
+
+            for src in over:
+                excess = -int(delta[src])
+                if excess <= 0:
+                    continue
+
+                take = min(need, excess)
+
+                idx_boundary = np.where((flat_labels == src) & boundary)[0]
+                idx_pool = idx_boundary
+
+                if idx_pool.size < take:
+                    idx_inner = np.where((flat_labels == src) & (~boundary))[0]
+                    if idx_inner.size:
+                        idx_pool = np.concatenate([idx_boundary, idx_inner], axis=0)
+
+                if idx_pool.size == 0:
+                    continue
+
+                gain = flat_fields[dst, idx_pool] - flat_fields[src, idx_pool]
+                order = np.argsort(gain)[::-1]
+                picked = idx_pool[order[:take]]
+
+                if picked.size == 0:
+                    continue
+
+                flat_labels[picked] = dst
+                delta[dst] -= picked.size
+                delta[src] += picked.size
+                need -= picked.size
+                moved = True
+
+                if need <= 0:
+                    break
+
+        if not moved:
+            break
+
+    return flat_labels.reshape(shape).astype(np.uint8)
+
+
 def generate_one_variant(profile: VariantProfile) -> Tuple[Image.Image, np.ndarray, Dict[str, float]]:
     work_width = max(WIDTH + 64, int(round(WIDTH * profile.overscan)))
     work_height = max(HEIGHT + 64, int(round(HEIGHT * profile.overscan)))
 
-    fields = build_all_fields(work_width, work_height, profile, crop_height=HEIGHT, crop_width=WIDTH, motif_scale=MOTIF_SCALE)
+    fields = build_all_fields(
+        work_width,
+        work_height,
+        profile,
+        crop_height=HEIGHT,
+        crop_width=WIDTH,
+        motif_scale=MOTIF_SCALE,
+    )
+
     target_counts = np.rint(TARGET * (WIDTH * HEIGHT)).astype(int)
     target_counts[-1] = (WIDTH * HEIGHT) - int(target_counts[:-1].sum())
 
     canvas = sequential_assign(fields, target_counts)
     canvas = exactify_proportions(canvas, fields, target_counts)
+    canvas = force_exact_target_counts(canvas, fields, target_counts)
 
     rs = compute_ratios(canvas)
     small = downsample_nearest(canvas, 4)
     tiny = downsample_nearest(canvas, 8)
+
     metrics = {
         "largest_olive_component_ratio": largest_component_ratio(canvas == IDX_OLIVE),
         "boundary_density": boundary_density(canvas),
@@ -944,8 +1045,11 @@ def write_report(rows: List[Dict[str, object]], output_dir: Path, filename: str 
 # GÉNÉRATION ASYNCHRONE / LIVE
 # ============================================================
 
-
-async def _await_attempt(fut: asyncio.Future, attempt_no: int, seed: int) -> Tuple[int, int, CandidateResult, bool]:
+async def _await_attempt(
+    fut: asyncio.Future,
+    attempt_no: int,
+    seed: int,
+) -> Tuple[int, int, CandidateResult, bool]:
     candidate, accepted = await fut
     return attempt_no, seed, candidate, accepted
 
@@ -997,16 +1101,22 @@ async def async_generate_all(
     _runtime_log("INFO", "main_async_generate_all", "Plan de charge initial", tuning=tuning.__dict__)
 
     if enable_live_supervisor:
-        advice = _supervisor_feedback("generation_started", tuning=tuning.__dict__, output_dir=str(output_dir), target_count=target_count)
+        advice = _supervisor_feedback(
+            "generation_started",
+            tuning=tuning.__dict__,
+            output_dir=str(output_dir),
+            target_count=target_count,
+        )
         tuning = _merge_supervisor_tuning(tuning, advice, fallback_machine_intensity=machine_intensity)
 
-    counters = LiveCounters(target_count=target_count, start_ts=time.time())
+    counters = LiveCounters(target_count=target_count)
     rows: List[Dict[str, object]] = []
     batch_counter = 0
     loop = asyncio.get_running_loop()
 
     for target_index in range(1, target_count + 1):
         local_attempt = 1
+
         while True:
             if stop_requested is not None and await stop_requested():
                 write_report(rows, output_dir)
@@ -1043,17 +1153,18 @@ async def async_generate_all(
             if live_console:
                 console_progress(counters, current_target=target_index, workers=tuning.max_workers)
 
-            accepted_item: Optional[Tuple[int, CandidateResult]] = None
             ordered_results: List[Tuple[int, CandidateResult, bool]] = []
 
             for idx, done in enumerate(asyncio.as_completed(tasks), start=1):
                 attempt_no, _seed, candidate, accepted = await done
                 counters.attempts += 1
                 counters.in_flight = max(0, len(tasks) - idx)
+
                 if accepted:
-                    counters.accepted += 1
+                    counters.passed_validation += 1
                 else:
                     counters.rejected += 1
+
                 ordered_results.append((attempt_no, candidate, accepted))
 
                 if progress_callback is not None:
@@ -1086,6 +1197,8 @@ async def async_generate_all(
             filename = output_dir / f"camouflage_{target_index:03d}.png"
             save_candidate_image(accepted_candidate, filename)
             rows.append(candidate_row(target_index, accepted_attempt, counters.attempts, accepted_candidate))
+            counters.accepted += 1
+
             if live_console:
                 console_progress(counters, current_target=target_index, workers=tuning.max_workers)
             break
@@ -1099,6 +1212,7 @@ async def async_generate_all(
         "mode": "same_type_organic_8k_human_scale_async",
         "target_count": target_count,
         "accepted": counters.accepted,
+        "passed_validation": counters.passed_validation,
         "rejected": counters.rejected,
         "attempts": counters.attempts,
         "output_dir": str(Path(output_dir).resolve()),
@@ -1110,7 +1224,10 @@ async def async_generate_all(
         "px_per_cm": float(PX_PER_CM),
         "motif_scale": float(MOTIF_SCALE),
     }
-    (Path(output_dir) / "run_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    (Path(output_dir) / "run_summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     return rows
 
 
