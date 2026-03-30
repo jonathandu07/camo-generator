@@ -189,7 +189,7 @@ jobs: Dict[str, JobState] = {}
 
 app = FastAPI(
     title="Camouflage Armée Fédérale Europe API",
-    version="1.1.0",
+    version="1.1.1",
     description="Service FastAPI pour générer des camouflages via main.py et les exposer à une interface Vue 3.",
 )
 
@@ -200,6 +200,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("shutdown")
+def shutdown_event() -> None:
+    try:
+        camo.shutdown_process_pool()
+    except Exception:
+        pass
 
 
 # ============================================================
@@ -265,6 +273,11 @@ async def run_generation_job(job: JobState) -> None:
             parallel_attempts=job.parallel_attempts,
             adaptive_rejection_correction=job.adaptive_rejection_correction,
         )
+        if job.adaptive_rejection_correction:
+            job.add_event(
+                "info",
+                "Champ adaptive_rejection_correction reçu mais ignoré : main.py ne l'expose pas.",
+            )
 
         async def progress_callback(
             target_index: int,
@@ -310,7 +323,7 @@ async def run_generation_job(job: JobState) -> None:
                 max_workers=job.max_workers,
                 attempt_batch_size=job.attempt_batch_size,
                 parallel_attempts=job.parallel_attempts,
-                adaptive_rejection_correction=job.adaptive_rejection_correction,
+                live_console=False,
             )
 
             job.report_path = job.output_dir / "rapport_camouflages.csv"
@@ -520,7 +533,7 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(
-        "fastAPI_updated:app",
+        f"{Path(__file__).stem}:app",
         host=os.getenv("CAMO_API_HOST", "127.0.0.1"),
         port=int(os.getenv("CAMO_API_PORT", "8000")),
         reload=False,
