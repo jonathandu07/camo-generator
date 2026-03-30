@@ -393,9 +393,11 @@ class AppMixin(TempDirMixin):
         self.app = sut.CamouflageApp()
         try:
             self.app.async_runner.stop()
+            if hasattr(self.app.async_runner, "loop"):
+                self.app.async_runner.loop.close()
         except Exception:
             pass
-        self.app.async_runner = types.SimpleNamespace(submit=make_submit_closing_coroutines(MagicMock()), stop=Mock())
+        self.app.async_runner = types.SimpleNamespace(submit=make_submit_closing_coroutines(MagicMock()), stop=Mock(), loop=None)
         self.app.current_output_dir = self.tmpdir
         self.app.process = FakeProcess()
 
@@ -435,6 +437,8 @@ class AppMixin(TempDirMixin):
     def tearDown(self) -> None:
         try:
             self.app.async_runner.stop()
+            if hasattr(self.app.async_runner, "loop") and self.app.async_runner.loop is not None:
+                self.app.async_runner.loop.close()
         except Exception:
             pass
         super().tearDown()
@@ -571,6 +575,10 @@ class TestUtilities(unittest.TestCase):
             self.assertEqual(fut.result(timeout=2), 42)
         finally:
             runner.stop()
+            try:
+                runner.loop.close()
+            except Exception:
+                pass
 
 
 # ============================================================
@@ -642,10 +650,18 @@ class TestCamouflageAppMethods(AppMixin, unittest.TestCase):
         self.assertTrue(self.app.start_btn.disabled)
         self.assertFalse(self.app.stop_btn.disabled)
 
-    def test_on_intensity_change(self):
-        self.app._on_intensity_change(None, 72.4)
-        self.assertEqual(int(self.app.machine_intensity), 72)
-        self.assertEqual(self.app.intensity_label.text, "72 %")
+    def test_on_motif_scale_change_and_apply_backend_scale(self):
+        self.app.motif_scale_label = make_fake_label()
+        with patch.object(sut.camo, "set_canvas_geometry") as mock_set:
+            out = self.app._apply_backend_motif_scale()
+        self.assertAlmostEqual(out, self.app.motif_scale, places=6)
+        mock_set.assert_called_once()
+
+        with patch.object(self.app, "_apply_backend_motif_scale", return_value=0.72) as mock_apply:
+            self.app._on_motif_scale_change(None, 0.72)
+        self.assertAlmostEqual(self.app.motif_scale, 0.72, places=6)
+        self.assertEqual(self.app.motif_scale_label.text, "0.72")
+        mock_apply.assert_called_once()
 
     def test_run_mode_helpers(self):
         self.assertEqual(self.app._run_mode_text(sut.RUN_MODE_SKIP_TESTS), "sans tests")
@@ -998,6 +1014,19 @@ class TestCamouflageAppAsync(AppMixin, unittest.IsolatedAsyncioTestCase):
         self.assertIn("Image 002", self.app.attempt_text.text)
         self.assertIn("MAE ratio", self.app.score_text.text)
         self.assertIn("overscan", self.app.struct_text.text)
+
+
+class TestBuildSmoke(AppMixin, unittest.TestCase):
+    def test_build_returns_root_widget(self):
+        with patch.object(sut.Clock, "schedule_interval", return_value=None), \
+             patch.object(self.app, "reload_gallery", return_value=None), \
+             patch.object(self.app, "_refresh_controls_state", return_value=None), \
+             patch.object(self.app, "_refresh_run_mode_buttons", return_value=None), \
+             patch.object(self.app, "_refresh_diag_labels", return_value=None):
+            root = self.app.build()
+        self.assertIsNotNone(root)
+        self.assertIsNotNone(self.app.start_btn)
+        self.assertIsNotNone(self.app.motif_scale_slider)
 
 
 if __name__ == "__main__":
