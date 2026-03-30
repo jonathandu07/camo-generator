@@ -19,6 +19,7 @@ import asyncio
 import csv
 import importlib
 import io
+import json
 import logging
 import os
 import sys
@@ -38,7 +39,6 @@ from PIL import Image
 TEST_DIR = Path(__file__).resolve().parent
 if str(TEST_DIR) not in sys.path:
     sys.path.insert(0, str(TEST_DIR))
-
 
 
 def _import_mut():
@@ -189,7 +189,6 @@ REQUIRED_METRIC_KEYS = {
     "motif_scale",
 }
 
-
 VALID_METRICS = {
     "largest_olive_component_ratio": 0.20,
     "boundary_density": 0.05,
@@ -198,7 +197,7 @@ VALID_METRICS = {
     "mirror_similarity": 0.40,
     "edge_contact_ratio": 0.40,
     "overscan": 1.10,
-    "shift_strength": 1.00,
+    "shift_strength": 0.80,
     "width": 128.0,
     "height": 72.0,
     "physical_width_cm": 40.0,
@@ -207,19 +206,15 @@ VALID_METRICS = {
     "motif_scale": mut.DEFAULT_MOTIF_SCALE,
 }
 
-
 INVALID_RATIOS_FAR = np.array([0.50, 0.20, 0.20, 0.10], dtype=float)
-
 
 
 def valid_ratios() -> np.ndarray:
     return mut.TARGET.copy()
 
 
-
 def valid_metrics() -> Dict[str, float]:
     return dict(VALID_METRICS)
-
 
 
 def make_candidate(seed: int = 123456, ratios: np.ndarray | None = None, metrics: Dict[str, float] | None = None):
@@ -234,7 +229,6 @@ def make_candidate(seed: int = 123456, ratios: np.ndarray | None = None, metrics
     )
 
 
-
 def fake_snapshot(*, machine_intensity: float = 0.94, available_mb: float = 8192.0, disk_free_mb: float = 4096.0):
     return mut.ResourceSnapshot(
         ts=1.0,
@@ -247,7 +241,6 @@ def fake_snapshot(*, machine_intensity: float = 0.94, available_mb: float = 8192
         disk_free_mb=disk_free_mb,
         machine_intensity=machine_intensity,
     )
-
 
 
 def iter_metric_failure_cases() -> Iterable[tuple[str, float]]:
@@ -292,16 +285,30 @@ class TestConstantsAndDataclasses(AssertionsMixin, unittest.TestCase):
         self.assertEqual(out["cpu_count"], float(mut.CPU_COUNT))
 
     def test_runtime_tuning_normalized(self) -> None:
-        rt = mut.RuntimeTuning(max_workers=0, attempt_batch_size=0, parallel_attempts=True, machine_intensity=2.0).normalized()
+        rt = mut.RuntimeTuning(
+            max_workers=0,
+            attempt_batch_size=0,
+            parallel_attempts=True,
+            machine_intensity=2.0,
+        ).normalized()
         self.assertEqual(rt.max_workers, 1)
         self.assertEqual(rt.attempt_batch_size, 1)
         self.assertFalse(rt.parallel_attempts)
         self.assertEqual(rt.machine_intensity, 1.0)
 
     def test_live_counters_line_contains_useful_fields(self) -> None:
-        counters = mut.LiveCounters(target_count=5, accepted=2, rejected=3, attempts=5, in_flight=1, start_ts=time.time() - 2.0)
+        counters = mut.LiveCounters(
+            target_count=5,
+            accepted=2,
+            passed_validation=4,
+            rejected=3,
+            attempts=7,
+            in_flight=1,
+            start_ts=time.time() - 2.0,
+        )
         line = counters.line(current_target=3, workers=4)
         self.assertIn("fait=2/5", line)
+        self.assertIn("valides=4", line)
         self.assertIn("rejets=3", line)
         self.assertIn("workers=4", line)
 
@@ -310,7 +317,7 @@ class TestConstantsAndDataclasses(AssertionsMixin, unittest.TestCase):
         p2 = mut.make_profile(424242)
         self.assertEqual(p1, p2)
         self.assertTrue(1.08 <= p1.overscan <= 1.16)
-        self.assertTrue(0.55 <= p1.shift_strength <= 1.35)
+        self.assertTrue(0.50 <= p1.shift_strength <= 1.10)
         self.assertEqual(len(p1.palette_bias), 4)
 
 
@@ -354,7 +361,13 @@ class TestLoggingHelpers(GlobalStateMixin, TempDirMixin, unittest.TestCase):
 
     def test_merge_supervisor_tuning_normalizes_values(self) -> None:
         tuning = mut.RuntimeTuning(1, 1, False, 0.5, "base")
-        advice = {"max_workers": 0, "attempt_batch_size": 0, "parallel_attempts": True, "machine_intensity": 5.0, "reason": "advice"}
+        advice = {
+            "max_workers": 0,
+            "attempt_batch_size": 0,
+            "parallel_attempts": True,
+            "machine_intensity": 5.0,
+            "reason": "advice",
+        }
         out = mut._merge_supervisor_tuning(tuning, advice)
         self.assertEqual(out.max_workers, 1)
         self.assertEqual(out.attempt_batch_size, 1)
@@ -528,8 +541,22 @@ class TestGeneratorInternals(AssertionsMixin, GeometryMixin, unittest.TestCase):
 
     def test_build_all_fields_accepts_custom_motif_scale(self) -> None:
         profile = mut.make_profile(124)
-        fields_default = mut.build_all_fields(160, 96, profile, crop_height=72, crop_width=128, motif_scale=mut.DEFAULT_MOTIF_SCALE)
-        fields_small = mut.build_all_fields(160, 96, profile, crop_height=72, crop_width=128, motif_scale=0.55)
+        fields_default = mut.build_all_fields(
+            160,
+            96,
+            profile,
+            crop_height=72,
+            crop_width=128,
+            motif_scale=mut.DEFAULT_MOTIF_SCALE,
+        )
+        fields_small = mut.build_all_fields(
+            160,
+            96,
+            profile,
+            crop_height=72,
+            crop_width=128,
+            motif_scale=0.55,
+        )
         self.assertEqual(fields_default.shape, fields_small.shape)
         self.assertFalse(np.array_equal(fields_default, fields_small))
 
@@ -543,7 +570,7 @@ class TestGeneratorInternals(AssertionsMixin, GeometryMixin, unittest.TestCase):
         counts = np.bincount(labels.ravel(), minlength=4)
         self.assertEqual(tuple(counts), (2, 2, 2, 2))
 
-    def test_exactify_proportions_hits_target_counts(self) -> None:
+    def test_exactify_proportions_preserves_target_when_already_exact(self) -> None:
         labels = np.array(
             [
                 [0, 0, 0, 0],
@@ -557,11 +584,28 @@ class TestGeneratorInternals(AssertionsMixin, GeometryMixin, unittest.TestCase):
         fields[1, :, :] = 0.2
         fields[2, :, :] = 0.2
         fields[3, :, :] = 0.2
-        fields[1, 0, 1] = 0.9
-        fields[2, 3, 1] = 0.9
-        fields[3, 0, 2] = 0.9
         target_counts = np.array([10, 2, 2, 2], dtype=int)
         out = mut.exactify_proportions(labels, fields, target_counts)
+        counts = np.bincount(out.ravel(), minlength=4)
+        self.assertEqual(tuple(counts), tuple(target_counts))
+
+    def test_force_exact_target_counts_hits_target_counts(self) -> None:
+        labels = np.zeros((4, 4), dtype=np.uint8)
+        fields = np.zeros((4, 4, 4), dtype=np.float16)
+
+        positions_1 = [(0, 0), (0, 1), (1, 0)]
+        positions_2 = [(2, 2), (2, 3), (3, 2)]
+        positions_3 = [(1, 3), (3, 0)]
+
+        for y, x in positions_1:
+            fields[1, y, x] = 1.0
+        for y, x in positions_2:
+            fields[2, y, x] = 1.0
+        for y, x in positions_3:
+            fields[3, y, x] = 1.0
+
+        target_counts = np.array([8, 3, 3, 2], dtype=int)
+        out = mut.force_exact_target_counts(labels, fields, target_counts)
         counts = np.bincount(out.ravel(), minlength=4)
         self.assertEqual(tuple(counts), tuple(target_counts))
 
@@ -570,7 +614,7 @@ class TestGeneratorInternals(AssertionsMixin, GeometryMixin, unittest.TestCase):
         image, ratios, metrics = mut.generate_one_variant(profile)
         self.assertEqual(image.size, (128, 72))
         self.assertEqual(ratios.shape, (4,))
-        self.assertEqual(set(REQUIRED_METRIC_KEYS).issubset(set(metrics.keys())), True)
+        self.assertTrue(set(REQUIRED_METRIC_KEYS).issubset(set(metrics.keys())))
         self.assertAlmostEqual(float(ratios.sum()), 1.0, places=6)
         self.assertFloatClose(metrics["motif_scale"], mut.MOTIF_SCALE)
 
@@ -630,7 +674,13 @@ class TestValidationAndExports(TempDirMixin, AssertionsMixin, GeometryMixin, uni
         self.assertEqual(csv2.read_text(encoding="utf-8"), "")
 
 
-class TestAsyncHelpersAndOrchestrator(GlobalStateMixin, TempDirMixin, GeometryMixin, AssertionsMixin, unittest.IsolatedAsyncioTestCase):
+class TestAsyncHelpersAndOrchestrator(
+    GlobalStateMixin,
+    TempDirMixin,
+    GeometryMixin,
+    AssertionsMixin,
+    unittest.IsolatedAsyncioTestCase,
+):
     def setUp(self) -> None:
         super().setUp()
         mut.set_canvas_geometry(128, 72, 40.0, 22.5)
@@ -645,7 +695,15 @@ class TestAsyncHelpersAndOrchestrator(GlobalStateMixin, TempDirMixin, GeometryMi
         self.assertTrue(out[3])
 
     async def test_console_progress_writes_to_stdout(self) -> None:
-        counters = mut.LiveCounters(target_count=2, accepted=1, rejected=0, attempts=1, in_flight=0, start_ts=time.time() - 1.0)
+        counters = mut.LiveCounters(
+            target_count=2,
+            accepted=1,
+            passed_validation=1,
+            rejected=0,
+            attempts=1,
+            in_flight=0,
+            start_ts=time.time() - 1.0,
+        )
         buf = io.StringIO()
         with patch.object(sys, "stdout", buf):
             mut.console_progress(counters, current_target=1, workers=2)
@@ -674,6 +732,10 @@ class TestAsyncHelpersAndOrchestrator(GlobalStateMixin, TempDirMixin, GeometryMi
         self.assertTrue((self.tmpdir / "rapport_camouflages.csv").exists())
         self.assertTrue((self.tmpdir / "run_summary.json").exists())
 
+        summary = json.loads((self.tmpdir / "run_summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["accepted"], 1)
+        self.assertEqual(summary["passed_validation"], 1)
+
     async def test_async_generate_all_retries_until_accept(self) -> None:
         side_effects = [
             (make_candidate(seed=301), False),
@@ -695,6 +757,12 @@ class TestAsyncHelpersAndOrchestrator(GlobalStateMixin, TempDirMixin, GeometryMi
         self.assertEqual(rows[0]["seed"], 302)
         self.assertEqual(rows[0]["attempts_for_this_image"], 2)
         self.assertEqual(rows[0]["global_attempt"], 2)
+
+        summary = json.loads((self.tmpdir / "run_summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary["accepted"], 1)
+        self.assertEqual(summary["passed_validation"], 1)
+        self.assertEqual(summary["rejected"], 1)
+        self.assertEqual(summary["attempts"], 2)
 
     async def test_async_generate_all_parallel_branch(self) -> None:
         pool = ThreadPoolExecutor(max_workers=2)
@@ -740,7 +808,13 @@ class TestAsyncHelpersAndOrchestrator(GlobalStateMixin, TempDirMixin, GeometryMi
 
         def supervisor_side_effect(event_type: str, **payload: Any):
             if event_type == "generation_started":
-                return {"max_workers": 1, "attempt_batch_size": 1, "parallel_attempts": False, "machine_intensity": 0.6, "reason": "supervised"}
+                return {
+                    "max_workers": 1,
+                    "attempt_batch_size": 1,
+                    "parallel_attempts": False,
+                    "machine_intensity": 0.6,
+                    "reason": "supervised",
+                }
             return None
 
         with patch.object(mut, "validate_generation_request", return_value=None), \
@@ -771,6 +845,8 @@ class TestCliEntrypoints(GlobalStateMixin, TempDirMixin, GeometryMixin, Assertio
         self.assertFloatClose(args.motif_scale, mut.DEFAULT_MOTIF_SCALE)
 
     def test_main_calls_async_generate_all_and_shutdown_pool(self) -> None:
+        async_mock = AsyncMock(return_value=[{"index": 1}])
+
         with patch.object(sys, "argv", [
             "prog",
             "--target-count", "1",
@@ -782,12 +858,19 @@ class TestCliEntrypoints(GlobalStateMixin, TempDirMixin, GeometryMixin, Assertio
             "--motif-scale", "0.61",
             "--no-live-console",
         ]), \
-             patch.object(mut, "async_generate_all", return_value=[{"index": 1}]) as async_mock, \
+             patch.object(mut, "async_generate_all", async_mock), \
              patch.object(mut, "shutdown_process_pool") as shutdown_mock, \
              patch.object(mut, "set_canvas_geometry") as geometry_mock:
             mut.main()
-        geometry_mock.assert_called_once_with(width=128, height=72, physical_width_cm=40.0, physical_height_cm=22.5, motif_scale=0.61)
-        async_mock.assert_called_once()
+
+        geometry_mock.assert_called_once_with(
+            width=128,
+            height=72,
+            physical_width_cm=40.0,
+            physical_height_cm=22.5,
+            motif_scale=0.61,
+        )
+        async_mock.assert_awaited_once()
         shutdown_mock.assert_called_once()
 
 
