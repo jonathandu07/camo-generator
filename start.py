@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
 start.py
-Front-end Kivy nettoyé et réaligné avec main_v2_camouflage.py / main.py.
+Front-end Kivy réaligné avec le main.py actuel.
 
-Objectifs :
-- supprimer les doublons de scoring déjà présents dans le backend ;
-- retirer les métriques obsolètes côté front ;
-- conserver la génération séquentielle stricte avec aperçu live ;
-- afficher les nouvelles métriques utiles au camouflage militaire ;
-- garder une interface moderne et lisible.
+Corrections principales :
+- supprime les appels à des fonctions absentes dans main.py ;
+- remplace les anciens scores "visuels" par les vraies métriques strictes du backend ;
+- garde la génération séquentielle stricte avec aperçu live ;
+- ajoute une analyse locale des règles de rejet à partir des seuils de main.py ;
+- conserve l'export rapport + best_of côté front.
 """
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ import asyncio
 import ctypes
 import io
 import json
-import math
 import os
 import platform
 import shutil
@@ -49,9 +48,9 @@ except Exception:
     camo_log = None
 
 try:
-    import main_v2_camouflage as camo
-except Exception:
     import main as camo
+except Exception as exc:
+    raise RuntimeError("Impossible d'importer main.py depuis start.py") from exc
 
 from kivy.config import Config
 
@@ -143,10 +142,11 @@ C = {
 # ============================================================
 
 APP_TITLE = "Camouflage Armée Fédérale Europe"
-DEFAULT_OUTPUT_DIR = Path("camouflages_federale_europe")
-DEFAULT_TARGET_COUNT = 100
+DEFAULT_OUTPUT_DIR = Path(getattr(camo, "OUTPUT_DIR", "camouflages_federale_europe_8k"))
+DEFAULT_TARGET_COUNT = int(getattr(camo, "N_VARIANTS_REQUIRED", 100))
 DEFAULT_TOP_K = 20
-DEFAULT_PREFLIGHT_MODULES = ("test_main", "test_start")
+REPORT_NAME = "rapport_camouflages_front.csv"
+BEST_DIR_NAME = "best_of"
 
 RUN_MODE_BLOCKING = "blocking"
 RUN_MODE_NON_BLOCKING = "non_blocking"
@@ -154,8 +154,6 @@ RUN_MODE_SKIP_TESTS = "skip_tests"
 
 THUMB_SIZE = (240, 150)
 GALLERY_COLUMNS = 3
-REPORT_NAME = "rapport_camouflages_front.csv"
-BEST_DIR_NAME = "best_of"
 
 ES_CONTINUOUS = 0x80000000
 ES_SYSTEM_REQUIRED = 0x00000001
@@ -261,9 +259,113 @@ def rgb_image_to_index_canvas(img: PILImage.Image) -> np.ndarray:
     return out
 
 
+def backend_machine_intensity(percent_value: float) -> float:
+    return max(0.10, min(1.00, float(percent_value) / 100.0))
+
+
+def safe_metric(metrics: Dict[str, float], key: str, default: float = 0.0) -> float:
+    try:
+        return float(metrics.get(key, default))
+    except Exception:
+        return float(default)
+
+
+def extract_backend_scores(ratios: np.ndarray, metrics: Dict[str, float]) -> Dict[str, float]:
+    abs_err = np.abs(ratios - camo.TARGET)
+    return {
+        "ratio_mae": float(np.mean(abs_err)),
+        "ratio_max_abs": float(np.max(abs_err)),
+        "largest_olive_component_ratio": safe_metric(metrics, "largest_olive_component_ratio"),
+        "boundary_density": safe_metric(metrics, "boundary_density"),
+        "boundary_density_small": safe_metric(metrics, "boundary_density_small"),
+        "boundary_density_tiny": safe_metric(metrics, "boundary_density_tiny"),
+        "mirror_similarity": safe_metric(metrics, "mirror_similarity"),
+        "edge_contact_ratio": safe_metric(metrics, "edge_contact_ratio"),
+        "overscan": safe_metric(metrics, "overscan"),
+        "shift_strength": safe_metric(metrics, "shift_strength"),
+        "px_per_cm": safe_metric(metrics, "px_per_cm"),
+    }
+
+
+def rejection_rules_for_candidate(candidate: camo.CandidateResult) -> List[str]:
+    ratios = candidate.ratios
+    metrics = candidate.metrics
+    rules: List[str] = []
+
+    abs_err = np.abs(ratios - camo.TARGET)
+    color_labels = ["coyote", "olive", "terre", "gris"]
+    for idx, err in enumerate(abs_err):
+        if float(err) > float(camo.MAX_ABS_ERROR_PER_COLOR[idx]):
+            rules.append(f"ratio_{color_labels[idx]}")
+
+    if float(np.mean(abs_err)) > float(camo.MAX_MEAN_ABS_ERROR):
+        rules.append("ratio_mean_abs")
+
+    bd = safe_metric(metrics, "boundary_density")
+    if bd < float(camo.MIN_BOUNDARY_DENSITY):
+        rules.append("boundary_density_trop_faible")
+    elif bd > float(camo.MAX_BOUNDARY_DENSITY):
+        rules.append("boundary_density_trop_forte")
+
+    bd_small = safe_metric(metrics, "boundary_density_small")
+    if bd_small < float(camo.MIN_BOUNDARY_DENSITY_SMALL):
+        rules.append("boundary_density_small_trop_faible")
+    elif bd_small > float(camo.MAX_BOUNDARY_DENSITY_SMALL):
+        rules.append("boundary_density_small_trop_forte")
+
+    bd_tiny = safe_metric(metrics, "boundary_density_tiny")
+    if bd_tiny < float(camo.MIN_BOUNDARY_DENSITY_TINY):
+        rules.append("boundary_density_tiny_trop_faible")
+    elif bd_tiny > float(camo.MAX_BOUNDARY_DENSITY_TINY):
+        rules.append("boundary_density_tiny_trop_forte")
+
+    mirror = safe_metric(metrics, "mirror_similarity")
+    if mirror > float(camo.MAX_MIRROR_SIMILARITY):
+        rules.append("mirror_similarity")
+
+    olive = safe_metric(metrics, "largest_olive_component_ratio")
+    if olive < float(camo.MIN_LARGEST_OLIVE_COMPONENT_RATIO):
+        rules.append("largest_olive_component_ratio")
+
+    edge = safe_metric(metrics, "edge_contact_ratio")
+    if edge > float(camo.MAX_EDGE_CONTACT_RATIO):
+        rules.append("edge_contact_ratio")
+
+    if not rules and not camo.validate_candidate_result(candidate):
+        rules.append("rejet_backend_non_detaille")
+    return rules
+
+
+def candidate_rank_key(record: CandidateRecord) -> Tuple[float, float, float, float]:
+    ratios = record.ratios
+    metrics = record.metrics
+    ratio_mae = float(np.mean(np.abs(ratios - camo.TARGET)))
+    ratio_max = float(np.max(np.abs(ratios - camo.TARGET)))
+    mirror = safe_metric(metrics, "mirror_similarity")
+    edge = safe_metric(metrics, "edge_contact_ratio")
+    return (ratio_mae, ratio_max, mirror, edge)
+
+
+async def async_generate_candidate_from_seed(seed: int) -> camo.CandidateResult:
+    return await asyncio.to_thread(camo.generate_candidate_from_seed, seed)
+
+
+async def async_validate_candidate_result(candidate: camo.CandidateResult) -> bool:
+    return await asyncio.to_thread(camo.validate_candidate_result, candidate)
+
+
+async def async_save_candidate_image(candidate: camo.CandidateResult, path: Path) -> Path:
+    return await asyncio.to_thread(camo.save_candidate_image, candidate, path)
+
+
+async def async_write_report(rows: List[dict], output_dir: Path, filename: str = REPORT_NAME) -> Path:
+    return await asyncio.to_thread(camo.write_report, rows, output_dir, filename)
+
+
 # ============================================================
-# SILHOUETTE (garde l'aperçu, pas le scoring)
+# SILHOUETTE (aperçu uniquement)
 # ============================================================
+
 
 def build_silhouette_mask(width: int, height: int) -> np.ndarray:
     img = PILImage.new("L", (width, height), 0)
@@ -330,25 +432,6 @@ def silhouette_projection_image(index_canvas: np.ndarray) -> PILImage.Image:
     background[sil] = rgb[sil]
     background[silhouette_boundary(sil)] = np.array([255, 255, 255], dtype=np.uint8)
     return PILImage.fromarray(background, "RGB")
-
-
-# ============================================================
-# EXTRACTION DES SCORES BACKEND
-# ============================================================
-
-def extract_backend_scores(metrics: Dict[str, float]) -> Dict[str, float]:
-    return {
-        "score_final": float(metrics.get("visual_score_final", 0.0)),
-        "score_ratio": float(metrics.get("visual_score_ratio", 0.0)),
-        "score_silhouette": float(metrics.get("visual_score_silhouette", 0.0)),
-        "score_contour": float(metrics.get("visual_score_contour", 0.0)),
-        "score_main": float(metrics.get("visual_score_main", 0.0)),
-        "silhouette_color_diversity": float(metrics.get("visual_silhouette_color_diversity", 0.0)),
-        "contour_break_score": float(metrics.get("visual_contour_break_score", 0.0)),
-        "outline_band_diversity": float(metrics.get("visual_outline_band_diversity", 0.0)),
-        "small_scale_structural_score": float(metrics.get("visual_small_scale_structural_score", 0.0)),
-        "military_score": float(metrics.get("visual_military_score", 0.0)),
-    }
 
 
 # ============================================================
@@ -576,7 +659,7 @@ class CamouflageApp(App):
         self.process = psutil.Process() if psutil else None
         self.tests_ran = False
         self.tests_ok = False
-        self.tests_summary = "Tests non lancés."
+        self.tests_summary = "Préflight non lancé."
         self.run_mode = RUN_MODE_BLOCKING
         self.diag_total = 0
         self.diag_accepts = 0
@@ -640,7 +723,6 @@ class CamouflageApp(App):
         left = BoxLayout(orientation="vertical", spacing=dp(10), size_hint_x=0.36)
         right = BoxLayout(orientation="vertical", spacing=dp(10))
 
-        # Panneau contrôle
         control_scroll = ScrollView(do_scroll_x=False, bar_width=dp(8))
         control_content = BoxLayout(orientation="vertical", spacing=dp(10), size_hint_y=None)
         control_content.bind(minimum_height=control_content.setter("height"))
@@ -695,11 +777,11 @@ class CamouflageApp(App):
         self.resource_text = self._small_label("CPU -- | RAM -- | Disque -- | Processus --")
         controls.add_widget(self.resource_text)
 
-        controls.add_widget(self._label("Scores backend"))
-        self.score_text = self._small_label("Score -- | ratio -- | silhouette -- | contour --")
+        controls.add_widget(self._label("Validation backend"))
+        self.score_text = self._small_label("MAE ratio -- | max abs -- | olive comp. -- | miroir --")
         self.color_text = self._small_label("C -- | O -- | T -- | G --")
-        self.extra_text = self._small_label("olive conn. -- | centre -- | limites -- | miroir --")
-        self.struct_text = self._small_label("terre macro -- | gris macro -- | continuité brune -- | militaire --")
+        self.extra_text = self._small_label("bd -- | bd/4 -- | bd/8 -- | bord --")
+        self.struct_text = self._small_label("overscan -- | shift -- | px/cm --")
         controls.add_widget(self.score_text)
         controls.add_widget(self.color_text)
         controls.add_widget(self.extra_text)
@@ -738,7 +820,7 @@ class CamouflageApp(App):
         live_card = GlassCard(orientation="vertical")
         live_card.add_widget(self._label("Suivi direct de construction"))
         self.live_stage_label = self._small_label("Étape : attente")
-        self.live_counts_label = self._small_label("Macros -- | transitions -- | micros --")
+        self.live_counts_label = self._small_label("État backend strict")
         self.live_meta_label = self._small_label("Image -- | essai -- | seed --")
         live_card.add_widget(self.live_stage_label)
         live_card.add_widget(self.live_counts_label)
@@ -774,7 +856,7 @@ class CamouflageApp(App):
         Clock.schedule_interval(lambda dt: self.reload_gallery(), 3.0)
         return root
 
-    # ---------- small UI helpers ----------
+    # ---------- helpers UI ----------
     def _label(self, text: str, **kwargs) -> Label:
         kwargs.setdefault("size_hint_y", None)
         kwargs.setdefault("height", dp(26))
@@ -917,19 +999,14 @@ class CamouflageApp(App):
         target_index: Optional[int] = None,
         local_attempt: Optional[int] = None,
         seed: Optional[int] = None,
-        macro_count: Optional[int] = None,
-        transition_count: Optional[int] = None,
-        micro_count: Optional[int] = None,
+        metrics_text: Optional[str] = None,
         pil_img: Optional[PILImage.Image] = None,
         preview_path: Optional[str] = None,
     ):
         if self.live_stage_label is not None:
             self.live_stage_label.text = f"Étape : {stage}"
         if self.live_counts_label is not None:
-            m = "--" if macro_count is None else str(macro_count)
-            t = "--" if transition_count is None else str(transition_count)
-            mi = "--" if micro_count is None else str(micro_count)
-            self.live_counts_label.text = f"Macros {m} | transitions {t} | micros {mi}"
+            self.live_counts_label.text = metrics_text or "État backend strict"
         if self.live_meta_label is not None:
             ti = "--" if target_index is None else f"{target_index:03d}"
             la = "--" if local_attempt is None else f"{local_attempt:04d}"
@@ -950,21 +1027,24 @@ class CamouflageApp(App):
             return
         stage = payload.get("stage") or payload.get("live_stage") or payload.get("phase")
         preview_path = payload.get("preview_path") or payload.get("snapshot_path") or payload.get("frame_path")
-        macro_count = payload.get("macro_count")
-        transition_count = payload.get("transition_count")
-        micro_count = payload.get("micro_count")
         target_index = payload.get("target_index")
         local_attempt = payload.get("local_attempt")
         seed = payload.get("seed")
-        if stage or preview_path or macro_count is not None or transition_count is not None or micro_count is not None:
+        metrics_text = None
+        if "metrics" in payload and isinstance(payload["metrics"], dict):
+            m = payload["metrics"]
+            metrics_text = (
+                f"bd {m.get('boundary_density', '--')} | "
+                f"miroir {m.get('mirror_similarity', '--')} | "
+                f"bord {m.get('edge_contact_ratio', '--')}"
+            )
+        if stage or preview_path:
             self.update_live_stage(
-                stage=str(stage or "construction"),
+                stage=str(stage or "runtime"),
                 target_index=int(target_index) if target_index is not None else None,
                 local_attempt=int(local_attempt) if local_attempt is not None else None,
                 seed=int(seed) if seed is not None else None,
-                macro_count=int(macro_count) if macro_count is not None else None,
-                transition_count=int(transition_count) if transition_count is not None else None,
-                micro_count=int(micro_count) if micro_count is not None else None,
+                metrics_text=metrics_text,
                 preview_path=str(preview_path) if preview_path else None,
             )
 
@@ -1049,19 +1129,35 @@ class CamouflageApp(App):
         self.tests_label.color = C["success"] if ok is True else C["danger"] if ok is False else C["text_soft"]
 
     async def _async_run_preflight(self) -> Tuple[bool, str]:
-        if camo_log is None or not hasattr(camo_log, "async_run_preflight_tests"):
-            return False, "log.py indisponible : impossible de lancer le préflight."
         try:
-            summary = await camo_log.async_run_preflight_tests(module_names=DEFAULT_PREFLIGHT_MODULES, output_dir=Path("logs_generation"), timeout_s=None)
-            if hasattr(summary, "short_text"):
-                return bool(getattr(summary, "ok", False)), str(summary.short_text())
-            if isinstance(summary, dict):
-                ok = bool(summary.get("ok", False))
-                total = int(summary.get("total", 0))
-                failures = int(summary.get("failures", 0))
-                errors = int(summary.get("errors", 0))
-                return ok, f"{total} tests | {failures} échec(s) | {errors} erreur(s)"
-            return False, "Préflight : réponse inattendue."
+            try:
+                count = int((self.count_input.text if self.count_input is not None else str(DEFAULT_TARGET_COUNT)).strip())
+            except Exception:
+                count = DEFAULT_TARGET_COUNT
+
+            intensity = backend_machine_intensity(self.machine_intensity)
+            output_dir = self.current_output_dir
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            await asyncio.to_thread(
+                camo.validate_generation_request,
+                target_count=max(1, count),
+                output_dir=output_dir,
+                base_seed=int(getattr(camo, "DEFAULT_BASE_SEED", 0)),
+                machine_intensity=intensity,
+                max_workers=1,
+                attempt_batch_size=1,
+            )
+
+            if hasattr(camo, "sample_process_resources"):
+                snap = await asyncio.to_thread(camo.sample_process_resources, intensity, output_dir)
+                summary = (
+                    f"Préflight OK | CPU={snap.cpu_count} | RAM dispo={snap.system_available_mb:.0f} Mo | "
+                    f"disque libre={snap.disk_free_mb:.0f} Mo"
+                )
+            else:
+                summary = "Préflight OK"
+            return True, summary
         except Exception as exc:
             return False, f"Préflight impossible : {exc}"
 
@@ -1101,16 +1197,9 @@ class CamouflageApp(App):
         if pending_start and ok:
             self._start_generation_after_preflight()
         elif pending_start and not ok:
-            self.status("Tests KO", ok=False)
+            self.status("Préflight KO", ok=False)
 
     # ---------- diagnostics ----------
-    async def _extract_failure_rules(self, candidate: camo.CandidateResult, target_index: int, local_attempt: int) -> List[str]:
-        try:
-            failures = await asyncio.to_thread(camo.extract_rejection_failures, candidate, target_index, local_attempt)
-            return [str(item.get("rule", "")) for item in failures if item.get("rule")]
-        except Exception:
-            return []
-
     async def _register_live_diag(self, candidate: camo.CandidateResult, target_index: int, local_attempt: int, accepted: bool):
         self.diag_total += 1
         if accepted:
@@ -1120,7 +1209,7 @@ class CamouflageApp(App):
             self._refresh_diag_labels()
             return
         self.diag_rejects += 1
-        rules = await self._extract_failure_rules(candidate, target_index, local_attempt)
+        rules = rejection_rules_for_candidate(candidate)
         self.diag_last_rules = rules[:]
         for rule in rules:
             self.diag_rule_counter[rule] += 1
@@ -1137,6 +1226,8 @@ class CamouflageApp(App):
 
         if self.run_mode == RUN_MODE_SKIP_TESTS:
             self.tests_summary = "Tests ignorés (mode sans tests)."
+            self.tests_ok = True
+            self.tests_ran = True
             self._update_preflight_label(self.tests_summary, ok=None)
             self._start_generation_after_preflight()
             return
@@ -1179,7 +1270,7 @@ class CamouflageApp(App):
         self._refresh_diag_labels()
         prevent_sleep(True)
         self.status("Génération en cours…", ok=True)
-        self.log(f"Démarrage : {count} camouflage(s)")
+        self.log(f"Démarrage : {count} camouflage(s) | sortie={self.current_output_dir}")
         self._refresh_controls_state()
         fut = self.async_runner.submit(self._async_worker_generate(count))
         self.current_future = fut
@@ -1247,35 +1338,79 @@ class CamouflageApp(App):
                     self.total_attempts = total_attempts
                     seed = camo.build_seed(target_index, local_attempt, base_seed=camo.DEFAULT_BASE_SEED)
                     self.update_live_stage("génération backend", target_index, local_attempt, seed)
-                    candidate = await camo.async_generate_candidate_from_seed(seed)
-                    self.update_live_stage("validation", target_index, local_attempt, seed, pil_img=candidate.image)
-                    valid = await camo.async_validate_candidate_result(candidate)
-                    scores = extract_backend_scores(candidate.metrics)
+                    candidate = await async_generate_candidate_from_seed(seed)
+                    valid = await async_validate_candidate_result(candidate)
+                    scores = extract_backend_scores(candidate.ratios, candidate.metrics)
                     silhouette_img = await asyncio.to_thread(silhouette_projection_image, rgb_image_to_index_canvas(candidate.image))
                     self.update_preview(candidate.image, silhouette_img)
                     await self._register_live_diag(candidate, target_index, local_attempt, valid)
-                    self._update_attempt_status(target_index, local_attempt, total_attempts, seed, target_count, len(rows) + (1 if valid else 0), self.diag_rejects, valid, candidate.ratios, scores, candidate.metrics)
+
+                    metrics_text = (
+                        f"bd {scores['boundary_density']:.4f} | "
+                        f"miroir {scores['mirror_similarity']:.4f} | "
+                        f"bord {scores['edge_contact_ratio']:.4f}"
+                    )
 
                     if not valid:
-                        self.update_live_stage("rejeté", target_index, local_attempt, seed, pil_img=candidate.image)
-                        self.log(f"[img={target_index:03d} essai={local_attempt:04d}] rejeté | SF={scores['score_final']:.3f}")
+                        self.update_live_stage("rejeté", target_index, local_attempt, seed, metrics_text=metrics_text, pil_img=candidate.image)
+                        self._update_attempt_status(
+                            target_index,
+                            local_attempt,
+                            total_attempts,
+                            seed,
+                            target_count,
+                            self.accepted_count,
+                            self.diag_rejects,
+                            False,
+                            candidate.ratios,
+                            scores,
+                            candidate.metrics,
+                        )
+                        self.log(
+                            f"[img={target_index:03d} essai={local_attempt:04d}] rejeté | "
+                            f"MAE={scores['ratio_mae']:.6f} | bd={scores['boundary_density']:.4f}"
+                        )
                         await self._adaptive_pause()
                         await asyncio.sleep(0)
                         continue
 
                     filename = self.current_output_dir / f"camouflage_{target_index:03d}.png"
-                    self.update_live_stage("export image", target_index, local_attempt, seed, pil_img=candidate.image)
-                    await camo.async_save_candidate_image(candidate, filename)
-                    record = CandidateRecord(index=target_index, seed=candidate.seed, local_attempt=local_attempt, global_attempt=total_attempts, image_path=filename, metrics=dict(candidate.metrics), ratios=candidate.ratios.copy())
+                    self.update_live_stage("export image", target_index, local_attempt, seed, metrics_text=metrics_text, pil_img=candidate.image)
+                    await async_save_candidate_image(candidate, filename)
+                    record = CandidateRecord(
+                        index=target_index,
+                        seed=candidate.seed,
+                        local_attempt=local_attempt,
+                        global_attempt=total_attempts,
+                        image_path=filename,
+                        metrics={k: float(v) for k, v in candidate.metrics.items()},
+                        ratios=candidate.ratios.copy(),
+                    )
                     self.best_records.append(record)
-                    self.best_records.sort(key=lambda r: float(r.metrics.get("visual_score_final", 0.0)), reverse=True)
+                    self.best_records.sort(key=candidate_rank_key)
                     row = camo.candidate_row(target_index, local_attempt, total_attempts, candidate)
                     row["image_path"] = str(filename)
                     rows.append(row)
                     self.accepted_count = len(rows)
                     self.update_progress(len(rows), target_count)
-                    self.update_live_stage("accepté", target_index, local_attempt, seed, pil_img=candidate.image)
-                    self.log(f"[img={target_index:03d}] accepté -> {filename.name} | SF={scores['score_final']:.3f} | militaire={scores['military_score']:.3f}")
+                    self.update_live_stage("accepté", target_index, local_attempt, seed, metrics_text=metrics_text, pil_img=candidate.image)
+                    self._update_attempt_status(
+                        target_index,
+                        local_attempt,
+                        total_attempts,
+                        seed,
+                        target_count,
+                        self.accepted_count,
+                        self.diag_rejects,
+                        True,
+                        candidate.ratios,
+                        scores,
+                        candidate.metrics,
+                    )
+                    self.log(
+                        f"[img={target_index:03d}] accepté -> {filename.name} | "
+                        f"MAE={scores['ratio_mae']:.6f} | olive={scores['largest_olive_component_ratio']:.4f}"
+                    )
                     self.reload_gallery()
                     await self._adaptive_pause()
                     await asyncio.sleep(0)
@@ -1295,21 +1430,27 @@ class CamouflageApp(App):
             verdict = "accepté" if accepted else "rejeté"
             self.attempt_text.text = f"Image {target_index:03d} | essai {attempt_idx:04d} | total {global_attempt:06d} | seed {seed} | {verdict}"
         if self.color_text is not None:
-            self.color_text.text = f"C {rs[camo.IDX_COYOTE]*100:.2f}% | O {rs[camo.IDX_OLIVE]*100:.2f}% | T {rs[camo.IDX_TERRE]*100:.2f}% | G {rs[camo.IDX_GRIS]*100:.2f}%"
+            self.color_text.text = f"C {rs[camo.IDX_COYOTE]*100:.4f}% | O {rs[camo.IDX_OLIVE]*100:.4f}% | T {rs[camo.IDX_TERRE]*100:.4f}% | G {rs[camo.IDX_GRIS]*100:.4f}%"
         if self.score_text is not None:
-            self.score_text.text = f"Score {scores['score_final']:.3f} | ratio {scores['score_ratio']:.3f} | silhouette {scores['score_silhouette']:.3f} | contour {scores['score_contour']:.3f}"
+            self.score_text.text = (
+                f"MAE ratio {scores['ratio_mae']:.6f} | "
+                f"max abs {scores['ratio_max_abs']:.6f} | "
+                f"olive comp. {scores['largest_olive_component_ratio']:.4f} | "
+                f"miroir {scores['mirror_similarity']:.4f}"
+            )
         if self.extra_text is not None:
-            self.extra_text.text = f"olive conn. {metrics.get('largest_olive_component_ratio', 0.0):.3f} | centre {metrics.get('center_empty_ratio', 0.0):.3f} | limites {metrics.get('boundary_density', 0.0):.3f} | miroir {metrics.get('mirror_similarity', 0.0):.3f}"
+            self.extra_text.text = (
+                f"bd {scores['boundary_density']:.4f} | "
+                f"bd/4 {scores['boundary_density_small']:.4f} | "
+                f"bd/8 {scores['boundary_density_tiny']:.4f} | "
+                f"bord {scores['edge_contact_ratio']:.4f}"
+            )
         if self.struct_text is not None:
             self.struct_text.text = (
-                f"terre macro {metrics.get('macro_terre_visible_ratio', 0.0):.3f} | "
-                f"gris macro {metrics.get('macro_gris_visible_ratio', 0.0):.3f} | "
-                f"continuité brune {metrics.get('central_brown_continuity', 0.0):.3f} | "
-                f"militaire {metrics.get('visual_military_score', 0.0):.3f}"
+                f"overscan {safe_metric(metrics, 'overscan'):.4f} | "
+                f"shift {safe_metric(metrics, 'shift_strength'):.4f} | "
+                f"px/cm {safe_metric(metrics, 'px_per_cm'):.4f}"
             )
-
-    async def _async_write_report(self, rows: List[dict]) -> Path:
-        return await camo.async_write_report(rows, self.current_output_dir, filename=REPORT_NAME)
 
     async def _async_export_best_of(self, top_k: int) -> Path:
         best_dir = self.current_output_dir / BEST_DIR_NAME
@@ -1322,24 +1463,27 @@ class CamouflageApp(App):
                     pass
         rows: List[dict] = []
         for rank, rec in enumerate(self.best_records[:top_k], start=1):
-            dst = best_dir / f"best_{rank:03d}_camouflage_{rec.index:03d}.png"
-            await asyncio.to_thread(shutil.copy2, rec.image_path, dst)
+            if rec.image_path.exists():
+                dst = best_dir / f"best_{rank:03d}_camouflage_{rec.index:03d}.png"
+                await asyncio.to_thread(shutil.copy2, rec.image_path, dst)
             rows.append({
                 "rank": rank,
                 "source_index": rec.index,
                 "seed": rec.seed,
                 "global_attempt": rec.global_attempt,
                 "attempts_for_this_image": rec.local_attempt,
-                "score_final": round(float(rec.metrics.get("visual_score_final", 0.0)), 5),
-                "score_ratio": round(float(rec.metrics.get("visual_score_ratio", 0.0)), 5),
-                "score_silhouette": round(float(rec.metrics.get("visual_score_silhouette", 0.0)), 5),
-                "score_contour": round(float(rec.metrics.get("visual_score_contour", 0.0)), 5),
-                "score_main": round(float(rec.metrics.get("visual_score_main", 0.0)), 5),
-                "military_score": round(float(rec.metrics.get("visual_military_score", 0.0)), 5),
-                "coyote_brown_pct": round(float(rec.ratios[camo.IDX_COYOTE] * 100), 2),
-                "vert_olive_pct": round(float(rec.ratios[camo.IDX_OLIVE] * 100), 2),
-                "terre_de_france_pct": round(float(rec.ratios[camo.IDX_TERRE] * 100), 2),
-                "vert_de_gris_pct": round(float(rec.ratios[camo.IDX_GRIS] * 100), 2),
+                "ratio_mae": round(float(np.mean(np.abs(rec.ratios - camo.TARGET))), 8),
+                "ratio_max_abs": round(float(np.max(np.abs(rec.ratios - camo.TARGET))), 8),
+                "largest_olive_component_ratio": round(safe_metric(rec.metrics, "largest_olive_component_ratio"), 6),
+                "boundary_density": round(safe_metric(rec.metrics, "boundary_density"), 6),
+                "boundary_density_small": round(safe_metric(rec.metrics, "boundary_density_small"), 6),
+                "boundary_density_tiny": round(safe_metric(rec.metrics, "boundary_density_tiny"), 6),
+                "mirror_similarity": round(safe_metric(rec.metrics, "mirror_similarity"), 6),
+                "edge_contact_ratio": round(safe_metric(rec.metrics, "edge_contact_ratio"), 6),
+                "coyote_brown_pct": round(float(rec.ratios[camo.IDX_COYOTE] * 100), 4),
+                "vert_olive_pct": round(float(rec.ratios[camo.IDX_OLIVE] * 100), 4),
+                "terre_de_france_pct": round(float(rec.ratios[camo.IDX_TERRE] * 100), 4),
+                "vert_de_gris_pct": round(float(rec.ratios[camo.IDX_GRIS] * 100), 4),
             })
         if rows:
             await asyncio.to_thread(self._write_csv_sync, best_dir / "best_of.csv", rows)
@@ -1356,8 +1500,8 @@ class CamouflageApp(App):
             writer.writerows(rows)
 
     async def _async_finish_success(self, rows: List[dict]):
-        report_path = await self._async_write_report(rows)
-        best_dir = await self._async_export_best_of(DEFAULT_TOP_K)
+        report_path = await async_write_report(rows, self.current_output_dir, filename=REPORT_NAME)
+        best_dir = await self._async_export_best_of(min(DEFAULT_TOP_K, len(self.best_records)))
         prevent_sleep(False)
         self.running = False
         self.stopping = False
@@ -1369,7 +1513,7 @@ class CamouflageApp(App):
         self._refresh_controls_state()
 
     async def _async_finish_stopped(self, rows: List[dict]):
-        report_path = await self._async_write_report(rows)
+        report_path = await async_write_report(rows, self.current_output_dir, filename=REPORT_NAME)
         if rows:
             await self._async_export_best_of(min(DEFAULT_TOP_K, len(rows)))
         prevent_sleep(False)
