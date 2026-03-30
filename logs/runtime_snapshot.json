@@ -1,5 +1,34 @@
 {
-  "attempt_history_tail": [],
+  "attempt_history_tail": [
+    {
+      "accepted": false,
+      "duration_s": 426.62597370147705,
+      "seed": 202603220001,
+      "target_index": 1,
+      "local_attempt": 1
+    },
+    {
+      "accepted": false,
+      "duration_s": 509.26011514663696,
+      "seed": 202603220003,
+      "target_index": 1,
+      "local_attempt": 3
+    },
+    {
+      "accepted": false,
+      "duration_s": 560.3713669776917,
+      "seed": 202603220002,
+      "target_index": 1,
+      "local_attempt": 2
+    },
+    {
+      "accepted": false,
+      "duration_s": 573.1310203075409,
+      "seed": 202603220004,
+      "target_index": 1,
+      "local_attempt": 4
+    }
+  ],
   "resource_history_tail": [
     {
       "ts": 1774866767.2399979,
@@ -10,6 +39,17 @@
       "system_available_mb": 13153.0703125,
       "system_total_mb": 32724.37890625,
       "disk_free_mb": 167807.08984375,
+      "machine_intensity": 0.94
+    },
+    {
+      "ts": 1774867340.9198518,
+      "cpu_count": 4.0,
+      "process_cpu_percent": 0.0,
+      "system_cpu_percent": 100.0,
+      "process_rss_mb": 561.76953125,
+      "system_available_mb": 9297.7421875,
+      "system_total_mb": 32724.37890625,
+      "disk_free_mb": 167806.7890625,
       "machine_intensity": 0.94
     }
   ],
@@ -220,6 +260,182 @@
             "system_available_mb": 13153.0703125,
             "system_total_mb": 32724.37890625,
             "disk_free_mb": 167807.08984375,
+            "machine_intensity": 0.94
+          },
+          "tuning": {
+            "max_workers": 4,
+            "attempt_batch_size": 4,
+            "parallel_attempts": true,
+            "machine_intensity": 0.94,
+            "reason": "resource_plan"
+          }
+        },
+        "decision": {}
+      }
+    },
+    {
+      "ts": 1774867193.9396155,
+      "level": "WARNING",
+      "source": "supervisor",
+      "message": "Tentative terminée",
+      "payload": {
+        "target_index": 1,
+        "local_attempt": 1,
+        "accepted": false,
+        "duration_s": 426.62597370147705,
+        "tuning": {
+          "max_workers": 4,
+          "attempt_batch_size": 4,
+          "parallel_attempts": true,
+          "machine_intensity": 0.94,
+          "reason": "resource_plan"
+        },
+        "decision": {},
+        "ratios": {
+          "coyote_brown": 0.32,
+          "vert_olive": 0.28,
+          "terre_de_france": 0.22,
+          "vert_de_gris": 0.18
+        },
+        "metrics_subset": {
+          "visual_score_final": null,
+          "macro_total_count": null,
+          "periphery_non_coyote_ratio": null
+        }
+      }
+    },
+    {
+      "ts": 1774867276.784131,
+      "level": "WARNING",
+      "source": "supervisor",
+      "message": "Tentative terminée",
+      "payload": {
+        "target_index": 1,
+        "local_attempt": 3,
+        "accepted": false,
+        "duration_s": 509.26011514663696,
+        "tuning": {
+          "max_workers": 4,
+          "attempt_batch_size": 4,
+          "parallel_attempts": true,
+          "machine_intensity": 0.94,
+          "reason": "resource_plan"
+        },
+        "decision": {},
+        "ratios": {
+          "coyote_brown": 0.32,
+          "vert_olive": 0.28,
+          "terre_de_france": 0.22,
+          "vert_de_gris": 0.18
+        },
+        "metrics_subset": {
+          "visual_score_final": null,
+          "macro_total_count": null,
+          "periphery_non_coyote_ratio": null
+        }
+      }
+    },
+    {
+      "ts": 1774867327.7732227,
+      "level": "WARNING",
+      "source": "supervisor",
+      "message": "Tentative terminée",
+      "payload": {
+        "target_index": 1,
+        "local_attempt": 2,
+        "accepted": false,
+        "duration_s": 560.3713669776917,
+        "tuning": {
+          "max_workers": 4,
+          "attempt_batch_size": 4,
+          "parallel_attempts": true,
+          "machine_intensity": 0.94,
+          "reason": "resource_plan"
+        },
+        "decision": {},
+        "ratios": {
+          "coyote_brown": 0.32,
+          "vert_olive": 0.28,
+          "terre_de_france": 0.22,
+          "vert_de_gris": 0.18
+        },
+        "metrics_subset": {
+          "visual_score_final": null,
+          "macro_total_count": null,
+          "periphery_non_coyote_ratio": null
+        }
+      }
+    },
+    {
+      "ts": 1774867340.8220131,
+      "level": "WARNING",
+      "source": "supervisor",
+      "message": "Tentative terminée",
+      "payload": {
+        "target_index": 1,
+        "local_attempt": 4,
+        "accepted": false,
+        "duration_s": 573.1310203075409,
+        "tuning": {
+          "max_workers": 4,
+          "attempt_batch_size": 4,
+          "parallel_attempts": true,
+          "machine_intensity": 0.94,
+          "reason": "resource_plan"
+        },
+        "decision": {},
+        "ratios": {
+          "coyote_brown": 0.32,
+          "vert_olive": 0.28,
+          "terre_de_france": 0.22,
+          "vert_de_gris": 0.18
+        },
+        "metrics_subset": {
+          "visual_score_final": null,
+          "macro_total_count": null,
+          "periphery_non_coyote_ratio": null
+        }
+      }
+    },
+    {
+      "ts": 1774867340.8413517,
+      "level": "INFO",
+      "source": "supervisor",
+      "message": "Événement batch_finished",
+      "payload": {
+        "payload": {
+          "target_index": 1,
+          "accepted": false,
+          "tuning": {
+            "max_workers": 4,
+            "attempt_batch_size": 4,
+            "parallel_attempts": true,
+            "machine_intensity": 0.94,
+            "reason": "resource_plan"
+          },
+          "next_local_attempt": 5
+        },
+        "decision": {}
+      }
+    },
+    {
+      "ts": 1774867340.9199424,
+      "level": "INFO",
+      "source": "supervisor",
+      "message": "Événement resource_snapshot",
+      "payload": {
+        "payload": {
+          "target_index": 1,
+          "local_attempt": 5,
+          "snapshot": {
+            "ts": 1774867340.9198518,
+            "cpu_count": 4.0,
+            "process_cpu_percent": 0.0,
+            "system_cpu_percent": 100.0,
+            "process_rss_mb": 561.76953125,
+            "system_available_mb": 9297.7421875,
+            "system_total_mb": 32724.37890625,
+            "disk_free_mb": 167806.7890625,
             "machine_intensity": 0.94
           },
           "tuning": {
