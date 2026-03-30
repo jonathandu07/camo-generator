@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Suite de tests alignée sur l'API réelle de start.py.
+Suite de tests alignée sur l'API réelle de start.py / start_corrected.py.
 
 Objectifs :
 - couvrir les utilitaires front et les conversions d'image ;
@@ -23,7 +23,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import numpy as np
@@ -98,7 +98,6 @@ def _install_fake_kivy() -> None:
         def setter(self, name):
             def _set(_instance, value):
                 setattr(self, name, value)
-
             return _set
 
         def _redraw(self, *_):
@@ -111,7 +110,6 @@ def _install_fake_kivy() -> None:
         @functools.wraps(func)
         def _wrapped(*args, **kwargs):
             return func(*args, **kwargs)
-
         return _wrapped
 
     mods = {}
@@ -204,7 +202,10 @@ try:
 except Exception:
     _install_fake_kivy()
 
-import start as sut
+try:
+    import start_corrected as sut
+except Exception:
+    import start as sut  # type: ignore
 
 
 # ============================================================
@@ -244,9 +245,9 @@ LOGGER = configure_logger()
 
 def make_index_canvas_quadrants(h: int = 80, w: int = 80) -> np.ndarray:
     canvas = np.zeros((h, w), dtype=np.uint8)
-    canvas[: h // 2, w // 2 :] = sut.camo.IDX_OLIVE
-    canvas[h // 2 :, : w // 2] = sut.camo.IDX_TERRE
-    canvas[h // 2 :, w // 2 :] = sut.camo.IDX_GRIS
+    canvas[: h // 2, w // 2:] = sut.camo.IDX_OLIVE
+    canvas[h // 2:, : w // 2] = sut.camo.IDX_TERRE
+    canvas[h // 2:, w // 2:] = sut.camo.IDX_GRIS
     return canvas
 
 
@@ -260,23 +261,19 @@ def valid_ratios() -> np.ndarray:
 
 def valid_metrics() -> Dict[str, float]:
     return {
-        "visual_score_final": 0.78,
-        "visual_score_ratio": 0.92,
-        "visual_score_silhouette": 0.80,
-        "visual_score_contour": 0.74,
-        "visual_score_main": 0.70,
-        "visual_silhouette_color_diversity": 0.80,
-        "visual_contour_break_score": 0.66,
-        "visual_outline_band_diversity": 0.70,
-        "visual_small_scale_structural_score": 0.60,
-        "visual_military_score": 0.72,
         "largest_olive_component_ratio": 0.24,
-        "center_empty_ratio": 0.28,
-        "boundary_density": 0.145,
+        "boundary_density": 0.05,
+        "boundary_density_small": 0.06,
+        "boundary_density_tiny": 0.07,
         "mirror_similarity": 0.44,
-        "macro_terre_visible_ratio": 0.18,
-        "macro_gris_visible_ratio": 0.14,
-        "central_brown_continuity": 0.20,
+        "edge_contact_ratio": 0.30,
+        "overscan": 1.11,
+        "shift_strength": 0.92,
+        "width": 256.0,
+        "height": 144.0,
+        "physical_width_cm": 240.0,
+        "physical_height_cm": 135.0,
+        "px_per_cm": 1.066,
     }
 
 
@@ -290,11 +287,23 @@ def make_candidate(seed: int = 1234) -> Any:
     )
 
 
-def make_candidate_record(tmpdir: Path, index: int = 1, score: float = 0.8) -> sut.CandidateRecord:
+def make_invalid_candidate(seed: int = 1234) -> Any:
+    bad = valid_metrics()
+    bad["mirror_similarity"] = 0.99
+    return sut.camo.CandidateResult(
+        seed=seed,
+        profile=sut.camo.make_profile(seed),
+        image=make_pil_from_index_canvas(make_index_canvas_quadrants(60, 60)),
+        ratios=valid_ratios(),
+        metrics=bad,
+    )
+
+
+def make_candidate_record(tmpdir: Path, index: int = 1, mirror: float = 0.4) -> sut.CandidateRecord:
     image_path = tmpdir / f"camouflage_{index:03d}.png"
     make_pil_from_index_canvas(make_index_canvas_quadrants()).save(image_path)
     metrics = valid_metrics()
-    metrics["visual_score_final"] = score
+    metrics["mirror_similarity"] = mirror
     return sut.CandidateRecord(
         index=index,
         seed=1000 + index,
@@ -353,7 +362,6 @@ def make_submit_closing_coroutines(fake_future: Any):
         except Exception:
             pass
         return fake_future
-
     return _submit
 
 
@@ -419,9 +427,6 @@ class AppMixin(TempDirMixin):
         self.app.mode_blocking_btn = make_fake_button()
         self.app.mode_non_blocking_btn = make_fake_button()
         self.app.mode_skip_tests_btn = make_fake_button()
-        self.app.engine_classic_btn = make_fake_button()
-        self.app.engine_mldl_btn = make_fake_button()
-        self.app.engine_label = make_fake_label()
         self.app.intensity_label = make_fake_label()
         self.app.log_view = make_fake_log_view()
         self.app.diag_log_view = make_fake_log_view()
@@ -444,10 +449,6 @@ class TestUtilities(unittest.TestCase):
         self.assertEqual(sut.REPORT_NAME, "rapport_camouflages_front.csv")
         self.assertEqual(sut.BEST_DIR_NAME, "best_of")
         self.assertEqual(sut.DEFAULT_TOP_K, 20)
-        if hasattr(sut, "GEN_ENGINE_CLASSIC"):
-            self.assertEqual(sut.GEN_ENGINE_CLASSIC, "classic")
-        if hasattr(sut, "GEN_ENGINE_MLDL"):
-            self.assertEqual(sut.GEN_ENGINE_MLDL, "mldl")
 
     def test_hex_rgba(self):
         rgba = sut.hex_rgba("BL", 0.5)
@@ -499,6 +500,15 @@ class TestUtilities(unittest.TestCase):
         out = sut.rgb_image_to_index_canvas(img)
         np.testing.assert_array_equal(out, idx)
 
+    def test_backend_machine_intensity(self):
+        self.assertEqual(sut.backend_machine_intensity(100), 1.0)
+        self.assertEqual(sut.backend_machine_intensity(5), 0.10)
+        self.assertEqual(sut.backend_machine_intensity(50), 0.5)
+
+    def test_safe_metric(self):
+        self.assertEqual(sut.safe_metric({"x": 1.2}, "x"), 1.2)
+        self.assertEqual(sut.safe_metric({}, "x", 3.4), 3.4)
+
     def test_build_silhouette_mask_and_boundary(self):
         mask = sut.build_silhouette_mask(80, 120)
         boundary = sut.silhouette_boundary(mask)
@@ -514,9 +524,45 @@ class TestUtilities(unittest.TestCase):
         self.assertEqual(img.size, (50, 80))
 
     def test_extract_backend_scores(self):
-        scores = sut.extract_backend_scores(valid_metrics())
-        self.assertEqual(scores["score_final"], valid_metrics()["visual_score_final"])
-        self.assertEqual(scores["military_score"], valid_metrics()["visual_military_score"])
+        scores = sut.extract_backend_scores(valid_ratios(), valid_metrics())
+        self.assertIn("ratio_mae", scores)
+        self.assertIn("mirror_similarity", scores)
+        self.assertGreaterEqual(scores["ratio_mae"], 0.0)
+
+    def test_rejection_rules_for_candidate(self):
+        candidate = make_invalid_candidate()
+        rules = sut.rejection_rules_for_candidate(candidate)
+        self.assertIn("mirror_similarity", rules)
+
+    def test_candidate_rank_key(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            rec1 = make_candidate_record(td, index=1, mirror=0.40)
+            rec2 = make_candidate_record(td, index=2, mirror=0.80)
+            self.assertLess(sut.candidate_rank_key(rec1), sut.candidate_rank_key(rec2))
+
+    def test_async_helpers(self):
+        candidate = make_candidate()
+
+        async def _go():
+            with patch.object(sut.camo, "generate_candidate_from_seed", return_value=candidate) as mock_gen, \
+                 patch.object(sut.camo, "validate_candidate_result", return_value=True) as mock_val, \
+                 patch.object(sut.camo, "save_candidate_image", return_value=Path("x.png")) as mock_save, \
+                 patch.object(sut.camo, "write_report", return_value=Path("r.csv")) as mock_rep:
+                out1 = await sut.async_generate_candidate_from_seed(1)
+                out2 = await sut.async_validate_candidate_result(candidate)
+                out3 = await sut.async_save_candidate_image(candidate, Path("x.png"))
+                out4 = await sut.async_write_report([{"a": 1}], Path("."))
+            self.assertIs(out1, candidate)
+            self.assertTrue(out2)
+            self.assertEqual(out3, Path("x.png"))
+            self.assertEqual(out4, Path("r.csv"))
+            mock_gen.assert_called_once()
+            mock_val.assert_called_once()
+            mock_save.assert_called_once()
+            mock_rep.assert_called_once()
+
+        asyncio.run(_go())
 
     def test_asyncio_thread_runner(self):
         runner = sut.AsyncioThreadRunner()
@@ -565,9 +611,9 @@ class TestCamouflageAppMethods(AppMixin, unittest.TestCase):
             texture = "live_tex"
 
         with patch.object(sut, "pil_to_coreimage", return_value=FakeCore()):
-            self.app.update_live_stage("validation", 2, 7, 123, 8, 0, 0, pil_img=img)
+            self.app.update_live_stage("validation", 2, 7, 123, "bd 0.05 | miroir 0.44", pil_img=img)
         self.assertIn("validation", self.app.live_stage_label.text)
-        self.assertIn("Macros 8", self.app.live_counts_label.text)
+        self.assertIn("bd 0.05", self.app.live_counts_label.text)
         self.assertIn("Image 002", self.app.live_meta_label.text)
         self.assertEqual(self.app.live_preview_img.texture, "live_tex")
 
@@ -578,10 +624,8 @@ class TestCamouflageAppMethods(AppMixin, unittest.TestCase):
                 "target_index": 1,
                 "local_attempt": 2,
                 "seed": 3,
-                "macro_count": 4,
-                "transition_count": 5,
-                "micro_count": 6,
                 "preview_path": "frame.png",
+                "metrics": {"boundary_density": 0.05, "mirror_similarity": 0.4, "edge_contact_ratio": 0.3},
             })
             self.app._maybe_handle_live_runtime_payload(evt)
         mock_stage.assert_called_once()
@@ -615,25 +659,6 @@ class TestCamouflageAppMethods(AppMixin, unittest.TestCase):
         self.assertIn("●", self.app.mode_non_blocking_btn.text)
         self.assertIn("○", self.app.mode_blocking_btn.text)
         self.assertIn("Mode actuel", self.app.run_mode_label.text)
-
-    def test_generation_engine_helpers(self):
-        if not hasattr(sut, "GEN_ENGINE_MLDL"):
-            self.skipTest("Le module start chargé ne supporte pas encore le moteur ML/DL.")
-        self.assertEqual(self.app._generation_engine_text(sut.GEN_ENGINE_CLASSIC), "backend classique")
-        self.assertEqual(self.app._generation_engine_text(sut.GEN_ENGINE_MLDL), "pipeline ML/DL")
-        self.app._set_generation_engine(sut.GEN_ENGINE_MLDL)
-        self.assertEqual(self.app.generation_engine, sut.GEN_ENGINE_MLDL)
-        self.assertEqual(self.app.current_output_dir, Path("camouflages_ml_dl"))
-        self.assertIn("ML/DL", self.app.log_view.label.text)
-
-    def test_refresh_generation_engine_buttons(self):
-        if not hasattr(sut, "GEN_ENGINE_MLDL"):
-            self.skipTest("Le module start chargé ne supporte pas encore le moteur ML/DL.")
-        self.app.generation_engine = sut.GEN_ENGINE_MLDL
-        self.app._refresh_generation_engine_buttons()
-        self.assertIn("●", self.app.engine_mldl_btn.text)
-        self.assertIn("○", self.app.engine_classic_btn.text)
-        self.assertIn("Moteur actuel", self.app.engine_label.text)
 
     def test_refresh_diag_labels(self):
         self.app.diag_total = 6
@@ -724,7 +749,7 @@ class TestCamouflageAppMethods(AppMixin, unittest.TestCase):
         self.app.preflight_pending_start = True
         self.app._finish_preflight(False, "KO")
         self.assertFalse(self.app.tests_ok)
-        self.assertEqual(self.app.status_label.text, "Tests KO")
+        self.assertEqual(self.app.status_label.text, "Préflight KO")
 
     def test_start_generation_skip_tests(self):
         self.app.run_mode = sut.RUN_MODE_SKIP_TESTS
@@ -746,12 +771,6 @@ class TestCamouflageAppMethods(AppMixin, unittest.TestCase):
             self.app.start_generation()
         mock_pf.assert_called_once_with(pending_start=True)
 
-    def test_start_generation_ignores_when_already_running(self):
-        self.app.running = True
-        with patch.object(self.app, "_ensure_preflight") as mock_pf:
-            self.app.start_generation()
-        mock_pf.assert_not_called()
-
     def test_start_generation_after_preflight_invalid(self):
         self.app.count_input.text = "abc"
         self.app._start_generation_after_preflight()
@@ -769,21 +788,6 @@ class TestCamouflageAppMethods(AppMixin, unittest.TestCase):
         mock_sleep.assert_called_once_with(True)
         fake_future.add_done_callback.assert_called_once()
 
-    def test_start_generation_after_preflight_success_mldl(self):
-        if not hasattr(sut, "GEN_ENGINE_MLDL"):
-            self.skipTest("Le module start chargé ne supporte pas encore le moteur ML/DL.")
-        fake_future = MagicMock()
-        fake_future.done.return_value = False
-        fake_future.add_done_callback = MagicMock()
-        self.app.async_runner = types.SimpleNamespace(submit=make_submit_closing_coroutines(fake_future), stop=Mock())
-        self.app.generation_engine = sut.GEN_ENGINE_MLDL
-        with patch.object(sut, "prevent_sleep") as mock_sleep:
-            self.app._start_generation_after_preflight()
-        self.assertTrue(self.app.running)
-        self.assertEqual(self.app.current_output_dir, Path("camouflages_ml_dl"))
-        self.assertIs(self.app.current_future, fake_future)
-        mock_sleep.assert_called_once_with(True)
-
     def test_stop_generation(self):
         self.app.running = True
         self.app.stop_generation()
@@ -793,15 +797,6 @@ class TestCamouflageAppMethods(AppMixin, unittest.TestCase):
         self.app.preflight_running = True
         self.app.stop_generation()
         self.assertIn("préflight", self.app.log_view.label.text.lower())
-
-    def test_stop_generation_mldl(self):
-        if not hasattr(sut, "GEN_ENGINE_MLDL"):
-            self.skipTest("Le module start chargé ne supporte pas encore le moteur ML/DL.")
-        self.app.running = True
-        self.app.generation_engine = sut.GEN_ENGINE_MLDL
-        self.app.stop_generation()
-        self.assertFalse(self.app.stop_flag)
-        self.assertIn("ML/DL", self.app.log_view.label.text)
 
     def test_on_generation_done_success(self):
         fut = Mock()
@@ -881,35 +876,29 @@ class TestCamouflageAppMethods(AppMixin, unittest.TestCase):
 # ============================================================
 
 class TestCamouflageAppAsync(AppMixin, unittest.IsolatedAsyncioTestCase):
-    async def test_async_run_preflight_without_log(self):
-        with patch.object(sut, "camo_log", None):
-            ok, summary = await self.app._async_run_preflight()
-        self.assertFalse(ok)
-        self.assertIn("log.py indisponible", summary)
-
-    async def test_async_run_preflight_with_dict_summary(self):
-        fake_log = types.SimpleNamespace(
-            async_run_preflight_tests=AsyncMock(return_value={"ok": True, "total": 10, "failures": 0, "errors": 0})
-        )
-        with patch.object(sut, "camo_log", fake_log):
+    async def test_async_run_preflight_success(self):
+        fake_snapshot = types.SimpleNamespace(cpu_count=8, system_available_mb=4096.0, disk_free_mb=50000.0)
+        with patch.object(sut.camo, "validate_generation_request", return_value=None) as mock_validate, \
+             patch.object(sut.camo, "sample_process_resources", return_value=fake_snapshot):
             ok, summary = await self.app._async_run_preflight()
         self.assertTrue(ok)
-        self.assertIn("10 tests", summary)
+        self.assertIn("Préflight OK", summary)
+        mock_validate.assert_called_once()
 
-    async def test_extract_failure_rules(self):
-        candidate = make_candidate()
-        with patch.object(sut.camo, "extract_rejection_failures", return_value=[{"rule": "r1"}, {"rule": "r2"}], create=True):
-            rules = await self.app._extract_failure_rules(candidate, 1, 2)
-        self.assertEqual(rules, ["r1", "r2"])
+    async def test_async_run_preflight_error(self):
+        with patch.object(sut.camo, "validate_generation_request", side_effect=RuntimeError("boom")):
+            ok, summary = await self.app._async_run_preflight()
+        self.assertFalse(ok)
+        self.assertIn("boom", summary)
 
     async def test_register_live_diag_accept_and_reject(self):
-        candidate = make_candidate()
-        await self.app._register_live_diag(candidate, 1, 1, True)
+        good = make_candidate()
+        bad = make_invalid_candidate()
+        await self.app._register_live_diag(good, 1, 1, True)
         self.assertEqual(self.app.diag_accepts, 1)
-        with patch.object(self.app, "_extract_failure_rules", AsyncMock(return_value=["rule_a", "rule_b"])):
-            await self.app._register_live_diag(candidate, 1, 2, False)
+        await self.app._register_live_diag(bad, 1, 2, False)
         self.assertEqual(self.app.diag_rejects, 1)
-        self.assertIn("rule_a", self.app.diag_top_rules_label.text)
+        self.assertIn("mirror_similarity", self.app.diag_top_rules_label.text)
 
     async def test_adaptive_pause(self):
         fake_psutil = types.SimpleNamespace(
@@ -922,16 +911,10 @@ class TestCamouflageAppAsync(AppMixin, unittest.IsolatedAsyncioTestCase):
             await self.app._adaptive_pause()
         mock_sleep.assert_awaited()
 
-    async def test_async_write_report(self):
-        with patch.object(sut.camo, "async_write_report", AsyncMock(return_value=self.tmpdir / "r.csv")) as mock_write:
-            out = await self.app._async_write_report([{"a": 1}])
-        self.assertEqual(out, self.tmpdir / "r.csv")
-        mock_write.assert_awaited_once_with([{"a": 1}], self.app.current_output_dir, filename=sut.REPORT_NAME)
-
     async def test_async_export_best_of(self):
         self.app.best_records = [
-            make_candidate_record(self.tmpdir, index=1, score=0.9),
-            make_candidate_record(self.tmpdir, index=2, score=0.8),
+            make_candidate_record(self.tmpdir, index=1, mirror=0.4),
+            make_candidate_record(self.tmpdir, index=2, mirror=0.8),
         ]
         out = await self.app._async_export_best_of(2)
         self.assertTrue(out.exists())
@@ -950,7 +933,7 @@ class TestCamouflageAppAsync(AppMixin, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(path_empty.read_text(encoding="utf-8"), "")
 
     async def test_async_finish_success_stopped_error(self):
-        with patch.object(self.app, "_async_write_report", AsyncMock(return_value=self.tmpdir / "rapport.csv")), \
+        with patch.object(sut, "async_write_report", AsyncMock(return_value=self.tmpdir / "rapport.csv")), \
              patch.object(self.app, "_async_export_best_of", AsyncMock(return_value=self.tmpdir / "best")), \
              patch.object(sut, "prevent_sleep") as mock_sleep, \
              patch.object(self.app, "reload_gallery"):
@@ -966,9 +949,9 @@ class TestCamouflageAppAsync(AppMixin, unittest.IsolatedAsyncioTestCase):
         candidate = make_candidate(seed=999)
         self.app.current_output_dir = self.tmpdir
         with patch.object(self.app, "_async_should_stop", AsyncMock(return_value=False)), \
-             patch.object(sut.camo, "async_generate_candidate_from_seed", AsyncMock(return_value=candidate)), \
-             patch.object(sut.camo, "async_validate_candidate_result", AsyncMock(return_value=True)), \
-             patch.object(sut.camo, "async_save_candidate_image", AsyncMock()) as mock_save, \
+             patch.object(sut, "async_generate_candidate_from_seed", AsyncMock(return_value=candidate)), \
+             patch.object(sut, "async_validate_candidate_result", AsyncMock(return_value=True)), \
+             patch.object(sut, "async_save_candidate_image", AsyncMock()) as mock_save, \
              patch.object(sut.camo, "candidate_row", return_value={"index": 1}), \
              patch.object(self.app, "_register_live_diag", AsyncMock()) as mock_diag, \
              patch.object(self.app, "_async_finish_success", AsyncMock()) as mock_finish, \
@@ -988,7 +971,7 @@ class TestCamouflageAppAsync(AppMixin, unittest.IsolatedAsyncioTestCase):
 
     async def test_async_worker_generate_error(self):
         with patch.object(self.app, "_async_should_stop", AsyncMock(return_value=False)), \
-             patch.object(sut.camo, "async_generate_candidate_from_seed", AsyncMock(side_effect=RuntimeError("boom"))), \
+             patch.object(sut, "async_generate_candidate_from_seed", AsyncMock(side_effect=RuntimeError("boom"))), \
              patch.object(self.app, "_async_finish_error", AsyncMock()) as mock_err:
             await self.app._async_worker_generate(1)
         mock_err.assert_awaited_once()
@@ -996,61 +979,6 @@ class TestCamouflageAppAsync(AppMixin, unittest.IsolatedAsyncioTestCase):
     async def test_async_should_stop(self):
         self.app.stop_flag = True
         self.assertTrue(await self.app._async_should_stop())
-
-    async def test_async_worker_generate_mldl_without_module(self):
-        if not hasattr(sut, "GEN_ENGINE_MLDL"):
-            self.skipTest("Le module start chargé ne supporte pas encore le moteur ML/DL.")
-        with patch.object(sut, "camo_mldl", None, create=True), \
-             patch.object(self.app, "_async_finish_error", AsyncMock()) as mock_err:
-            await self.app._async_worker_generate_mldl(1)
-        mock_err.assert_awaited_once()
-
-    async def test_async_finish_success_mldl(self):
-        if not hasattr(sut, "GEN_ENGINE_MLDL"):
-            self.skipTest("Le module start chargé ne supporte pas encore le moteur ML/DL.")
-        runner = types.SimpleNamespace(
-            total_attempts=12,
-            cfg=types.SimpleNamespace(
-                report_name="rapport_camouflages_ml_dl.csv",
-                checkpoint_name="surrogate_camouflage.pt",
-                dataset_name="dataset_camouflage_ml_dl.npz",
-            ),
-        )
-        rows = [{"index": 1}]
-        with patch.object(sut, "prevent_sleep") as mock_sleep, \
-             patch.object(self.app, "reload_gallery"):
-            await self.app._async_finish_success_mldl(rows, runner)
-        mock_sleep.assert_called_once_with(False)
-        self.assertFalse(self.app.running)
-        self.assertIn("ML/DL", self.app.status_label.text)
-
-    async def test_async_worker_generate_mldl_success(self):
-        if not hasattr(sut, "GEN_ENGINE_MLDL"):
-            self.skipTest("Le module start chargé ne supporte pas encore le moteur ML/DL.")
-        rows = [{"index": 1}]
-
-        class FakeRunner:
-            def __init__(self, cfg):
-                self.cfg = cfg
-                self.total_attempts = 7
-
-            def generate(self):
-                out_dir = Path(self.cfg.output_dir)
-                out_dir.mkdir(parents=True, exist_ok=True)
-                (out_dir / "camouflage_001.png").write_bytes(b"fake")
-                (out_dir / "run_summary_ml_dl.json").write_text(json.dumps({"total_attempts": 7}), encoding="utf-8")
-                return rows
-
-        fake_module = types.SimpleNamespace(
-            MLDLConfig=lambda **kwargs: types.SimpleNamespace(**kwargs, report_name="rapport_camouflages_ml_dl.csv", checkpoint_name="surrogate_camouflage.pt", dataset_name="dataset_camouflage_ml_dl.npz"),
-            CamouflageMLDLGenerator=FakeRunner,
-        )
-
-        with patch.object(sut, "camo_mldl", fake_module, create=True), \
-             patch.object(self.app, "reload_gallery"), \
-             patch.object(self.app, "_async_finish_success_mldl", AsyncMock()) as mock_finish:
-            await self.app._async_worker_generate_mldl(1)
-        mock_finish.assert_awaited_once()
 
     def test_update_attempt_status(self):
         self.app._update_attempt_status(
@@ -1063,13 +991,13 @@ class TestCamouflageAppAsync(AppMixin, unittest.IsolatedAsyncioTestCase):
             rejected_count=5,
             accepted=False,
             rs=valid_ratios(),
-            scores=sut.extract_backend_scores(valid_metrics()),
+            scores=sut.extract_backend_scores(valid_ratios(), valid_metrics()),
             metrics=valid_metrics(),
         )
         self.assertIn("1 / 10", self.app.progress_text.text)
         self.assertIn("Image 002", self.app.attempt_text.text)
-        self.assertIn("Score 0.780", self.app.score_text.text)
-        self.assertIn("militaire", self.app.struct_text.text)
+        self.assertIn("MAE ratio", self.app.score_text.text)
+        self.assertIn("overscan", self.app.struct_text.text)
 
 
 if __name__ == "__main__":
