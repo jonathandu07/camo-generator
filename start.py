@@ -33,6 +33,7 @@ from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
 import numpy as np
 from PIL import Image as PILImage
 from PIL import ImageDraw
+from PIL import ImageFilter
 
 try:
     import psutil
@@ -238,6 +239,10 @@ def make_thumbnail(pil_img: PILImage.Image, size: Tuple[int, int]) -> PILImage.I
     return canvas
 
 
+DEFAULT_UI_MOTIF_SCALE = float(getattr(camo, "DEFAULT_MOTIF_SCALE", 0.58))
+DEFAULT_BACKEND_MACHINE_INTENSITY = float(getattr(camo, "DEFAULT_MACHINE_INTENSITY", 0.98))
+
+
 def palette_map() -> Dict[Tuple[int, int, int], int]:
     return {
         tuple(camo.RGB[camo.IDX_COYOTE].tolist()): camo.IDX_COYOTE,
@@ -367,52 +372,100 @@ async def async_write_report(rows: List[dict], output_dir: Path, filename: str =
 # ============================================================
 
 
-def build_silhouette_mask(width: int, height: int) -> np.ndarray:
-    img = PILImage.new("L", (width, height), 0)
+def build_silhouette_alpha(width: int, height: int, supersample: int = 4) -> np.ndarray:
+    width = max(32, int(width))
+    height = max(32, int(height))
+    ss = max(2, int(supersample))
+    W = width * ss
+    H = height * ss
+    cx = W // 2
+
+    img = PILImage.new("L", (W, H), 0)
     draw = ImageDraw.Draw(img)
 
-    head_w = int(width * 0.18)
-    head_h = int(height * 0.12)
-    head_x1 = (width - head_w) // 2
-    head_y1 = int(height * 0.05)
-    draw.ellipse([head_x1, head_y1, head_x1 + head_w, head_y1 + head_h], fill=255)
+    def rr(box: Tuple[int, int, int, int], radius: int, fill: int = 255) -> None:
+        x1, y1, x2, y2 = [int(v) for v in box]
+        draw.rounded_rectangle([x1, y1, x2, y2], radius=max(1, int(radius)), fill=fill)
 
-    torso_w = int(width * 0.34)
-    torso_h = int(height * 0.38)
-    torso_x1 = (width - torso_w) // 2
-    torso_y1 = int(height * 0.16)
-    draw.rounded_rectangle([torso_x1, torso_y1, torso_x1 + torso_w, torso_y1 + torso_h], radius=int(width * 0.03), fill=255)
+    def poly(points: List[Tuple[int, int]], fill: int = 255) -> None:
+        draw.polygon([(int(x), int(y)) for x, y in points], fill=fill)
 
-    shoulder_w = int(width * 0.58)
-    shoulder_h = int(height * 0.10)
-    shoulder_x1 = (width - shoulder_w) // 2
-    shoulder_y1 = int(height * 0.14)
-    draw.rounded_rectangle([shoulder_x1, shoulder_y1, shoulder_x1 + shoulder_w, shoulder_y1 + shoulder_h], radius=int(width * 0.025), fill=255)
+    helmet_w = int(W * 0.19)
+    helmet_h = int(H * 0.10)
+    helmet_y1 = int(H * 0.04)
+    rr((cx - helmet_w // 2, helmet_y1, cx + helmet_w // 2, helmet_y1 + helmet_h), radius=int(helmet_w * 0.36))
 
-    arm_w = int(width * 0.11)
-    arm_h = int(height * 0.32)
-    left_arm_x1 = int(width * 0.15)
-    right_arm_x1 = width - left_arm_x1 - arm_w
-    arm_y1 = int(height * 0.20)
-    draw.rounded_rectangle([left_arm_x1, arm_y1, left_arm_x1 + arm_w, arm_y1 + arm_h], radius=int(width * 0.02), fill=255)
-    draw.rounded_rectangle([right_arm_x1, arm_y1, right_arm_x1 + arm_w, arm_y1 + arm_h], radius=int(width * 0.02), fill=255)
+    head_w = int(W * 0.15)
+    head_h = int(H * 0.095)
+    head_y1 = int(H * 0.055)
+    rr((cx - head_w // 2, head_y1, cx + head_w // 2, head_y1 + head_h), radius=int(head_w * 0.45))
 
-    pelvis_w = int(width * 0.30)
-    pelvis_h = int(height * 0.10)
-    pelvis_x1 = (width - pelvis_w) // 2
-    pelvis_y1 = int(height * 0.51)
-    draw.rounded_rectangle([pelvis_x1, pelvis_y1, pelvis_x1 + pelvis_w, pelvis_y1 + pelvis_h], radius=int(width * 0.02), fill=255)
+    neck_w = int(W * 0.055)
+    neck_h = int(H * 0.030)
+    neck_y1 = int(H * 0.145)
+    rr((cx - neck_w // 2, neck_y1, cx + neck_w // 2, neck_y1 + neck_h), radius=int(neck_w * 0.35))
 
-    leg_w = int(width * 0.12)
-    leg_h = int(height * 0.32)
-    leg_gap = int(width * 0.04)
-    left_leg_x1 = (width // 2) - leg_gap // 2 - leg_w
-    right_leg_x1 = (width // 2) + leg_gap // 2
-    leg_y1 = int(height * 0.58)
-    draw.rounded_rectangle([left_leg_x1, leg_y1, left_leg_x1 + leg_w, leg_y1 + leg_h], radius=int(width * 0.018), fill=255)
-    draw.rounded_rectangle([right_leg_x1, leg_y1, right_leg_x1 + leg_w, leg_y1 + leg_h], radius=int(width * 0.018), fill=255)
+    torso_top_y = int(H * 0.17)
+    torso_bottom_y = int(H * 0.52)
+    shoulder_half = int(W * 0.195)
+    waist_half = int(W * 0.120)
+    poly([
+        (cx - shoulder_half, torso_top_y),
+        (cx + shoulder_half, torso_top_y),
+        (cx + waist_half, torso_bottom_y),
+        (cx - waist_half, torso_bottom_y),
+    ])
+    rr((cx - int(W * 0.145), int(H * 0.22), cx + int(W * 0.145), int(H * 0.47)), radius=int(W * 0.038))
 
-    return np.array(img, dtype=np.uint8) > 0
+    left_arm = [
+        (cx - int(W * 0.17), int(H * 0.18)),
+        (cx - int(W * 0.29), int(H * 0.24)),
+        (cx - int(W * 0.25), int(H * 0.43)),
+        (cx - int(W * 0.17), int(H * 0.50)),
+        (cx - int(W * 0.12), int(H * 0.46)),
+        (cx - int(W * 0.16), int(H * 0.25)),
+    ]
+    right_arm = [(W - x, y) for x, y in left_arm]
+    poly(left_arm)
+    poly(right_arm)
+    rr((cx - int(W * 0.30), int(H * 0.23), cx - int(W * 0.23), int(H * 0.45)), radius=int(W * 0.018))
+    rr((cx + int(W * 0.23), int(H * 0.23), cx + int(W * 0.30), int(H * 0.45)), radius=int(W * 0.018))
+
+    pelvis_w = int(W * 0.26)
+    pelvis_h = int(H * 0.09)
+    pelvis_y1 = int(H * 0.50)
+    rr((cx - pelvis_w // 2, pelvis_y1, cx + pelvis_w // 2, pelvis_y1 + pelvis_h), radius=int(W * 0.030))
+
+    left_thigh = [
+        (cx - int(W * 0.09), int(H * 0.57)),
+        (cx - int(W * 0.02), int(H * 0.57)),
+        (cx - int(W * 0.03), int(H * 0.77)),
+        (cx - int(W * 0.10), int(H * 0.77)),
+    ]
+    right_thigh = [(W - x, y) for x, y in left_thigh]
+    poly(left_thigh)
+    poly(right_thigh)
+
+    left_calf = [
+        (cx - int(W * 0.10), int(H * 0.74)),
+        (cx - int(W * 0.03), int(H * 0.74)),
+        (cx - int(W * 0.04), int(H * 0.95)),
+        (cx - int(W * 0.11), int(H * 0.95)),
+    ]
+    right_calf = [(W - x, y) for x, y in left_calf]
+    poly(left_calf)
+    poly(right_calf)
+
+    rr((cx - int(W * 0.125), int(H * 0.93), cx - int(W * 0.015), int(H * 0.98)), radius=int(W * 0.018))
+    rr((cx + int(W * 0.015), int(H * 0.93), cx + int(W * 0.125), int(H * 0.98)), radius=int(W * 0.018))
+
+    img = img.filter(ImageFilter.GaussianBlur(radius=max(1, int(ss * 0.45))))
+    img = img.resize((width, height), resample=PILImage.Resampling.LANCZOS)
+    return np.asarray(img, dtype=np.float32) / 255.0
+
+
+def build_silhouette_mask(width: int, height: int) -> np.ndarray:
+    return build_silhouette_alpha(width, height) >= 0.50
 
 
 def silhouette_boundary(mask: np.ndarray) -> np.ndarray:
@@ -426,13 +479,34 @@ def silhouette_boundary(mask: np.ndarray) -> np.ndarray:
 
 def silhouette_projection_image(index_canvas: np.ndarray) -> PILImage.Image:
     h, w = index_canvas.shape
-    sil = build_silhouette_mask(w, h)
-    background = np.full((h, w, 3), tuple(int(v * 255) for v in C["bg_root"][:3]), dtype=np.uint8)
-    rgb = camo.RGB[index_canvas]
-    background[sil] = rgb[sil]
-    background[silhouette_boundary(sil)] = np.array([255, 255, 255], dtype=np.uint8)
-    return PILImage.fromarray(background, "RGB")
+    alpha = build_silhouette_alpha(w, h)
+    mask_mid = alpha >= 0.42
+    mask_inner = alpha >= 0.72
+    edge_outer = silhouette_boundary(mask_mid)
+    edge_inner = silhouette_boundary(mask_inner)
 
+    rgb = camo.RGB[index_canvas].astype(np.float32)
+
+    y = np.linspace(0.0, 1.0, h, dtype=np.float32)[:, None, None]
+    x = np.linspace(0.0, 1.0, w, dtype=np.float32)[None, :, None]
+    bg_top = np.array([18.0, 24.0, 31.0], dtype=np.float32)
+    bg_bottom = np.array([34.0, 42.0, 50.0], dtype=np.float32)
+    background = bg_top * (1.0 - y) + bg_bottom * y
+    vignette = 1.0 - 0.16 * np.sqrt((x - 0.5) ** 2 + (y - 0.52) ** 2) / 0.72
+    background = np.clip(background * vignette, 0.0, 255.0)
+
+    shadow = np.zeros_like(alpha, dtype=np.float32)
+    dy = max(1, h // 90)
+    dx = max(1, w // 85)
+    shadow[dy:, dx:] = alpha[:-dy, :-dx] * 0.28
+    background = background * (1.0 - shadow[..., None])
+
+    alpha3 = alpha[..., None]
+    comp = background * (1.0 - alpha3) + rgb * alpha3
+    comp[edge_outer] = np.array([244.0, 245.0, 240.0], dtype=np.float32)
+    comp[edge_inner] = comp[edge_inner] * 0.45 + np.array([12.0, 14.0, 18.0], dtype=np.float32) * 0.55
+
+    return PILImage.fromarray(np.clip(comp, 0.0, 255.0).astype(np.uint8), "RGB")
 
 # ============================================================
 # WIDGETS UI
@@ -655,7 +729,8 @@ class CamouflageApp(App):
         self.best_records: List[CandidateRecord] = []
         self.accepted_count = 0
         self.total_attempts = 0
-        self.machine_intensity = 100.0
+        self.machine_intensity = DEFAULT_BACKEND_MACHINE_INTENSITY * 100.0
+        self.motif_scale = DEFAULT_UI_MOTIF_SCALE
         self.process = psutil.Process() if psutil else None
         self.tests_ran = False
         self.tests_ok = False
@@ -677,8 +752,8 @@ class CamouflageApp(App):
         self.open_btn: Optional[SoftButton] = None
         self.progress_bar: Optional[GlassProgressBar] = None
         self.progress_text: Optional[Label] = None
-        self.intensity_slider: Optional[Slider] = None
-        self.intensity_label: Optional[Label] = None
+        self.motif_scale_slider: Optional[Slider] = None
+        self.motif_scale_label: Optional[Label] = None
         self.resource_text: Optional[Label] = None
         self.tests_label: Optional[Label] = None
         self.run_mode_label: Optional[Label] = None
@@ -764,17 +839,17 @@ class CamouflageApp(App):
         controls.add_widget(self.progress_bar)
         controls.add_widget(self.progress_text)
 
-        controls.add_widget(self._label("Intensité machine"))
-        intensity_row = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(8))
-        self.intensity_slider = Slider(min=25, max=100, value=100)
-        self.intensity_label = self._small_label("100 %", size_hint_x=0.22)
-        self.intensity_slider.bind(value=self._on_intensity_change)
-        intensity_row.add_widget(self.intensity_slider)
-        intensity_row.add_widget(self.intensity_label)
-        controls.add_widget(intensity_row)
+        controls.add_widget(self._label("Scale des motifs"))
+        motif_row = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(8))
+        self.motif_scale_slider = Slider(min=0.35, max=1.20, value=DEFAULT_UI_MOTIF_SCALE, step=0.01)
+        self.motif_scale_label = self._small_label(f"{DEFAULT_UI_MOTIF_SCALE:.2f}", size_hint_x=0.22)
+        self.motif_scale_slider.bind(value=self._on_motif_scale_change)
+        motif_row.add_widget(self.motif_scale_slider)
+        motif_row.add_widget(self.motif_scale_label)
+        controls.add_widget(motif_row)
 
         controls.add_widget(self._label("Monitoring"))
-        self.resource_text = self._small_label("CPU -- | RAM -- | Disque -- | Processus --")
+        self.resource_text = self._small_label("CPU -- | RAM -- | Disque -- | Processus -- | scale --")
         controls.add_widget(self.resource_text)
 
         controls.add_widget(self._label("Validation backend"))
@@ -1057,10 +1132,26 @@ class CamouflageApp(App):
             self.open_btn.disabled = False
         self._refresh_run_mode_buttons()
 
-    def _on_intensity_change(self, _slider, value):
-        if self.intensity_label is not None:
-            self.intensity_label.text = f"{int(value)} %"
-        self.machine_intensity = float(value)
+    def _apply_backend_motif_scale(self) -> float:
+        scale = max(0.25, float(self.motif_scale))
+        setter = getattr(camo, "set_motif_scale", None)
+        if callable(setter):
+            setter(scale)
+        else:
+            camo.set_canvas_geometry(
+                width=int(getattr(camo, "WIDTH", 7680)),
+                height=int(getattr(camo, "HEIGHT", 4320)),
+                physical_width_cm=float(getattr(camo, "PHYSICAL_WIDTH_CM", 240.0)),
+                physical_height_cm=float(getattr(camo, "PHYSICAL_HEIGHT_CM", 135.0)),
+                motif_scale=scale,
+            )
+        return scale
+
+    def _on_motif_scale_change(self, _slider, value):
+        self.motif_scale = float(value)
+        applied = self._apply_backend_motif_scale()
+        if self.motif_scale_label is not None:
+            self.motif_scale_label.text = f"{applied:.2f}"
 
     def _run_mode_text(self, mode: Optional[str] = None) -> str:
         mode = self.run_mode if mode is None else mode
@@ -1135,6 +1226,7 @@ class CamouflageApp(App):
             except Exception:
                 count = DEFAULT_TARGET_COUNT
 
+            self._apply_backend_motif_scale()
             intensity = backend_machine_intensity(self.machine_intensity)
             output_dir = self.current_output_dir
             output_dir.mkdir(parents=True, exist_ok=True)
@@ -1255,6 +1347,7 @@ class CamouflageApp(App):
             self.log("Nombre de camouflages invalide.")
             return
 
+        self._apply_backend_motif_scale()
         self.current_output_dir = DEFAULT_OUTPUT_DIR
         self.current_output_dir.mkdir(parents=True, exist_ok=True)
         self.best_records.clear()
@@ -1270,7 +1363,7 @@ class CamouflageApp(App):
         self._refresh_diag_labels()
         prevent_sleep(True)
         self.status("Génération en cours…", ok=True)
-        self.log(f"Démarrage : {count} camouflage(s) | sortie={self.current_output_dir}")
+        self.log(f"Démarrage : {count} camouflage(s) | sortie={self.current_output_dir} | motif_scale={self.motif_scale:.2f}")
         self._refresh_controls_state()
         fut = self.async_runner.submit(self._async_worker_generate(count))
         self.current_future = fut
@@ -1307,7 +1400,6 @@ class CamouflageApp(App):
         return self.stop_flag
 
     async def _adaptive_pause(self):
-        base = 0.0 if self.machine_intensity >= 90 else (100.0 - self.machine_intensity) / 5000.0
         extra = 0.0
         if psutil is not None:
             try:
@@ -1319,8 +1411,8 @@ class CamouflageApp(App):
                     extra = 0.015
             except Exception:
                 pass
-        if base + extra > 0:
-            await asyncio.sleep(base + extra)
+        if extra > 0:
+            await asyncio.sleep(extra)
 
     async def _async_worker_generate(self, target_count: int):
         rows: List[dict] = []
@@ -1449,7 +1541,8 @@ class CamouflageApp(App):
             self.struct_text.text = (
                 f"overscan {safe_metric(metrics, 'overscan'):.4f} | "
                 f"shift {safe_metric(metrics, 'shift_strength'):.4f} | "
-                f"px/cm {safe_metric(metrics, 'px_per_cm'):.4f}"
+                f"px/cm {safe_metric(metrics, 'px_per_cm'):.4f} | "
+                f"scale {safe_metric(metrics, 'motif_scale', self.motif_scale):.4f}"
             )
 
     async def _async_export_best_of(self, top_k: int) -> Path:
@@ -1559,7 +1652,10 @@ class CamouflageApp(App):
             disk = psutil.disk_usage(anchor).percent
             proc_cpu = self.process.cpu_percent(interval=None) if self.process else 0.0
             proc_mem = self.process.memory_info().rss / (1024 ** 3) if self.process else 0.0
-            self.resource_text.text = f"CPU {cpu:.0f}% | RAM {ram:.0f}% | Disque {disk:.0f}% | Processus {proc_cpu:.0f}% / {proc_mem:.2f} Go"
+            self.resource_text.text = (
+                f"CPU {cpu:.0f}% | RAM {ram:.0f}% | Disque {disk:.0f}% | "
+                f"Processus {proc_cpu:.0f}% / {proc_mem:.2f} Go | scale {self.motif_scale:.2f}"
+            )
         except Exception:
             self.resource_text.text = "Monitoring indisponible."
 
