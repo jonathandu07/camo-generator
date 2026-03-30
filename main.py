@@ -1232,6 +1232,49 @@ async def async_generate_all(
 
 
 # ============================================================
+# INTÉGRATION ML / DL GUIDÉE
+# ============================================================
+
+def _build_mldl_config_from_args(args: argparse.Namespace) -> Any:
+    mldl = importlib.import_module("camouflage_ml_dl_guided")
+    if hasattr(mldl, "build_config_from_main_args"):
+        return mldl.build_config_from_main_args(args)
+    return mldl.MLDLConfig(
+        target_count=int(args.target_count),
+        warmup_samples=int(args.mldl_warmup_samples),
+        candidate_pool_size=int(args.mldl_candidate_pool_size),
+        validate_top_k=int(args.mldl_validate_top_k),
+        max_attempts_per_target=int(args.mldl_max_attempts_per_target),
+        train_epochs=int(args.mldl_train_epochs),
+        batch_size=int(args.mldl_batch_size),
+        learning_rate=float(args.mldl_learning_rate),
+        hidden_dim=int(args.mldl_hidden_dim),
+        device=str(args.mldl_device),
+        base_seed=int(args.base_seed),
+        output_dir=str(args.output_dir),
+        alpha_ucb=float(args.mldl_alpha_ucb),
+        min_train_size=int(args.mldl_min_train_size),
+        retrain_every=int(args.mldl_retrain_every),
+        random_seed=int(args.random_seed),
+    )
+
+
+def run_guided_generation_from_main(args: argparse.Namespace) -> Tuple[List[Dict[str, object]], Dict[str, Any]]:
+    mldl = importlib.import_module("camouflage_ml_dl_guided")
+    cfg = _build_mldl_config_from_args(args)
+    if hasattr(mldl, "run_guided_generation"):
+        return mldl.run_guided_generation(cfg)
+
+    runner = mldl.CamouflageMLDLGenerator(cfg)
+    rows = runner.generate()
+    return rows, {
+        "total_attempts": runner.total_attempts,
+        "output_dir": str(Path(cfg.output_dir).resolve()),
+        "report": str((Path(cfg.output_dir) / cfg.report_name).resolve()),
+    }
+
+
+# ============================================================
 # CLI
 # ============================================================
 
@@ -1252,13 +1295,29 @@ def parse_cli_args() -> argparse.Namespace:
     parser.add_argument("--strict-preflight", action="store_true")
     parser.add_argument("--disable-live-supervisor", action="store_true")
     parser.add_argument("--no-live-console", action="store_true")
+
+    # Mode guidé ML / DL
+    parser.add_argument("--guided-ml-dl", action="store_true", help="Active la recherche guidée par ML/DL en ligne")
+    parser.add_argument("--random-seed", type=int, default=12345)
+    parser.add_argument("--mldl-warmup-samples", type=int, default=128)
+    parser.add_argument("--mldl-candidate-pool-size", type=int, default=8)
+    parser.add_argument("--mldl-validate-top-k", type=int, default=3)
+    parser.add_argument("--mldl-max-attempts-per-target", type=int, default=120)
+    parser.add_argument("--mldl-train-epochs", type=int, default=24)
+    parser.add_argument("--mldl-batch-size", type=int, default=32)
+    parser.add_argument("--mldl-learning-rate", type=float, default=1e-3)
+    parser.add_argument("--mldl-hidden-dim", type=int, default=128)
+    parser.add_argument("--mldl-device", type=str, default="auto")
+    parser.add_argument("--mldl-alpha-ucb", type=float, default=1.25)
+    parser.add_argument("--mldl-min-train-size", type=int, default=32)
+    parser.add_argument("--mldl-retrain-every", type=int, default=24)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_cli_args()
-    random.seed(12345)
-    np.random.seed(12345)
+    random.seed(args.random_seed)
+    np.random.seed(args.random_seed)
 
     set_canvas_geometry(
         width=args.width,
@@ -1269,31 +1328,45 @@ def main() -> None:
     )
 
     try:
-        rows = asyncio.run(
-            async_generate_all(
-                target_count=args.target_count,
-                output_dir=Path(args.output_dir),
-                base_seed=args.base_seed,
-                max_workers=args.max_workers,
-                attempt_batch_size=args.attempt_batch_size,
-                parallel_attempts=not args.disable_parallel_attempts,
-                machine_intensity=args.machine_intensity,
-                strict_preflight=bool(args.strict_preflight),
-                enable_live_supervisor=not args.disable_live_supervisor,
-                live_console=not args.no_live_console,
+        if args.guided_ml_dl:
+            rows, guided_summary = run_guided_generation_from_main(args)
+            csv_path = Path(args.output_dir) / "rapport_camouflages_ml_dl.csv"
+            print("Terminé.")
+            print("Mode : same_type_organic_8k_human_scale_guided_ml_dl")
+            print(f"Résolution : {WIDTH}x{HEIGHT}")
+            print(f"Format physique : {PHYSICAL_WIDTH_CM} cm x {PHYSICAL_HEIGHT_CM} cm")
+            print(f"Densité : {PX_PER_CM:.3f} px/cm")
+            print(f"Motif scale : {MOTIF_SCALE:.3f}")
+            print(f"Images validées : {len(rows)}/{args.target_count}")
+            print(f"Tentatives totales : {int(guided_summary.get('total_attempts', 0))}")
+            print(f"Dossier : {Path(args.output_dir).resolve()}")
+            print(f"CSV : {csv_path.resolve()}")
+        else:
+            rows = asyncio.run(
+                async_generate_all(
+                    target_count=args.target_count,
+                    output_dir=Path(args.output_dir),
+                    base_seed=args.base_seed,
+                    max_workers=args.max_workers,
+                    attempt_batch_size=args.attempt_batch_size,
+                    parallel_attempts=not args.disable_parallel_attempts,
+                    machine_intensity=args.machine_intensity,
+                    strict_preflight=bool(args.strict_preflight),
+                    enable_live_supervisor=not args.disable_live_supervisor,
+                    live_console=not args.no_live_console,
+                )
             )
-        )
-        csv_path = Path(args.output_dir) / "rapport_camouflages.csv"
-        print("Terminé.")
-        print("Mode : same_type_organic_8k_human_scale_async")
-        print(f"Résolution : {WIDTH}x{HEIGHT}")
-        print(f"Format physique : {PHYSICAL_WIDTH_CM} cm x {PHYSICAL_HEIGHT_CM} cm")
-        print(f"Densité : {PX_PER_CM:.3f} px/cm")
-        print(f"Motif scale : {MOTIF_SCALE:.3f}")
-        print(f"Images validées : {len(rows)}/{args.target_count}")
-        print(f"Dossier : {Path(args.output_dir).resolve()}")
-        print(f"CSV : {csv_path.resolve()}")
-        print(f"Workers max dynamiques : {DEFAULT_MAX_WORKERS}")
+            csv_path = Path(args.output_dir) / "rapport_camouflages.csv"
+            print("Terminé.")
+            print("Mode : same_type_organic_8k_human_scale_async")
+            print(f"Résolution : {WIDTH}x{HEIGHT}")
+            print(f"Format physique : {PHYSICAL_WIDTH_CM} cm x {PHYSICAL_HEIGHT_CM} cm")
+            print(f"Densité : {PX_PER_CM:.3f} px/cm")
+            print(f"Motif scale : {MOTIF_SCALE:.3f}")
+            print(f"Images validées : {len(rows)}/{args.target_count}")
+            print(f"Dossier : {Path(args.output_dir).resolve()}")
+            print(f"CSV : {csv_path.resolve()}")
+            print(f"Workers max dynamiques : {DEFAULT_MAX_WORKERS}")
     finally:
         shutdown_process_pool()
 
