@@ -354,6 +354,15 @@ def set_canvas_geometry(
     MOTIF_SCALE = motif_scale
 
 
+def set_motif_scale(motif_scale: float) -> float:
+    global MOTIF_SCALE
+    motif_scale = float(motif_scale)
+    if motif_scale <= 0:
+        raise ValueError("motif_scale doit être > 0")
+    MOTIF_SCALE = motif_scale
+    return MOTIF_SCALE
+
+
 def shutdown_process_pool() -> None:
     global _PROCESS_POOL, _PROCESS_POOL_WORKERS
     if _PROCESS_POOL is not None:
@@ -903,20 +912,27 @@ def force_exact_target_counts(labels: np.ndarray, fields: np.ndarray, target_cou
 
 
 def generate_one_variant(profile: VariantProfile) -> Tuple[Image.Image, np.ndarray, Dict[str, float]]:
-    work_width = max(WIDTH + 64, int(round(WIDTH * profile.overscan)))
-    work_height = max(HEIGHT + 64, int(round(HEIGHT * profile.overscan)))
+    width = int(WIDTH)
+    height = int(HEIGHT)
+    physical_width_cm = float(PHYSICAL_WIDTH_CM)
+    physical_height_cm = float(PHYSICAL_HEIGHT_CM)
+    px_per_cm = float(PX_PER_CM)
+    motif_scale = float(MOTIF_SCALE)
+
+    work_width = max(width + 64, int(round(width * profile.overscan)))
+    work_height = max(height + 64, int(round(height * profile.overscan)))
 
     fields = build_all_fields(
         work_width,
         work_height,
         profile,
-        crop_height=HEIGHT,
-        crop_width=WIDTH,
-        motif_scale=MOTIF_SCALE,
+        crop_height=height,
+        crop_width=width,
+        motif_scale=motif_scale,
     )
 
-    target_counts = np.rint(TARGET * (WIDTH * HEIGHT)).astype(int)
-    target_counts[-1] = (WIDTH * HEIGHT) - int(target_counts[:-1].sum())
+    target_counts = np.rint(TARGET * (width * height)).astype(int)
+    target_counts[-1] = (width * height) - int(target_counts[:-1].sum())
 
     canvas = sequential_assign(fields, target_counts)
     canvas = exactify_proportions(canvas, fields, target_counts)
@@ -935,12 +951,12 @@ def generate_one_variant(profile: VariantProfile) -> Tuple[Image.Image, np.ndarr
         "edge_contact_ratio": edge_contact_ratio(canvas),
         "overscan": float(profile.overscan),
         "shift_strength": float(profile.shift_strength),
-        "width": float(WIDTH),
-        "height": float(HEIGHT),
-        "physical_width_cm": float(PHYSICAL_WIDTH_CM),
-        "physical_height_cm": float(PHYSICAL_HEIGHT_CM),
-        "px_per_cm": float(PX_PER_CM),
-        "motif_scale": float(MOTIF_SCALE),
+        "width": float(width),
+        "height": float(height),
+        "physical_width_cm": float(physical_width_cm),
+        "physical_height_cm": float(physical_height_cm),
+        "px_per_cm": float(px_per_cm),
+        "motif_scale": float(motif_scale),
     }
     return render_canvas(canvas), rs, metrics
 

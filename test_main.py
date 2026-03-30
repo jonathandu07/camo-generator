@@ -401,6 +401,17 @@ class TestSystemHelpers(GlobalStateMixin, TempDirMixin, AssertionsMixin, Geometr
         with self.assertRaises(ValueError):
             mut.set_canvas_geometry(320, 180, 100.0, 56.25, 0.0)
 
+    def test_set_motif_scale_updates_global_and_rejects_invalid_values(self) -> None:
+        original = mut.MOTIF_SCALE
+        try:
+            out = mut.set_motif_scale(0.73)
+            self.assertFloatClose(out, 0.73)
+            self.assertFloatClose(mut.MOTIF_SCALE, 0.73)
+            with self.assertRaises(ValueError):
+                mut.set_motif_scale(0.0)
+        finally:
+            mut.set_motif_scale(original)
+
     def test_shutdown_process_pool_calls_shutdown(self) -> None:
         pool = Mock()
         mut._PROCESS_POOL = pool
@@ -454,6 +465,53 @@ class TestSystemHelpers(GlobalStateMixin, TempDirMixin, AssertionsMixin, Geometr
                 attempt_batch_size=1,
             )
         self.assertFalse((self.tmpdir / ".write_probe.tmp").exists())
+
+    def test_validate_generation_request_rejects_invalid_arguments(self) -> None:
+        with self.assertRaises(ValueError):
+            mut.validate_generation_request(
+                target_count=0,
+                output_dir=self.tmpdir,
+                base_seed=1,
+                machine_intensity=0.5,
+                max_workers=1,
+                attempt_batch_size=1,
+            )
+        with self.assertRaises(ValueError):
+            mut.validate_generation_request(
+                target_count=1,
+                output_dir=self.tmpdir,
+                base_seed=-1,
+                machine_intensity=0.5,
+                max_workers=1,
+                attempt_batch_size=1,
+            )
+        with patch.object(mut, "sample_process_resources", return_value=fake_snapshot(disk_free_mb=4096.0, machine_intensity=0.10)):
+            mut.validate_generation_request(
+                target_count=1,
+                output_dir=self.tmpdir,
+                base_seed=1,
+                machine_intensity=0.05,
+                max_workers=1,
+                attempt_batch_size=1,
+            )
+        with self.assertRaises(ValueError):
+            mut.validate_generation_request(
+                target_count=1,
+                output_dir=self.tmpdir,
+                base_seed=1,
+                machine_intensity=0.5,
+                max_workers=0,
+                attempt_batch_size=1,
+            )
+        with self.assertRaises(ValueError):
+            mut.validate_generation_request(
+                target_count=1,
+                output_dir=self.tmpdir,
+                base_seed=1,
+                machine_intensity=0.5,
+                max_workers=1,
+                attempt_batch_size=0,
+            )
 
 
 class TestPureUtilities(TempDirMixin, AssertionsMixin, GeometryMixin, unittest.TestCase):
@@ -617,6 +675,24 @@ class TestGeneratorInternals(AssertionsMixin, GeometryMixin, unittest.TestCase):
         self.assertTrue(set(REQUIRED_METRIC_KEYS).issubset(set(metrics.keys())))
         self.assertAlmostEqual(float(ratios.sum()), 1.0, places=6)
         self.assertFloatClose(metrics["motif_scale"], mut.MOTIF_SCALE)
+
+    def test_generate_one_variant_freezes_motif_scale_for_metrics(self) -> None:
+        profile = mut.make_profile(778)
+        original_scale = mut.MOTIF_SCALE
+        original_build_all_fields = mut.build_all_fields
+
+        def side_effect(*args, **kwargs):
+            mut.MOTIF_SCALE = 0.99
+            return original_build_all_fields(*args, **kwargs)
+
+        try:
+            mut.set_motif_scale(0.61)
+            with patch.object(mut, "build_all_fields", side_effect=side_effect):
+                _image, _ratios, metrics = mut.generate_one_variant(profile)
+            self.assertFloatClose(metrics["motif_scale"], 0.61)
+            self.assertFloatClose(mut.MOTIF_SCALE, 0.99)
+        finally:
+            mut.set_motif_scale(original_scale)
 
     def test_generate_candidate_from_seed_returns_candidate_result(self) -> None:
         candidate = mut.generate_candidate_from_seed(12345)
@@ -834,6 +910,94 @@ class TestAsyncHelpersAndOrchestrator(
         self.assertGreaterEqual(supervisor_mock.call_count, 2)
 
 
+class TestMLDLIntegration(GlobalStateMixin, TempDirMixin, GeometryMixin, AssertionsMixin, unittest.TestCase):
+    def test_build_mldl_config_from_args_uses_builder_when_available(self) -> None:
+        fake_module = types.SimpleNamespace(build_config_from_main_args=lambda args: {"mode": "builder", "target_count": args.target_count})
+        args = types.SimpleNamespace(target_count=7)
+        with patch.dict(sys.modules, {"camouflage_ml_dl_guided": fake_module}, clear=False):
+            cfg = mut._build_mldl_config_from_args(args)
+        self.assertEqual(cfg, {"mode": "builder", "target_count": 7})
+
+    def test_build_mldl_config_from_args_falls_back_to_mldlconfig(self) -> None:
+        class FakeMLDLConfig:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        fake_module = types.SimpleNamespace(MLDLConfig=FakeMLDLConfig)
+        args = types.SimpleNamespace(
+            target_count=3,
+            mldl_warmup_samples=10,
+            mldl_candidate_pool_size=4,
+            mldl_validate_top_k=2,
+            mldl_max_attempts_per_target=20,
+            mldl_train_epochs=5,
+            mldl_batch_size=8,
+            mldl_learning_rate=1e-3,
+            mldl_hidden_dim=16,
+            mldl_device="cpu",
+            base_seed=123,
+            output_dir=str(self.tmpdir),
+            mldl_alpha_ucb=1.1,
+            mldl_min_train_size=6,
+            mldl_retrain_every=7,
+            random_seed=99,
+        )
+        with patch.dict(sys.modules, {"camouflage_ml_dl_guided": fake_module}, clear=False):
+            cfg = mut._build_mldl_config_from_args(args)
+        self.assertEqual(cfg.target_count, 3)
+        self.assertEqual(cfg.output_dir, str(self.tmpdir))
+        self.assertEqual(cfg.random_seed, 99)
+
+    def test_run_guided_generation_from_main_uses_direct_runner_when_available(self) -> None:
+        fake_module = types.SimpleNamespace(
+            build_config_from_main_args=lambda args: {"cfg": True},
+            run_guided_generation=lambda cfg: ([{"index": 1}], {"total_attempts": 4, "cfg": cfg}),
+        )
+        with patch.dict(sys.modules, {"camouflage_ml_dl_guided": fake_module}, clear=False):
+            rows, summary = mut.run_guided_generation_from_main(types.SimpleNamespace(target_count=1))
+        self.assertEqual(rows, [{"index": 1}])
+        self.assertEqual(summary["total_attempts"], 4)
+
+    def test_run_guided_generation_from_main_falls_back_to_generator_class(self) -> None:
+        class FakeConfig:
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+                self.report_name = "guided.csv"
+                self.output_dir = kwargs["output_dir"]
+
+        class FakeRunner:
+            def __init__(self, cfg):
+                self.cfg = cfg
+                self.total_attempts = 9
+            def generate(self):
+                return [{"index": 1}, {"index": 2}]
+
+        fake_module = types.SimpleNamespace(MLDLConfig=FakeConfig, CamouflageMLDLGenerator=FakeRunner)
+        args = types.SimpleNamespace(
+            target_count=2,
+            mldl_warmup_samples=10,
+            mldl_candidate_pool_size=4,
+            mldl_validate_top_k=2,
+            mldl_max_attempts_per_target=20,
+            mldl_train_epochs=5,
+            mldl_batch_size=8,
+            mldl_learning_rate=1e-3,
+            mldl_hidden_dim=16,
+            mldl_device="cpu",
+            base_seed=123,
+            output_dir=str(self.tmpdir),
+            mldl_alpha_ucb=1.1,
+            mldl_min_train_size=6,
+            mldl_retrain_every=7,
+            random_seed=99,
+        )
+        with patch.dict(sys.modules, {"camouflage_ml_dl_guided": fake_module}, clear=False):
+            rows, summary = mut.run_guided_generation_from_main(args)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(summary["total_attempts"], 9)
+        self.assertTrue(summary["report"].endswith("guided.csv"))
+
+
 class TestCliEntrypoints(GlobalStateMixin, TempDirMixin, GeometryMixin, AssertionsMixin, unittest.TestCase):
     def test_parse_cli_args_defaults(self) -> None:
         with patch.object(sys, "argv", ["prog"]):
@@ -842,7 +1006,15 @@ class TestCliEntrypoints(GlobalStateMixin, TempDirMixin, GeometryMixin, Assertio
         self.assertEqual(args.width, mut.DEFAULT_WIDTH)
         self.assertEqual(args.height, mut.DEFAULT_HEIGHT)
         self.assertFalse(args.disable_parallel_attempts)
+        self.assertFalse(args.guided_ml_dl)
         self.assertFloatClose(args.motif_scale, mut.DEFAULT_MOTIF_SCALE)
+
+    def test_parse_cli_args_guided_flags(self) -> None:
+        with patch.object(sys, "argv", ["prog", "--guided-ml-dl", "--random-seed", "77", "--mldl-device", "cpu"]):
+            args = mut.parse_cli_args()
+        self.assertTrue(args.guided_ml_dl)
+        self.assertEqual(args.random_seed, 77)
+        self.assertEqual(args.mldl_device, "cpu")
 
     def test_main_calls_async_generate_all_and_shutdown_pool(self) -> None:
         async_mock = AsyncMock(return_value=[{"index": 1}])
