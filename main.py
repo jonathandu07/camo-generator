@@ -90,16 +90,18 @@ DEFAULT_ATTEMPT_BATCH_SIZE = max(1, DEFAULT_MAX_WORKERS)
 DEFAULT_MACHINE_INTENSITY = 0.98
 DEFAULT_RESOURCE_SAMPLE_EVERY_BATCHES = 1
 DEFAULT_OVERSCAN = 1.10
+DEFAULT_MOTIF_SCALE = 0.78
+MOTIF_SCALE = DEFAULT_MOTIF_SCALE
 
 # Validation stricte adaptée au moteur organique 8K.
 MAX_ABS_ERROR_PER_COLOR = np.array([0.0015, 0.0015, 0.0015, 0.0015], dtype=float)
 MAX_MEAN_ABS_ERROR = 0.0010
 MIN_BOUNDARY_DENSITY = 0.010
-MAX_BOUNDARY_DENSITY = 0.110
+MAX_BOUNDARY_DENSITY = 0.125
 MIN_BOUNDARY_DENSITY_SMALL = 0.015
-MAX_BOUNDARY_DENSITY_SMALL = 0.140
+MAX_BOUNDARY_DENSITY_SMALL = 0.165
 MIN_BOUNDARY_DENSITY_TINY = 0.020
-MAX_BOUNDARY_DENSITY_TINY = 0.180
+MAX_BOUNDARY_DENSITY_TINY = 0.210
 MAX_MIRROR_SIMILARITY = 0.88
 MIN_LARGEST_OLIVE_COMPONENT_RATIO = 0.08
 MAX_EDGE_CONTACT_RATIO = 0.72
@@ -318,16 +320,20 @@ def set_canvas_geometry(
     height: int,
     physical_width_cm: float = DEFAULT_PHYSICAL_WIDTH_CM,
     physical_height_cm: float = DEFAULT_PHYSICAL_HEIGHT_CM,
+    motif_scale: float = DEFAULT_MOTIF_SCALE,
 ) -> None:
-    global WIDTH, HEIGHT, PHYSICAL_WIDTH_CM, PHYSICAL_HEIGHT_CM, PX_PER_CM
+    global WIDTH, HEIGHT, PHYSICAL_WIDTH_CM, PHYSICAL_HEIGHT_CM, PX_PER_CM, MOTIF_SCALE
     width = int(width)
     height = int(height)
     physical_width_cm = float(physical_width_cm)
     physical_height_cm = float(physical_height_cm)
+    motif_scale = float(motif_scale)
     if width <= 0 or height <= 0:
         raise ValueError("width et height doivent être > 0")
     if physical_width_cm <= 0 or physical_height_cm <= 0:
         raise ValueError("physical_width_cm et physical_height_cm doivent être > 0")
+    if motif_scale <= 0:
+        raise ValueError("motif_scale doit être > 0")
     WIDTH = width
     HEIGHT = height
     PHYSICAL_WIDTH_CM = physical_width_cm
@@ -335,6 +341,7 @@ def set_canvas_geometry(
     px_per_cm_x = WIDTH / PHYSICAL_WIDTH_CM
     px_per_cm_y = HEIGHT / PHYSICAL_HEIGHT_CM
     PX_PER_CM = min(px_per_cm_x, px_per_cm_y)
+    MOTIF_SCALE = motif_scale
 
 
 def shutdown_process_pool() -> None:
@@ -610,6 +617,11 @@ def cells_for_patch_size(patch_cm_x: float, patch_cm_y: float, width_px: int, he
     return cells_x, cells_y
 
 
+def scaled_patch_size(patch_cm_x: float, patch_cm_y: float, motif_scale: float) -> Tuple[float, float]:
+    motif_scale = max(0.25, float(motif_scale))
+    return float(patch_cm_x) * motif_scale, float(patch_cm_y) * motif_scale
+
+
 # ============================================================
 # GÉNÉRATEUR ORGANIQUE 8K HUMAN-SCALE
 # ============================================================
@@ -677,37 +689,51 @@ def build_all_fields(
     profile: VariantProfile,
     crop_height: int,
     crop_width: int,
+    motif_scale: float = MOTIF_SCALE,
 ) -> np.ndarray:
     rng = np.random.default_rng(profile.seed)
 
     # Échelles en centimètres pour lecture multi-distance sur silhouette humaine.
-    c1x, c1y = cells_for_patch_size(82, 64, work_width, work_height)   # macro longue distance
-    c2x, c2y = cells_for_patch_size(54, 40, work_width, work_height)   # macro/mid
-    c3x, c3y = cells_for_patch_size(22, 16, work_width, work_height)   # intermédiaire
-    c4x, c4y = cells_for_patch_size(7, 5, work_width, work_height)     # micro courte distance
+    # Réduit par défaut pour obtenir des masses plus fines tout en gardant une lecture
+    # exploitable à longue, moyenne et courte distance.
+    s1x, s1y = scaled_patch_size(78, 58, motif_scale)
+    s2x, s2y = scaled_patch_size(46, 34, motif_scale)
+    s3x, s3y = scaled_patch_size(18, 13, motif_scale)
+    s4x, s4y = scaled_patch_size(5.5, 4.0, motif_scale)
+    s5x, s5y = scaled_patch_size(2.6, 1.9, motif_scale)
+
+    c1x, c1y = cells_for_patch_size(s1x, s1y, work_width, work_height)   # macro longue distance
+    c2x, c2y = cells_for_patch_size(s2x, s2y, work_width, work_height)   # moyenne distance
+    c3x, c3y = cells_for_patch_size(s3x, s3y, work_width, work_height)   # intermédiaire
+    c4x, c4y = cells_for_patch_size(s4x, s4y, work_width, work_height)   # micro courte distance
+    c5x, c5y = cells_for_patch_size(s5x, s5y, work_width, work_height)   # ultra-micro rapprochement
 
     plans = {
         IDX_COYOTE: [
             (c1x, c1y, -18.0, 1.00),
-            (c2x, c2y, 22.0, 0.46),
-            (c3x, c3y, -8.0, 0.18),
-            (c4x, c4y, 0.0, 0.05),
+            (c2x, c2y, 22.0, 0.52),
+            (c3x, c3y, -8.0, 0.24),
+            (c4x, c4y, 0.0, 0.09),
+            (c5x, c5y, -11.0, 0.04),
         ],
         IDX_OLIVE: [
             (c1x, c1y, 16.0, 1.00),
-            (c2x, c2y, -26.0, 0.48),
-            (c3x, c3y, 7.0, 0.18),
-            (c4x, c4y, 12.0, 0.05),
+            (c2x, c2y, -26.0, 0.54),
+            (c3x, c3y, 7.0, 0.23),
+            (c4x, c4y, 12.0, 0.10),
+            (c5x, c5y, 24.0, 0.04),
         ],
         IDX_TERRE: [
-            (c2x, c2y, -12.0, 0.94),
-            (c3x, c3y, 26.0, 0.42),
-            (c4x, c4y, -4.0, 0.10),
+            (c2x, c2y, -12.0, 0.96),
+            (c3x, c3y, 26.0, 0.48),
+            (c4x, c4y, -4.0, 0.15),
+            (c5x, c5y, 9.0, 0.05),
         ],
         IDX_GRIS: [
-            (c2x, c2y, 20.0, 0.88),
-            (c3x, c3y, -24.0, 0.42),
-            (c4x, c4y, 0.0, 0.16),
+            (c2x, c2y, 20.0, 0.90),
+            (c3x, c3y, -24.0, 0.48),
+            (c4x, c4y, 0.0, 0.20),
+            (c5x, c5y, -15.0, 0.06),
         ],
     }
 
@@ -789,7 +815,7 @@ def generate_one_variant(profile: VariantProfile) -> Tuple[Image.Image, np.ndarr
     work_width = max(WIDTH + 64, int(round(WIDTH * profile.overscan)))
     work_height = max(HEIGHT + 64, int(round(HEIGHT * profile.overscan)))
 
-    fields = build_all_fields(work_width, work_height, profile, crop_height=HEIGHT, crop_width=WIDTH)
+    fields = build_all_fields(work_width, work_height, profile, crop_height=HEIGHT, crop_width=WIDTH, motif_scale=MOTIF_SCALE)
     target_counts = np.rint(TARGET * (WIDTH * HEIGHT)).astype(int)
     target_counts[-1] = (WIDTH * HEIGHT) - int(target_counts[:-1].sum())
 
@@ -813,6 +839,7 @@ def generate_one_variant(profile: VariantProfile) -> Tuple[Image.Image, np.ndarr
         "physical_width_cm": float(PHYSICAL_WIDTH_CM),
         "physical_height_cm": float(PHYSICAL_HEIGHT_CM),
         "px_per_cm": float(PX_PER_CM),
+        "motif_scale": float(MOTIF_SCALE),
     }
     return render_canvas(canvas), rs, metrics
 
@@ -896,6 +923,7 @@ def candidate_row(target_index: int, local_attempt: int, global_attempt: int, ca
         "physical_width_cm": round(float(metrics["physical_width_cm"]), 3),
         "physical_height_cm": round(float(metrics["physical_height_cm"]), 3),
         "px_per_cm": round(float(metrics["px_per_cm"]), 6),
+        "motif_scale": round(float(metrics["motif_scale"]), 6),
     }
 
 
@@ -1080,6 +1108,7 @@ async def async_generate_all(
         "physical_width_cm": float(PHYSICAL_WIDTH_CM),
         "physical_height_cm": float(PHYSICAL_HEIGHT_CM),
         "px_per_cm": float(PX_PER_CM),
+        "motif_scale": float(MOTIF_SCALE),
     }
     (Path(output_dir) / "run_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     return rows
@@ -1098,6 +1127,7 @@ def parse_cli_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=DEFAULT_HEIGHT)
     parser.add_argument("--physical-width-cm", type=float, default=DEFAULT_PHYSICAL_WIDTH_CM)
     parser.add_argument("--physical-height-cm", type=float, default=DEFAULT_PHYSICAL_HEIGHT_CM)
+    parser.add_argument("--motif-scale", type=float, default=DEFAULT_MOTIF_SCALE)
     parser.add_argument("--max-workers", type=int, default=None)
     parser.add_argument("--attempt-batch-size", type=int, default=None)
     parser.add_argument("--machine-intensity", type=float, default=DEFAULT_MACHINE_INTENSITY)
@@ -1118,6 +1148,7 @@ def main() -> None:
         height=args.height,
         physical_width_cm=args.physical_width_cm,
         physical_height_cm=args.physical_height_cm,
+        motif_scale=args.motif_scale,
     )
 
     try:
@@ -1141,6 +1172,7 @@ def main() -> None:
         print(f"Résolution : {WIDTH}x{HEIGHT}")
         print(f"Format physique : {PHYSICAL_WIDTH_CM} cm x {PHYSICAL_HEIGHT_CM} cm")
         print(f"Densité : {PX_PER_CM:.3f} px/cm")
+        print(f"Motif scale : {MOTIF_SCALE:.3f}")
         print(f"Images validées : {len(rows)}/{args.target_count}")
         print(f"Dossier : {Path(args.output_dir).resolve()}")
         print(f"CSV : {csv_path.resolve()}")
