@@ -1,6 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Suite de tests pour camouflage_ml_dl.py.
+Suite de tests pour camouflage_ml_dl_guided.py.
+
+Objectifs :
+- couvrir les helpers de features, rejet et reward ;
+- couvrir standardisation, surrogate DL, bandit et buffer ;
+- couvrir l'orchestrateur guidé ML/DL, le résumé et la CLI ;
+- rester rapide et déterministe.
 """
 from __future__ import annotations
 
@@ -17,19 +23,22 @@ from typing import Any, Dict, List
 from unittest.mock import Mock, patch
 
 import numpy as np
-import torch
 from PIL import Image
 
-MODULE_NAME = os.getenv("CAMO_MLDL_MODULE", "camouflage_ml_dl")
+TEST_DIR = Path(__file__).resolve().parent
+if str(TEST_DIR) not in sys.path:
+    sys.path.insert(0, str(TEST_DIR))
+
+MODULE_NAME = os.getenv("CAMO_MLDL_MODULE", "camouflage_ml_dl_guided")
 mut = importlib.import_module(MODULE_NAME)
 
-LOG_DIR = Path(os.getenv("LOG_OUTPUT_DIR", Path(__file__).resolve().parent / "logs")).resolve()
+LOG_DIR = Path(os.getenv("LOG_OUTPUT_DIR", TEST_DIR / "logs")).resolve()
 LOG_DIR.mkdir(parents=True, exist_ok=True)
-LOG_FILE = LOG_DIR / "test_camouflage_ml_dl.log"
+LOG_FILE = LOG_DIR / "test_camouflage_ml_dl_guided.log"
 
 
 def configure_logger() -> logging.Logger:
-    logger = logging.getLogger("test_camouflage_ml_dl")
+    logger = logging.getLogger("test_camouflage_ml_dl_guided")
     logger.setLevel(logging.DEBUG)
     if logger.handlers:
         return logger
@@ -45,7 +54,7 @@ LOGGER = configure_logger()
 class TempDirMixin:
     def setUp(self) -> None:
         super().setUp()
-        self._tmpdir_obj = tempfile.TemporaryDirectory(prefix="test_camouflage_ml_dl_")
+        self._tmpdir_obj = tempfile.TemporaryDirectory(prefix="test_camouflage_ml_dl_guided_")
         self.tmpdir = Path(self._tmpdir_obj.name)
 
     def tearDown(self) -> None:
@@ -56,74 +65,73 @@ class TempDirMixin:
 def valid_metrics() -> Dict[str, float]:
     return {
         "largest_olive_component_ratio": 0.24,
-        "largest_olive_component_ratio_small": 0.18,
-        "olive_multizone_share": 0.62,
-        "center_empty_ratio": 0.36,
-        "center_empty_ratio_small": 0.41,
-        "boundary_density": 0.145,
-        "boundary_density_small": 0.11,
-        "boundary_density_tiny": 0.11,
+        "boundary_density": 0.05,
+        "boundary_density_small": 0.06,
+        "boundary_density_tiny": 0.07,
         "mirror_similarity": 0.44,
-        "central_brown_continuity": 0.20,
-        "oblique_share": 0.72,
-        "vertical_share": 0.16,
-        "angle_dominance_ratio": 0.20,
-        "macro_olive_visible_ratio": 0.24,
-        "macro_terre_visible_ratio": 0.18,
-        "macro_gris_visible_ratio": 0.14,
-        "macro_total_count": 18.0,
-        "macro_olive_count": 8.0,
-        "macro_terre_count": 6.0,
-        "macro_gris_count": 4.0,
-        "macro_multizone_ratio": 0.60,
-        "largest_macro_mask_ratio": 0.06,
-        "periphery_boundary_density_ratio": 1.22,
-        "periphery_non_coyote_ratio": 1.17,
-        "visual_score_final": 0.72,
-        "visual_score_ratio": 0.91,
-        "visual_score_silhouette": 0.79,
-        "visual_score_contour": 0.73,
-        "visual_score_main": 0.68,
-        "visual_silhouette_color_diversity": 0.74,
-        "visual_contour_break_score": 0.58,
-        "visual_outline_band_diversity": 0.66,
-        "visual_small_scale_structural_score": 0.54,
-        "visual_military_score": 0.74,
+        "edge_contact_ratio": 0.30,
+        "overscan": 1.11,
+        "shift_strength": 0.92,
+        "width": 256.0,
+        "height": 144.0,
+        "physical_width_cm": 240.0,
+        "physical_height_cm": 135.0,
+        "px_per_cm": 1.066,
+        "motif_scale": 0.58,
     }
 
 
 def make_candidate(seed: int = 1234, ratios: np.ndarray | None = None, metrics: Dict[str, float] | None = None) -> Any:
-    ratios = np.array([0.32, 0.28, 0.22, 0.18], dtype=float) if ratios is None else ratios
-    metrics = valid_metrics() if metrics is None else metrics
+    ratios = np.array([0.32, 0.28, 0.22, 0.18], dtype=float) if ratios is None else np.asarray(ratios, dtype=float)
+    metrics = valid_metrics() if metrics is None else dict(metrics)
     return types.SimpleNamespace(
         seed=seed,
-        ratios=np.asarray(ratios, dtype=float),
-        metrics=dict(metrics),
+        ratios=ratios,
+        metrics=metrics,
         image=Image.new("RGB", (32, 32), (0, 0, 0)),
     )
 
 
-def make_analysis(names: List[str] | None = None) -> Any:
-    return types.SimpleNamespace(failure_names=list(names or ["ratio_olive", "center_empty_ratio"]))
+def make_invalid_candidate(seed: int = 1234) -> Any:
+    m = valid_metrics()
+    m["mirror_similarity"] = 0.99
+    ratios = np.array([0.32, 0.28, 0.22, 0.18], dtype=float)
+    return make_candidate(seed=seed, ratios=ratios, metrics=m)
 
 
-class TestFeatureHelpers(unittest.TestCase):
-    def test_candidate_to_feature_vector(self):
+class TestHelpers(unittest.TestCase):
+    def test_safe_float(self):
+        self.assertEqual(mut._safe_float(1.2), 1.2)
+        self.assertEqual(mut._safe_float("x", 3.4), 3.4)
+        self.assertEqual(mut._safe_float(float("inf"), 5.6), 5.6)
+
+    def test_candidate_to_feature_dict_and_vector(self):
         candidate = make_candidate()
+        feat = mut.candidate_to_feature_dict(candidate)
         vec = mut.candidate_to_feature_vector(candidate)
+        self.assertEqual(set(mut.FEATURE_KEYS), set(feat.keys()))
         self.assertEqual(vec.shape, (len(mut.FEATURE_KEYS),))
-        self.assertAlmostEqual(float(vec[0]), 0.32)
+        self.assertAlmostEqual(float(feat["ratio_coyote"]), 0.32)
 
-    def test_analysis_to_failure_vector_and_context(self):
-        analysis = make_analysis(["ratio_olive", "visual_military_score"])
-        fail = mut.analysis_to_failure_vector(analysis)
-        self.assertEqual(fail.shape, (len(mut.FAILURE_KEYS),))
-        ctx = mut.build_context_vector(make_candidate(), analysis)
+    def test_analyze_rejection_and_failure_vector(self):
+        candidate = make_invalid_candidate()
+        analysis = mut.analyze_rejection(candidate, target_index=1, local_attempt=2)
+        self.assertIsInstance(analysis, mut.RejectionAnalysis)
+        self.assertGreaterEqual(analysis.fail_count, 1)
+        vec = mut.analysis_to_failure_vector(analysis)
+        self.assertEqual(vec.shape, (len(mut.FAILURE_KEYS),))
+        ctx = mut.build_context_vector(candidate, analysis)
         self.assertEqual(ctx.shape, (len(mut.FEATURE_KEYS) + len(mut.FAILURE_KEYS),))
 
     def test_candidate_reward(self):
         c = make_candidate()
         self.assertGreater(mut.candidate_reward(c, True), mut.candidate_reward(c, False))
+
+    def test_propose_seed(self):
+        self.assertEqual(mut.propose_seed(10, {"mode": "linear", "offset": 2, "step": 3}), 15)
+        self.assertEqual(mut.propose_seed(10, {"mode": "offset", "offset": 7}), 17)
+        self.assertEqual(mut.propose_seed(10, {"mode": "affine", "mul": 3, "add": 1}), 31)
+        self.assertEqual(mut.propose_seed(10, {"mode": "xor", "mask": 5}), 15)
 
 
 class TestStandardizer(unittest.TestCase):
@@ -140,11 +148,10 @@ class TestStandardizer(unittest.TestCase):
 
 class TestDeepSurrogate(TempDirMixin, unittest.TestCase):
     def test_fit_predict_save_load(self):
-        torch.set_num_threads(1)
         dim = len(mut.FEATURE_KEYS)
-        x = np.random.default_rng(123).normal(size=(8, dim)).astype(np.float32)
-        y_valid = np.array([0, 1] * 4, dtype=np.float32)
-        y_reward = np.linspace(-1.0, 1.0, 8, dtype=np.float32)
+        x = np.random.default_rng(123).normal(size=(12, dim)).astype(np.float32)
+        y_valid = np.array([0, 1] * 6, dtype=np.float32)
+        y_reward = np.linspace(-1.0, 1.0, 12, dtype=np.float32)
         model = mut.DeepSurrogate(input_dim=dim, hidden_dim=16, lr=1e-3, device="cpu")
         stats = model.fit(x, y_valid, y_reward, epochs=1, batch_size=4)
         self.assertIn("loss", stats)
@@ -153,6 +160,7 @@ class TestDeepSurrogate(TempDirMixin, unittest.TestCase):
         self.assertEqual(p_reward.shape, (1,))
         path = self.tmpdir / "surrogate.pt"
         model.save(path)
+        self.assertTrue(path.exists())
         model2 = mut.DeepSurrogate(input_dim=dim, hidden_dim=16, lr=1e-3, device="cpu")
         model2.load(path)
         p2_valid, _ = model2.predict(x[0])
@@ -169,16 +177,6 @@ class TestLinUCBBandit(unittest.TestCase):
         self.assertEqual(bandit.scores(ctx).shape, (3,))
 
 
-class TestGuidedStateHelpers(unittest.TestCase):
-    def test_merge_guided_delta(self):
-        base = {"olive_scale_delta": 0.1, "zone_boost_deltas": [0.0 for _ in range(len(mut.camo.DENSITY_ZONES))]}
-        delta = {"olive_scale_delta": 0.2, "extra_macro_attempts": 10, "zone_boost_deltas": [0.1 for _ in range(len(mut.camo.DENSITY_ZONES))], "expand_angle_pool": True}
-        out = mut.merge_guided_delta(base, delta)
-        self.assertAlmostEqual(out["olive_scale_delta"], 0.3)
-        self.assertEqual(out["extra_macro_attempts"], 10)
-        self.assertTrue(out["expand_angle_pool"])
-
-
 class TestExperienceBuffer(TempDirMixin, unittest.TestCase):
     def test_add_as_arrays_save(self):
         buf = mut.ExperienceBuffer()
@@ -186,6 +184,8 @@ class TestExperienceBuffer(TempDirMixin, unittest.TestCase):
         self.assertIsInstance(reward, float)
         x, y_valid, y_reward = buf.as_arrays()
         self.assertEqual(x.shape[0], 1)
+        self.assertEqual(y_valid.tolist(), [1.0])
+        self.assertEqual(y_reward.shape[0], 1)
         path = self.tmpdir / "dataset.npz"
         buf.save(path)
         self.assertTrue(path.exists())
@@ -194,8 +194,25 @@ class TestExperienceBuffer(TempDirMixin, unittest.TestCase):
 class TestGenerator(TempDirMixin, unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
-        self.cfg = mut.MLDLConfig(target_count=1, warmup_samples=2, candidate_pool_size=3, validate_top_k=2, max_attempts_per_target=4, train_epochs=1, batch_size=2, hidden_dim=8, output_dir=str(self.tmpdir), min_train_size=2, retrain_every=2, device="cpu")
+        self.cfg = mut.MLDLConfig(
+            target_count=1,
+            warmup_samples=2,
+            candidate_pool_size=3,
+            validate_top_k=2,
+            max_attempts_per_target=4,
+            train_epochs=1,
+            batch_size=2,
+            hidden_dim=8,
+            output_dir=str(self.tmpdir),
+            min_train_size=2,
+            retrain_every=2,
+            device="cpu",
+        )
         self.gen = mut.CamouflageMLDLGenerator(self.cfg)
+
+    def test_resolve_device(self):
+        self.assertIn(self.gen._resolve_device("auto"), {"cpu", "cuda"})
+        self.assertEqual(self.gen._resolve_device("cpu"), "cpu")
 
     def test_warmup(self):
         with patch.object(mut.camo, "build_seed", side_effect=lambda target_index, local_attempt, base_seed: 1000 + local_attempt), \
@@ -205,6 +222,7 @@ class TestGenerator(TempDirMixin, unittest.TestCase):
         x, y_valid, _ = self.gen.buffer.as_arrays()
         self.assertEqual(len(x), 2)
         self.assertEqual(int(np.sum(y_valid)), 1)
+        self.assertIsNotNone(self.gen.last_rejected_candidate)
 
     def test_maybe_train(self):
         for i in range(2):
@@ -218,52 +236,42 @@ class TestGenerator(TempDirMixin, unittest.TestCase):
         mock_save.assert_called_once()
         mock_buf_save.assert_called_once()
 
+    def test_select_action_indexes(self):
+        out = self.gen._select_action_indexes(None)
+        self.assertTrue(out)
+        self.assertLessEqual(len(out), self.cfg.candidate_pool_size)
+
     def test_propose_candidates(self):
-        base_state = {"zone_boost_deltas": [0.0 for _ in range(len(mut.camo.DENSITY_ZONES))]}
+        self.gen.last_rejected_candidate = make_candidate(seed=999)
+        self.gen.last_analysis = mut.RejectionAnalysis(1, 1, 999, 1, 1.0, ["mirror_similarity_high"], ["x"])
         with patch.object(mut.camo, "build_seed", side_effect=lambda target_index, local_attempt, base_seed: 2000 + local_attempt), \
-             patch.object(mut.camo, "generate_candidate_from_seed", side_effect=lambda seed, correction_state=None: make_candidate(seed=seed)), \
-             patch.object(mut.camo, "_guided_state_has_effects", return_value=False, create=True):
-            proposals = self.gen._propose_candidates(1, 1, base_state, analysis=None)
+             patch.object(mut.camo, "generate_candidate_from_seed", side_effect=lambda seed: make_candidate(seed=seed)):
+            proposals = self.gen._propose_candidates(1, 1, self.gen.last_analysis)
         self.assertTrue(proposals)
         self.assertTrue(all(isinstance(p, mut.Proposal) for p in proposals))
+        self.assertLessEqual(len(proposals), self.cfg.candidate_pool_size)
 
-    def test_validate_top_candidates(self):
-        proposals = [
-            mut.Proposal(seed=1, action_idx=0, action_name="a0", guided_state={}, candidate=make_candidate(seed=1), pred_valid=0.8, pred_reward=1.0),
-            mut.Proposal(seed=2, action_idx=1, action_name="a1", guided_state={}, candidate=make_candidate(seed=2), pred_valid=0.6, pred_reward=0.5),
-        ]
-        fake_analysis = types.SimpleNamespace(failure_names=["ratio_olive"])
-        self.gen.last_rejected_candidate = make_candidate(seed=0)
-        with patch.object(mut, "neutral_guided_state", return_value={"zone_boost_deltas": [0.0 for _ in range(len(mut.camo.DENSITY_ZONES))]}), \
-             patch.object(mut.camo, "validate_candidate_result", side_effect=[False, True]), \
-             patch.object(mut.camo, "deep_rejection_analysis", return_value=fake_analysis, create=True), \
-             patch.object(mut.camo, "_merge_guided_generation_state", side_effect=lambda state, analysis: {"zone_boost_deltas": [0.0 for _ in range(len(mut.camo.DENSITY_ZONES))], "reject_streak": 1}, create=True), \
+    def test_validate_top_candidates_accepts(self):
+        proposal = mut.Proposal(seed=1, action_idx=0, action_name="a0", candidate=make_candidate(seed=1), pred_valid=0.7, pred_reward=0.1)
+        with patch.object(mut.camo, "validate_candidate_result", return_value=True), \
+             patch.object(self.gen, "maybe_train", return_value=None) as maybe_train, \
+             patch.object(self.gen.bandit, "update") as bandit_update:
+            accepted, best_analysis = self.gen._validate_top_candidates([proposal], target_index=1, local_attempt=1)
+        self.assertIs(accepted, proposal)
+        self.assertIsNone(best_analysis)
+        maybe_train.assert_called_once()
+        bandit_update.assert_called_once()
+
+    def test_validate_top_candidates_rejects(self):
+        proposal = mut.Proposal(seed=1, action_idx=0, action_name="a0", candidate=make_invalid_candidate(seed=1), pred_valid=0.2, pred_reward=-0.1)
+        with patch.object(mut.camo, "validate_candidate_result", return_value=False), \
              patch.object(self.gen, "maybe_train", return_value=None), \
-             patch.object(self.gen.bandit, "update") as mock_update:
-            accepted, analysis, state = self.gen._validate_top_candidates(proposals, 1, 1)
-        self.assertIsNotNone(accepted)
-        self.assertIsNotNone(state)
-        mock_update.assert_called_once()
-
-    def test_generate(self):
-        self.gen.last_rejected_candidate = make_candidate(seed=0)
-        accepted = mut.Proposal(seed=10, action_idx=0, action_name="boost_olive", guided_state={}, candidate=make_candidate(seed=10), pred_valid=0.9, pred_reward=2.0)
-        with patch.object(mut.camo, "generate_candidate_from_seed", return_value=make_candidate(seed=0)), \
-             patch.object(mut, "neutral_guided_state", return_value={"zone_boost_deltas": [0.0 for _ in range(len(mut.camo.DENSITY_ZONES))]}), \
-             patch.object(self.gen, "warmup", return_value=None), \
-             patch.object(self.gen, "maybe_train", return_value={"loss": 0.1}), \
-             patch.object(self.gen, "_propose_candidates", return_value=[accepted]), \
-             patch.object(self.gen, "_validate_top_candidates", return_value=(accepted, None, {"zone_boost_deltas": [0.0 for _ in range(len(mut.camo.DENSITY_ZONES))]})), \
-             patch.object(mut.camo, "save_candidate_image") as mock_save, \
-             patch.object(mut.camo, "candidate_row", return_value={"index": 1, "seed": 10}) as mock_row, \
-             patch.object(mut.camo, "write_report") as mock_report, \
-             patch.object(self.gen, "_write_summary") as mock_summary:
-            rows = self.gen.generate()
-        self.assertEqual(rows, [{"index": 1, "seed": 10}])
-        mock_save.assert_called_once()
-        mock_row.assert_called_once()
-        mock_report.assert_called_once()
-        mock_summary.assert_called_once()
+             patch.object(self.gen.bandit, "update") as bandit_update:
+            accepted, best_analysis = self.gen._validate_top_candidates([proposal], target_index=1, local_attempt=1)
+        self.assertIsNone(accepted)
+        self.assertIsInstance(best_analysis, mut.RejectionAnalysis)
+        bandit_update.assert_called_once()
+        self.assertIsNotNone(self.gen.last_rejected_candidate)
 
     def test_write_summary(self):
         self.gen.rows = [{"index": 1}]
@@ -271,34 +279,103 @@ class TestGenerator(TempDirMixin, unittest.TestCase):
         self.gen._write_summary()
         path = self.tmpdir / "run_summary_ml_dl.json"
         self.assertTrue(path.exists())
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(payload["total_rows"], 1)
+        summary = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(summary["total_rows"], 1)
+        self.assertEqual(summary["total_attempts"], 3)
+
+    def test_generate(self):
+        candidate = make_candidate(seed=7)
+        proposal = mut.Proposal(seed=7, action_idx=0, action_name="a0", candidate=candidate, pred_valid=0.8, pred_reward=1.0)
+        row = {"index": 1, "seed": 7}
+
+        def fake_warmup():
+            self.gen.last_rejected_candidate = make_invalid_candidate(seed=5)
+            self.gen.last_analysis = mut.RejectionAnalysis(0, 1, 5, 1, 1.0, ["mirror_similarity_high"], ["x"])
+
+        with patch.object(self.gen, "warmup", side_effect=fake_warmup), \
+             patch.object(self.gen, "maybe_train", return_value=None), \
+             patch.object(self.gen, "_propose_candidates", return_value=[proposal]), \
+             patch.object(self.gen, "_validate_top_candidates", return_value=(proposal, None)), \
+             patch.object(mut.camo, "save_candidate_image") as save_img, \
+             patch.object(mut.camo, "candidate_row", return_value=row), \
+             patch.object(mut.camo, "write_report") as write_report:
+            rows = self.gen.generate()
+        self.assertEqual(rows, [row])
+        save_img.assert_called_once()
+        write_report.assert_called_once()
+        self.assertTrue((self.tmpdir / "run_summary_ml_dl.json").exists())
 
 
-class TestCLI(unittest.TestCase):
+class TestCliAndPublicAPI(TempDirMixin, unittest.TestCase):
     def test_parse_args(self):
-        argv = ["camouflage_ml_dl.py", "--target-count", "5", "--warmup-samples", "16", "--candidate-pool-size", "4", "--validate-top-k", "2", "--output-dir", "out_dir"]
-        with patch.object(sys, "argv", argv):
+        with patch.object(sys, "argv", [
+            "prog",
+            "--target-count", "2",
+            "--warmup-samples", "4",
+            "--candidate-pool-size", "5",
+            "--validate-top-k", "2",
+            "--max-attempts-per-target", "11",
+            "--train-epochs", "3",
+            "--batch-size", "7",
+            "--learning-rate", "0.02",
+            "--hidden-dim", "16",
+            "--device", "cpu",
+            "--base-seed", "999",
+            "--output-dir", str(self.tmpdir),
+            "--alpha-ucb", "1.7",
+            "--min-train-size", "8",
+            "--retrain-every", "9",
+            "--random-seed", "111",
+        ]):
             cfg = mut.parse_args()
-        self.assertEqual(cfg.target_count, 5)
-        self.assertEqual(cfg.output_dir, "out_dir")
+        self.assertEqual(cfg.target_count, 2)
+        self.assertEqual(cfg.warmup_samples, 4)
+        self.assertEqual(cfg.output_dir, str(self.tmpdir))
+        self.assertEqual(cfg.random_seed, 111)
+
+    def test_build_config_from_main_args(self):
+        args = types.SimpleNamespace(
+            target_count=3,
+            mldl_warmup_samples=4,
+            mldl_candidate_pool_size=5,
+            mldl_validate_top_k=2,
+            mldl_max_attempts_per_target=10,
+            mldl_train_epochs=6,
+            mldl_batch_size=7,
+            mldl_learning_rate=0.01,
+            mldl_hidden_dim=16,
+            mldl_device="cpu",
+            base_seed=999,
+            output_dir=str(self.tmpdir),
+            mldl_alpha_ucb=1.7,
+            mldl_min_train_size=8,
+            mldl_retrain_every=9,
+            random_seed=111,
+        )
+        cfg = mut.build_config_from_main_args(args)
+        self.assertEqual(cfg.target_count, 3)
+        self.assertEqual(cfg.hidden_dim, 16)
+        self.assertEqual(cfg.output_dir, str(self.tmpdir))
+
+    def test_run_guided_generation(self):
+        cfg = mut.MLDLConfig(target_count=1, output_dir=str(self.tmpdir), random_seed=123)
+        summary_path = self.tmpdir / "run_summary_ml_dl.json"
+        summary_path.write_text(json.dumps({"total_attempts": 5}), encoding="utf-8")
+        with patch.object(mut, "CamouflageMLDLGenerator") as runner_cls:
+            runner = runner_cls.return_value
+            runner.generate.return_value = [{"index": 1}]
+            rows, summary = mut.run_guided_generation(cfg)
+        self.assertEqual(rows, [{"index": 1}])
+        self.assertEqual(summary["total_attempts"], 5)
 
     def test_main(self):
-        cfg = mut.MLDLConfig(target_count=2, output_dir="out_dir_test")
-        fake_runner = types.SimpleNamespace(generate=Mock(return_value=[{"index": 1}, {"index": 2}]), total_attempts=7)
+        cfg = mut.MLDLConfig(target_count=1, output_dir=str(self.tmpdir), random_seed=123)
         with patch.object(mut, "parse_args", return_value=cfg), \
-             patch.object(mut, "CamouflageMLDLGenerator", return_value=fake_runner), \
-             patch.object(mut.random, "seed") as mock_rseed, \
-             patch.object(mut.np.random, "seed") as mock_nseed, \
-             patch.object(mut.torch, "manual_seed") as mock_tseed, \
-             patch.object(mut.torch.cuda, "is_available", return_value=False):
+             patch.object(mut, "run_guided_generation", return_value=([{"index": 1}], {"total_attempts": 7})) as run_mock:
             mut.main()
-        fake_runner.generate.assert_called_once()
-        mock_rseed.assert_called_once_with(cfg.random_seed)
-        mock_nseed.assert_called_once_with(cfg.random_seed)
-        mock_tseed.assert_called_once_with(cfg.random_seed)
+        run_mock.assert_called_once_with(cfg)
 
 
 if __name__ == "__main__":
-    LOGGER.info("========== DÉBUT DES TESTS test_camouflage_ml_dl.py ==========")
+    LOGGER.info("========== DÉBUT DES TESTS test_camouflage_ml_dl_guided.py ==========")
     unittest.main(verbosity=2)
