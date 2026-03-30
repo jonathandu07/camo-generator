@@ -21,9 +21,11 @@ Approche :
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import math
 import random
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -43,7 +45,19 @@ except Exception:  # pragma: no cover
     TensorDataset = None
     TORCH_AVAILABLE = False
 
-import main as camo
+def _resolve_camo_module():
+    """
+    Résout le module de génération sans dupliquer `main` lorsqu'il est lancé
+    comme script (`__main__`).
+    """
+    for name in ("main", "__main__"):
+        mod = sys.modules.get(name)
+        if mod is not None and hasattr(mod, "generate_candidate_from_seed") and hasattr(mod, "validate_candidate_result"):
+            return mod
+    return importlib.import_module("main")
+
+
+camo = _resolve_camo_module()
 
 
 # ============================================================
@@ -828,20 +842,57 @@ def parse_args() -> MLDLConfig:
     )
 
 
+def build_config_from_main_args(args: Any) -> MLDLConfig:
+    return MLDLConfig(
+        target_count=int(getattr(args, "target_count", 20)),
+        warmup_samples=int(getattr(args, "mldl_warmup_samples", 128)),
+        candidate_pool_size=int(getattr(args, "mldl_candidate_pool_size", 8)),
+        validate_top_k=int(getattr(args, "mldl_validate_top_k", 3)),
+        max_attempts_per_target=int(getattr(args, "mldl_max_attempts_per_target", 120)),
+        train_epochs=int(getattr(args, "mldl_train_epochs", 24)),
+        batch_size=int(getattr(args, "mldl_batch_size", 32)),
+        learning_rate=float(getattr(args, "mldl_learning_rate", 1e-3)),
+        hidden_dim=int(getattr(args, "mldl_hidden_dim", 128)),
+        device=str(getattr(args, "mldl_device", "auto")),
+        base_seed=int(getattr(args, "base_seed", camo.DEFAULT_BASE_SEED)),
+        output_dir=str(getattr(args, "output_dir", "camouflages_ml_dl")),
+        alpha_ucb=float(getattr(args, "mldl_alpha_ucb", 1.25)),
+        min_train_size=int(getattr(args, "mldl_min_train_size", 32)),
+        retrain_every=int(getattr(args, "mldl_retrain_every", 24)),
+        random_seed=int(getattr(args, "random_seed", 12345)),
+    )
+
+
+def run_guided_generation(config: MLDLConfig) -> Tuple[List[Dict[str, object]], Dict[str, Any]]:
+    random.seed(config.random_seed)
+    np.random.seed(config.random_seed)
+    if TORCH_AVAILABLE:
+        torch.manual_seed(config.random_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(config.random_seed)
+
+    runner = CamouflageMLDLGenerator(config)
+    rows = runner.generate()
+    summary_path = Path(config.output_dir) / "run_summary_ml_dl.json"
+    summary = {}
+    if summary_path.exists():
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except Exception:
+            summary = {}
+    summary.setdefault("target_count", config.target_count)
+    summary.setdefault("total_attempts", runner.total_attempts)
+    summary.setdefault("output_dir", str(Path(config.output_dir).resolve()))
+    summary.setdefault("report", str((Path(config.output_dir) / config.report_name).resolve()))
+    return rows, summary
+
+
 def main() -> None:
     cfg = parse_args()
-    random.seed(cfg.random_seed)
-    np.random.seed(cfg.random_seed)
-    if TORCH_AVAILABLE:
-        torch.manual_seed(cfg.random_seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(cfg.random_seed)
-
-    runner = CamouflageMLDLGenerator(cfg)
-    rows = runner.generate()
+    rows, summary = run_guided_generation(cfg)
     print("Terminé.")
     print(f"Camouflages validés : {len(rows)}/{cfg.target_count}")
-    print(f"Tentatives totales : {runner.total_attempts}")
+    print(f"Tentatives totales : {int(summary.get('total_attempts', 0))}")
     print(f"Dossier : {Path(cfg.output_dir).resolve()}")
     print(f"Rapport : {(Path(cfg.output_dir) / cfg.report_name).resolve()}")
 
