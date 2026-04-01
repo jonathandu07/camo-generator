@@ -36,6 +36,7 @@ from PIL import Image as PILImage
 from PIL import ImageDraw
 from PIL import ImageFilter
 
+
 try:
     import psutil
 except Exception:
