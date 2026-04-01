@@ -147,7 +147,7 @@ APP_TITLE = "Camouflage Armée Fédérale Europe"
 DEFAULT_OUTPUT_DIR = Path(getattr(camo, "OUTPUT_DIR", "camouflages_federale_europe_8k"))
 DEFAULT_TARGET_COUNT = int(getattr(camo, "N_VARIANTS_REQUIRED", 100))
 DEFAULT_TOP_K = 20
-REPORT_NAME = "rapport_camouflages_front.csv"
+REPORT_NAME = "rapport_camouflages.csv"
 BEST_DIR_NAME = "best_of"
 
 RUN_MODE_BLOCKING = "blocking"
@@ -157,7 +157,8 @@ RUN_MODE_SKIP_TESTS = "skip_tests"
 THUMB_SIZE = (240, 150)
 GALLERY_COLUMNS = 3
 MAX_GALLERY_ITEMS = 24
-DEFAULT_SOLDIER_MODEL_PATH = Path(os.getenv("CAMO_SOLDIER_MODEL", "1774949910078.png"))
+SCRIPT_DIR = Path(__file__).resolve().parent
+SOLDIER_MODEL_BASENAMES = ("soldat_modele_vert.png", "1774949910078.png", "soldat_modele.png")
 
 ES_CONTINUOUS = 0x80000000
 ES_SYSTEM_REQUIRED = 0x00000001
@@ -370,6 +371,71 @@ async def async_write_report(rows: List[dict], output_dir: Path, filename: str =
     return await asyncio.to_thread(camo.write_report, rows, output_dir, filename)
 
 
+def build_backend_compatible_output_path(
+    output_dir: Path,
+    target_index: int,
+    local_attempt: int,
+    global_attempt: int,
+    candidate: camo.CandidateResult,
+) -> Path:
+    builder = getattr(camo, "build_unique_camo_path", None)
+    if callable(builder):
+        try:
+            return Path(builder(
+                output_dir=output_dir,
+                target_index=target_index,
+                seed=int(candidate.seed),
+                local_attempt=local_attempt,
+                global_attempt=global_attempt,
+            ))
+        except Exception:
+            pass
+
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    nano = time.time_ns() % 1_000_000_000
+    return output_dir / (
+        f"camouflage_{int(target_index):03d}"
+        f"_s{int(candidate.seed)}"
+        f"_a{int(local_attempt):04d}"
+        f"_g{int(global_attempt):06d}"
+        f"_{timestamp}_{nano:09d}.png"
+    )
+
+
+def build_candidate_row_compatible(
+    target_index: int,
+    local_attempt: int,
+    global_attempt: int,
+    candidate: camo.CandidateResult,
+    saved_path: Path,
+) -> Dict[str, Any]:
+    row_builder = getattr(camo, "candidate_row", None)
+    if callable(row_builder):
+        try:
+            return row_builder(
+                target_index,
+                local_attempt,
+                global_attempt,
+                candidate,
+                image_name=saved_path.name,
+                image_path=str(saved_path),
+            )
+        except TypeError:
+            row = row_builder(target_index, local_attempt, global_attempt, candidate)
+            if isinstance(row, dict):
+                row["image_name"] = saved_path.name
+                row["image_path"] = str(saved_path)
+                return row
+    return {
+        "index": target_index,
+        "seed": int(candidate.seed),
+        "attempts_for_this_image": local_attempt,
+        "global_attempt": global_attempt,
+        "image_name": saved_path.name,
+        "image_path": str(saved_path),
+    }
+
+
 # ============================================================
 # PROJECTION SUR SOLDAT MODÈLE (aperçu uniquement)
 # ============================================================
@@ -406,6 +472,7 @@ class ProjectionConfig:
 
 PROJECTION_CFG = ProjectionConfig()
 _PROJECTION_SUBJECT_CACHE: Optional[np.ndarray] = None
+_PROJECTION_SUBJECT_PATH: Optional[Path] = None
 
 
 def ensure_odd(v: int) -> int:
@@ -429,14 +496,55 @@ def read_bgr(path: str | Path) -> np.ndarray:
     return img
 
 
+def read_pil_rgb(path: str | Path) -> PILImage.Image:
+    with PILImage.open(path) as img:
+        return img.convert("RGB")
+
+
+def resolve_soldier_model_path() -> Path:
+    env_value = os.getenv("CAMO_SOLDIER_MODEL", "").strip()
+    candidates: List[Path] = []
+    if env_value:
+        candidates.append(Path(env_value).expanduser())
+
+    for name in SOLDIER_MODEL_BASENAMES:
+        candidates.extend([
+            SCRIPT_DIR / name,
+            Path.cwd() / name,
+            SCRIPT_DIR / "images" / name,
+            SCRIPT_DIR / "assets" / name,
+            Path.cwd() / "images" / name,
+            Path.cwd() / "assets" / name,
+        ])
+
+    # Fallback utile dans l'environnement de génération de cette conversation.
+    candidates.append(Path("/mnt/data/1774949910078.png"))
+
+    seen = set()
+    uniq: List[Path] = []
+    for p in candidates:
+        key = str(p)
+        if key not in seen:
+            uniq.append(p)
+            seen.add(key)
+
+    for candidate in uniq:
+        if candidate.exists():
+            return candidate.resolve()
+
+    searched = "\n - ".join(str(p) for p in uniq)
+    raise FileNotFoundError(
+        "Image modèle introuvable. Place 'soldat_modele_vert.png' à côté de start.py "
+        "ou définis la variable CAMO_SOLDIER_MODEL. Emplacements testés:\n - " + searched
+    )
+
+
 def get_projection_subject_bgr() -> np.ndarray:
-    global _PROJECTION_SUBJECT_CACHE
-    if _PROJECTION_SUBJECT_CACHE is None:
-        if not DEFAULT_SOLDIER_MODEL_PATH.exists():
-            raise FileNotFoundError(
-                f"Image modèle introuvable: {DEFAULT_SOLDIER_MODEL_PATH}"
-            )
-        _PROJECTION_SUBJECT_CACHE = read_bgr(DEFAULT_SOLDIER_MODEL_PATH)
+    global _PROJECTION_SUBJECT_CACHE, _PROJECTION_SUBJECT_PATH
+    model_path = resolve_soldier_model_path()
+    if _PROJECTION_SUBJECT_CACHE is None or _PROJECTION_SUBJECT_PATH != model_path:
+        _PROJECTION_SUBJECT_PATH = model_path
+        _PROJECTION_SUBJECT_CACHE = read_bgr(model_path)
     return _PROJECTION_SUBJECT_CACHE.copy()
 
 
@@ -785,18 +893,25 @@ class GalleryThumb(Button):
             Color(*C["stroke_soft"])
             Line(rounded_rectangle=(self.x, self.y, self.width, self.height, r), width=1.0)
 
+    def set_thumbnail_pil(self, pil_img: PILImage.Image):
+        try:
+            self.thumb.texture = pil_to_coreimage(pil_img).texture
+        except Exception:
+            pass
+
     def load_thumbnail(self):
         try:
-            img = PILImage.open(self.image_path).convert("RGB")
-            self.thumb.texture = pil_to_coreimage(make_thumbnail(img, THUMB_SIZE)).texture
+            img = read_pil_rgb(self.image_path)
+            self.set_thumbnail_pil(make_thumbnail(img, THUMB_SIZE))
+            self.app_ref.request_gallery_projection(self.image_path, self)
         except Exception:
             pass
 
     def _open_preview(self, *_):
         try:
-            pil_img = PILImage.open(self.image_path).convert("RGB")
-            projected = projection_preview_image(pil_img)
-            self.app_ref.update_preview(pil_img, projected)
+            pil_img = read_pil_rgb(self.image_path)
+            self.app_ref.update_preview(pil_img, pil_img)
+            self.app_ref.request_preview_projection(self.image_path, pil_img)
             self.app_ref.log(f"Aperçu galerie : {self.image_path.name}")
         except Exception as exc:
             self.app_ref.log(f"Impossible d'ouvrir {self.image_path.name} : {exc}")
@@ -835,6 +950,9 @@ class CamouflageApp(App):
         self.diag_last_rules: List[str] = []
         self._runtime_subscription_active = False
         self._runtime_subscriber_callback = None
+        self.gallery_projection_cache: Dict[str, PILImage.Image] = {}
+        self.gallery_projection_pending: Dict[str, List["GalleryThumb"]] = {}
+        self.preview_projection_cache: Dict[str, PILImage.Image] = {}
 
         self.status_label: Optional[Label] = None
         self.attempt_text: Optional[Label] = None
@@ -1058,6 +1176,77 @@ class CamouflageApp(App):
         box.add_widget(pane)
         return box
 
+    def _projection_cache_key(self, image_path: Path) -> str:
+        try:
+            stat = image_path.stat()
+            return f"{image_path.resolve()}::{stat.st_mtime_ns}::{stat.st_size}"
+        except Exception:
+            return str(image_path.resolve())
+
+    def request_gallery_projection(self, image_path: Path, thumb_widget: "GalleryThumb"):
+        key = self._projection_cache_key(image_path)
+        cached = self.gallery_projection_cache.get(key)
+        if cached is not None:
+            thumb_widget.set_thumbnail_pil(cached)
+            return
+        waiters = self.gallery_projection_pending.setdefault(key, [])
+        waiters.append(thumb_widget)
+        if len(waiters) > 1:
+            return
+        fut = self.async_runner.submit(self._async_build_gallery_projection(image_path))
+        fut.add_done_callback(lambda f, k=key: self._on_gallery_projection_done(k, f))
+
+    async def _async_build_gallery_projection(self, image_path: Path) -> PILImage.Image:
+        pil_img = await asyncio.to_thread(read_pil_rgb, image_path)
+        projected = await asyncio.to_thread(projection_preview_image, pil_img)
+        return await asyncio.to_thread(make_thumbnail, projected, THUMB_SIZE)
+
+    def _on_gallery_projection_done(self, key: str, fut: Future):
+        try:
+            thumb_img = fut.result()
+        except Exception as exc:
+            thumb_img = None
+            self.log(f"Projection galerie impossible : {exc}")
+        Clock.schedule_once(lambda dt: self._apply_gallery_projection_done(key, thumb_img), 0)
+
+    @mainthread
+    def _apply_gallery_projection_done(self, key: str, thumb_img: Optional[PILImage.Image]):
+        waiters = self.gallery_projection_pending.pop(key, [])
+        if thumb_img is None:
+            return
+        self.gallery_projection_cache[key] = thumb_img
+        for thumb in waiters:
+            try:
+                thumb.set_thumbnail_pil(thumb_img)
+            except Exception:
+                pass
+
+    def request_preview_projection(self, image_path: Path, raw_img: PILImage.Image):
+        key = self._projection_cache_key(image_path)
+        cached = self.preview_projection_cache.get(key)
+        if cached is not None:
+            self.update_preview(raw_img, cached)
+            return
+        fut = self.async_runner.submit(self._async_build_preview_projection(image_path))
+        fut.add_done_callback(lambda f, k=key, img=raw_img.copy(): self._on_preview_projection_done(k, img, f))
+
+    async def _async_build_preview_projection(self, image_path: Path) -> PILImage.Image:
+        pil_img = await asyncio.to_thread(read_pil_rgb, image_path)
+        return await asyncio.to_thread(projection_preview_image, pil_img)
+
+    def _on_preview_projection_done(self, key: str, raw_img: PILImage.Image, fut: Future):
+        try:
+            projected = fut.result()
+        except Exception as exc:
+            self.log(f"Projection aperçu impossible : {exc}")
+            return
+        Clock.schedule_once(lambda dt, k=key, r=raw_img, p=projected: self._apply_preview_projection_done(k, r, p), 0)
+
+    @mainthread
+    def _apply_preview_projection_done(self, key: str, raw_img: PILImage.Image, projected: PILImage.Image):
+        self.preview_projection_cache[key] = projected
+        self.update_preview(raw_img, projected)
+
     # ---------- runtime ----------
     def on_start(self):
         try:
@@ -1066,6 +1255,12 @@ class CamouflageApp(App):
             pass
         self._subscribe_runtime_feed()
         self._emit_runtime("INFO", "start", "Interface Kivy démarrée")
+        try:
+            model_path = resolve_soldier_model_path()
+            self.log(f"Modèle soldat chargé : {model_path}")
+        except Exception as exc:
+            self.log(str(exc))
+            self.status("Modèle soldat introuvable", ok=False)
 
     def _emit_runtime(self, level: str, source: str, message: str, **payload: Any):
         if camo_log is None or not hasattr(camo_log, "log_event"):
@@ -1564,23 +1759,33 @@ class CamouflageApp(App):
                         await asyncio.sleep(0)
                         continue
 
-                    filename = self.current_output_dir / f"camouflage_{target_index:03d}.png"
+                    filename = build_backend_compatible_output_path(
+                        output_dir=self.current_output_dir,
+                        target_index=target_index,
+                        local_attempt=local_attempt,
+                        global_attempt=total_attempts,
+                        candidate=candidate,
+                    )
                     self.update_live_stage("export image", target_index, local_attempt, seed, metrics_text=metrics_text, pil_img=projection_img)
-                    await async_save_candidate_image(candidate, filename)
+                    saved_path = await async_save_candidate_image(candidate, filename)
                     record = CandidateRecord(
                         index=target_index,
                         seed=candidate.seed,
                         local_attempt=local_attempt,
                         global_attempt=total_attempts,
-                        image_path=filename,
+                        image_path=saved_path,
                         metrics={k: float(v) for k, v in candidate.metrics.items()},
                         ratios=candidate.ratios.copy(),
                     )
                     self.best_records.append(record)
                     self.best_records.sort(key=candidate_rank_key)
-                    row = camo.candidate_row(target_index, local_attempt, total_attempts, candidate)
-                    row["image_path"] = str(filename)
-                    rows.append(row)
+                    rows.append(build_candidate_row_compatible(
+                        target_index=target_index,
+                        local_attempt=local_attempt,
+                        global_attempt=total_attempts,
+                        candidate=candidate,
+                        saved_path=saved_path,
+                    ))
                     self.accepted_count = len(rows)
                     self.update_progress(len(rows), target_count)
                     self.update_live_stage("accepté", target_index, local_attempt, seed, metrics_text=metrics_text, pil_img=projection_img)
@@ -1598,7 +1803,7 @@ class CamouflageApp(App):
                         candidate.metrics,
                     )
                     self.log(
-                        f"[img={target_index:03d}] accepté -> {filename.name} | "
+                        f"[img={target_index:03d}] accepté -> {saved_path.name} | "
                         f"MAE={scores['ratio_mae']:.6f} | olive={scores['largest_olive_component_ratio']:.4f}"
                     )
                     self.reload_gallery()
