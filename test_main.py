@@ -549,8 +549,8 @@ class TestPureUtilities(TempDirMixin, AssertionsMixin, GeometryMixin, unittest.T
         self.assertFloatClose(sx, 5.0)
         self.assertFloatClose(sy, 2.5)
         sx2, sy2 = mut.scaled_patch_size(10.0, 5.0, 0.0)
-        self.assertFloatClose(sx2, 2.5)
-        self.assertFloatClose(sy2, 1.25)
+        self.assertFloatClose(sx2, 10.0 * mut.MIN_MOTIF_SCALE)
+        self.assertFloatClose(sy2, 5.0 * mut.MIN_MOTIF_SCALE)
 
     def test_downsample_center_crop_shift_reflect_and_cells(self) -> None:
         arr = np.arange(16, dtype=np.uint8).reshape(4, 4)
@@ -736,6 +736,18 @@ class TestValidationAndExports(TempDirMixin, AssertionsMixin, GeometryMixin, uni
         self.assertIn("largest_olive_component_ratio", row)
         self.assertIn("physical_width_cm", row)
         self.assertIn("motif_scale", row)
+        self.assertIn("image_name", row)
+        self.assertIn("image_path", row)
+
+    def test_unique_camo_helpers_and_deduped_save(self) -> None:
+        candidate = make_candidate(seed=888)
+        path1 = mut.build_unique_camo_path(self.tmpdir, 1, candidate.seed, 2, 3)
+        self.assertTrue(path1.name.startswith("camouflage_001_"))
+        saved1 = mut.save_candidate_image(candidate, path1)
+        saved2 = mut.save_candidate_image(candidate, path1)
+        self.assertTrue(saved1.exists())
+        self.assertTrue(saved2.exists())
+        self.assertNotEqual(saved1, saved2)
 
     def test_write_report_with_rows_and_empty_rows(self) -> None:
         row = mut.candidate_row(1, 1, 1, make_candidate())
@@ -804,7 +816,10 @@ class TestAsyncHelpersAndOrchestrator(
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["seed"], 211)
         progress.assert_awaited_once()
-        self.assertTrue((self.tmpdir / "camouflage_001.png").exists())
+        saved_images = sorted(self.tmpdir.glob("camouflage_*.png"))
+        self.assertEqual(len(saved_images), 1)
+        self.assertEqual(rows[0]["image_name"], saved_images[0].name)
+        self.assertEqual(Path(rows[0]["image_path"]), saved_images[0])
         self.assertTrue((self.tmpdir / "rapport_camouflages.csv").exists())
         self.assertTrue((self.tmpdir / "run_summary.json").exists())
 
