@@ -13,7 +13,7 @@ Corrections principales :
 
 Principes :
 - 8K horizontal par défaut : 7680 x 4320
-- échelle physique par défaut : 240 cm x 135 cm
+- échelle physique par défaut : 768 cm x 432 cm (1 px = 1 mm à 1 m)
 - hiérarchie multi-échelle en centimètres pour lecture longue / moyenne / courte distance
 - génération overscan + crop central pour éviter les artefacts de bord
 - génération mémoire-maîtrisée : une couche à la fois, crop avant empilement
@@ -60,11 +60,11 @@ DEFAULT_HEIGHT = 4320
 WIDTH = DEFAULT_WIDTH
 HEIGHT = DEFAULT_HEIGHT
 
-DEFAULT_PHYSICAL_WIDTH_CM = 240.0
-DEFAULT_PHYSICAL_HEIGHT_CM = 135.0
+DEFAULT_PHYSICAL_WIDTH_CM = 768.0
+DEFAULT_PHYSICAL_HEIGHT_CM = 432.0
 PHYSICAL_WIDTH_CM = DEFAULT_PHYSICAL_WIDTH_CM
 PHYSICAL_HEIGHT_CM = DEFAULT_PHYSICAL_HEIGHT_CM
-PX_PER_CM = WIDTH / PHYSICAL_WIDTH_CM
+PX_PER_CM = min(WIDTH / PHYSICAL_WIDTH_CM, HEIGHT / PHYSICAL_HEIGHT_CM)
 
 N_VARIANTS_REQUIRED = 100
 DEFAULT_BASE_SEED = 202603120000
@@ -98,8 +98,11 @@ DEFAULT_RESOURCE_SAMPLE_EVERY_BATCHES = 1
 DEFAULT_OVERSCAN = 1.10
 
 # Réduit pour obtenir des motifs plus fins tout en conservant une lecture multi-distance.
+MIN_MOTIF_SCALE = 0.10
+MAX_MOTIF_SCALE = 1.20
 DEFAULT_MOTIF_SCALE = 0.58
 MOTIF_SCALE = DEFAULT_MOTIF_SCALE
+MIN_PATCH_PX = 2.0
 
 # Validation stricte adaptée au moteur organique 8K.
 MAX_ABS_ERROR_PER_COLOR = np.array([0.0015, 0.0015, 0.0015, 0.0015], dtype=float)
@@ -351,7 +354,7 @@ def set_canvas_geometry(
     px_per_cm_x = WIDTH / PHYSICAL_WIDTH_CM
     px_per_cm_y = HEIGHT / PHYSICAL_HEIGHT_CM
     PX_PER_CM = min(px_per_cm_x, px_per_cm_y)
-    MOTIF_SCALE = motif_scale
+    MOTIF_SCALE = max(MIN_MOTIF_SCALE, min(MAX_MOTIF_SCALE, motif_scale))
 
 
 def set_motif_scale(motif_scale: float) -> float:
@@ -359,7 +362,7 @@ def set_motif_scale(motif_scale: float) -> float:
     motif_scale = float(motif_scale)
     if motif_scale <= 0:
         raise ValueError("motif_scale doit être > 0")
-    MOTIF_SCALE = motif_scale
+    MOTIF_SCALE = max(MIN_MOTIF_SCALE, min(MAX_MOTIF_SCALE, motif_scale))
     return MOTIF_SCALE
 
 
@@ -637,15 +640,15 @@ def shift_reflect(arr: np.ndarray, dy: int, dx: int) -> np.ndarray:
 
 def cells_for_patch_size(patch_cm_x: float, patch_cm_y: float, width_px: int, height_px: int) -> Tuple[int, int]:
     # On abaisse le plancher pour permettre des motifs réellement plus fins en 8K.
-    patch_px_x = max(4.0, float(patch_cm_x) * PX_PER_CM)
-    patch_px_y = max(4.0, float(patch_cm_y) * PX_PER_CM)
+    patch_px_x = max(MIN_PATCH_PX, float(patch_cm_x) * PX_PER_CM)
+    patch_px_y = max(MIN_PATCH_PX, float(patch_cm_y) * PX_PER_CM)
     cells_x = max(3, int(round(width_px / patch_px_x)))
     cells_y = max(3, int(round(height_px / patch_px_y)))
     return cells_x, cells_y
 
 
 def scaled_patch_size(patch_cm_x: float, patch_cm_y: float, motif_scale: float) -> Tuple[float, float]:
-    motif_scale = max(0.25, float(motif_scale))
+    motif_scale = max(MIN_MOTIF_SCALE, min(MAX_MOTIF_SCALE, float(motif_scale)))
     return float(patch_cm_x) * motif_scale, float(patch_cm_y) * motif_scale
 
 
@@ -1008,14 +1011,77 @@ def validate_candidate_result(candidate: CandidateResult) -> bool:
 # EXPORT / RAPPORT
 # ============================================================
 
-def save_candidate_image(candidate: CandidateResult, path: Path) -> Path:
+def build_unique_camo_name(
+    target_index: int,
+    seed: int,
+    local_attempt: int,
+    global_attempt: Optional[int] = None,
+    *,
+    prefix: str = "camouflage",
+    ext: str = "png",
+) -> str:
+    ext = ext.lstrip(".") or "png"
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    nano = time.time_ns() % 1_000_000_000
+    global_part = f"_g{int(global_attempt):06d}" if global_attempt is not None else ""
+    return (
+        f"{prefix}_{int(target_index):03d}"
+        f"_s{int(seed)}"
+        f"_a{int(local_attempt):04d}"
+        f"{global_part}_{timestamp}_{nano:09d}.{ext}"
+    )
+
+
+def build_unique_camo_path(
+    output_dir: Path,
+    target_index: int,
+    seed: int,
+    local_attempt: int,
+    global_attempt: Optional[int] = None,
+    *,
+    prefix: str = "camouflage",
+    ext: str = "png",
+) -> Path:
+    output_dir = ensure_output_dir(output_dir)
+    return output_dir / build_unique_camo_name(
+        target_index=target_index,
+        seed=seed,
+        local_attempt=local_attempt,
+        global_attempt=global_attempt,
+        prefix=prefix,
+        ext=ext,
+    )
+
+
+def _dedupe_output_path(path: Path) -> Path:
     path = Path(path)
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    counter = 1
+    while True:
+        candidate = path.with_name(f"{stem}__dup{counter:03d}{suffix}")
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+def save_candidate_image(candidate: CandidateResult, path: Path) -> Path:
+    path = _dedupe_output_path(Path(path))
     path.parent.mkdir(parents=True, exist_ok=True)
     candidate.image.save(path)
     return path
 
 
-def candidate_row(target_index: int, local_attempt: int, global_attempt: int, candidate: CandidateResult) -> Dict[str, object]:
+def candidate_row(
+    target_index: int,
+    local_attempt: int,
+    global_attempt: int,
+    candidate: CandidateResult,
+    image_name: Optional[str] = None,
+    image_path: Optional[str] = None,
+) -> Dict[str, object]:
     rs = candidate.ratios
     metrics = candidate.metrics
     return {
@@ -1041,6 +1107,8 @@ def candidate_row(target_index: int, local_attempt: int, global_attempt: int, ca
         "physical_height_cm": round(float(metrics["physical_height_cm"]), 3),
         "px_per_cm": round(float(metrics["px_per_cm"]), 6),
         "motif_scale": round(float(metrics["motif_scale"]), 6),
+        "image_name": image_name or "",
+        "image_path": image_path or "",
     }
 
 
@@ -1210,9 +1278,22 @@ async def async_generate_all(
                 continue
 
             accepted_attempt, accepted_candidate = accepted_item
-            filename = output_dir / f"camouflage_{target_index:03d}.png"
-            save_candidate_image(accepted_candidate, filename)
-            rows.append(candidate_row(target_index, accepted_attempt, counters.attempts, accepted_candidate))
+            filename = build_unique_camo_path(
+                output_dir=output_dir,
+                target_index=target_index,
+                seed=accepted_candidate.seed,
+                local_attempt=accepted_attempt,
+                global_attempt=counters.attempts,
+            )
+            saved_path = save_candidate_image(accepted_candidate, filename)
+            rows.append(candidate_row(
+                target_index,
+                accepted_attempt,
+                counters.attempts,
+                accepted_candidate,
+                image_name=saved_path.name,
+                image_path=str(saved_path),
+            ))
             counters.accepted += 1
 
             if live_console:
