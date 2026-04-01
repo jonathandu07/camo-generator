@@ -151,6 +151,7 @@ DEFAULT_TARGET_COUNT = int(getattr(camo, "N_VARIANTS_REQUIRED", 100))
 DEFAULT_TOP_K = 20
 REPORT_NAME = "rapport_camouflages.csv"
 BEST_DIR_NAME = "best_of"
+MANNEQUIN_DIR_NAME = "mannequin_previews"
 
 RUN_MODE_BLOCKING = "blocking"
 RUN_MODE_NON_BLOCKING = "non_blocking"
@@ -371,6 +372,18 @@ async def async_save_candidate_image(candidate: camo.CandidateResult, path: Path
 
 async def async_write_report(rows: List[dict], output_dir: Path, filename: str = REPORT_NAME) -> Path:
     return await asyncio.to_thread(camo.write_report, rows, output_dir, filename)
+
+
+def save_mannequin_projection_sync(projection_img: PILImage.Image, saved_camo_path: Path, output_dir: Path) -> Path:
+    mannequin_dir = Path(output_dir) / MANNEQUIN_DIR_NAME
+    mannequin_dir.mkdir(parents=True, exist_ok=True)
+    out_path = mannequin_dir / f"{Path(saved_camo_path).stem}__mannequin.png"
+    projection_img.save(out_path, format="PNG")
+    return out_path
+
+
+async def async_save_mannequin_projection(projection_img: PILImage.Image, saved_camo_path: Path, output_dir: Path) -> Path:
+    return await asyncio.to_thread(save_mannequin_projection_sync, projection_img, saved_camo_path, output_dir)
 
 
 def build_backend_compatible_output_path(
@@ -1975,6 +1988,11 @@ class CamouflageApp(App):
                     )
                     self.update_live_stage("export image", target_index, local_attempt, seed, metrics_text=metrics_text, pil_img=projection_img)
                     saved_path = await async_save_candidate_image(candidate, filename)
+                    mannequin_saved_path = await async_save_mannequin_projection(
+                        projection_img,
+                        saved_path,
+                        self.current_output_dir,
+                    )
                     record = CandidateRecord(
                         index=target_index,
                         seed=candidate.seed,
@@ -1986,13 +2004,16 @@ class CamouflageApp(App):
                     )
                     self.best_records.append(record)
                     self.best_records.sort(key=candidate_rank_key)
-                    rows.append(build_candidate_row_compatible(
+                    row = build_candidate_row_compatible(
                         target_index=target_index,
                         local_attempt=local_attempt,
                         global_attempt=total_attempts,
                         candidate=candidate,
                         saved_path=saved_path,
-                    ))
+                    )
+                    row["mannequin_image_name"] = mannequin_saved_path.name
+                    row["mannequin_image_path"] = str(mannequin_saved_path)
+                    rows.append(row)
                     self.accepted_count = len(rows)
                     self.update_progress(len(rows), target_count)
                     self.update_live_stage("accepté", target_index, local_attempt, seed, metrics_text=metrics_text, pil_img=projection_img)
@@ -2011,6 +2032,7 @@ class CamouflageApp(App):
                     )
                     self.log(
                         f"[img={target_index:03d}] accepté -> {saved_path.name} | "
+                        f"mannequin -> {mannequin_saved_path.name} | "
                         f"MAE={scores['ratio_mae']:.6f} | olive={scores['largest_olive_component_ratio']:.4f}"
                     )
                     self.reload_gallery()

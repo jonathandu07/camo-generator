@@ -34,3 +34,7 @@
 2026-04-01 21:46:13 | INFO     | camo_supervisor | [start] Interface Kivy démarrée
 2026-04-01 21:46:33 | INFO     | camo_supervisor | [main_preflight] Préflight local validé | payload={"snapshot": {"cpu_count": 4.0, "disk_free_mb": 167714.51953125, "machine_intensity": 0.98, "process_cpu_percent": 0.0, "process_rss_mb": 275.07421875, "system_available_mb": 18826.83984375, "system_cpu_percent": 0.0, "system_total_mb": 32724.37890625, "ts": 1775072793.9039865}}
 2026-04-01 22:09:36 | INFO     | camo_supervisor | [start] Interface Kivy démarrée
+2026-04-01 22:16:10 | INFO     | camo_supervisor | [start] Interface Kivy démarrée
+2026-04-01 22:16:52 | INFO     | camo_supervisor | [main_preflight] Préflight local validé | payload={"snapshot": {"cpu_count": 4.0, "disk_free_mb": 167713.11328125, "machine_intensity": 0.98, "process_cpu_percent": 0.0, "process_rss_mb": 2258.328125, "system_available_mb": 16156.60546875, "system_cpu_percent": 0.0, "system_total_mb": 32724.37890625, "ts": 1775074612.8210855}}
+2026-04-01 22:51:04 | INFO     | camo_supervisor | [start] Interface Kivy démarrée
+2026-04-01 22:51:33 | INFO     | camo_supervisor | [main_preflight] Préflight local validé | payload={"snapshot": {"cpu_count": 4.0, "disk_free_mb": 167707.140625, "machine_intensity": 0.98, "process_cpu_percent": 0.0, "process_rss_mb": 184.96484375, "system_available_mb": 17807.87890625, "system_cpu_percent": 100.0, "system_total_mb": 32724.37890625, "ts": 1775076693.9840074}}
