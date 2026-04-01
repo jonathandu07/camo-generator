@@ -36,7 +36,6 @@ from PIL import Image as PILImage
 from PIL import ImageDraw
 from PIL import ImageFilter
 
-
 try:
     import psutil
 except Exception:
@@ -157,6 +156,7 @@ RUN_MODE_SKIP_TESTS = "skip_tests"
 
 THUMB_SIZE = (240, 150)
 GALLERY_COLUMNS = 3
+MAX_GALLERY_ITEMS = 24
 DEFAULT_SOLDIER_MODEL_PATH = Path(os.getenv("CAMO_SOLDIER_MODEL", "/mnt/data/1774949910078.png"))
 
 ES_CONTINUOUS = 0x80000000
@@ -788,11 +788,7 @@ class GalleryThumb(Button):
     def load_thumbnail(self):
         try:
             img = PILImage.open(self.image_path).convert("RGB")
-            try:
-                thumb_img = projection_preview_image(img)
-            except Exception:
-                thumb_img = img
-            self.thumb.texture = pil_to_coreimage(make_thumbnail(thumb_img, THUMB_SIZE)).texture
+            self.thumb.texture = pil_to_coreimage(make_thumbnail(img, THUMB_SIZE)).texture
         except Exception:
             pass
 
@@ -1021,10 +1017,9 @@ class CamouflageApp(App):
 
         self._refresh_controls_state()
         self._refresh_run_mode_buttons()
-        self.reload_gallery()
         self._refresh_diag_labels()
         Clock.schedule_interval(self._update_resource_monitor, 1.0)
-        Clock.schedule_interval(lambda dt: self.reload_gallery(), 3.0)
+        Clock.schedule_once(lambda dt: self.reload_gallery(), 0.2)
         return root
 
     # ---------- helpers UI ----------
@@ -1304,7 +1299,10 @@ class CamouflageApp(App):
         self.gallery_grid.clear_widgets()
         if not self.current_output_dir.exists():
             return
-        for p in sorted(self.current_output_dir.glob("camouflage_*.png")):
+        paths = sorted(self.current_output_dir.glob("camouflage_*.png"))
+        if MAX_GALLERY_ITEMS > 0:
+            paths = paths[-MAX_GALLERY_ITEMS:]
+        for p in reversed(paths):
             self.gallery_grid.add_widget(GalleryThumb(self, p))
 
     # ---------- preflight ----------
