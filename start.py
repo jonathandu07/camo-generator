@@ -8,7 +8,9 @@ Corrections principales :
 - remplace les anciens scores "visuels" par les vraies métriques strictes du backend ;
 - garde la génération séquentielle stricte avec aperçu live ;
 - ajoute une analyse locale des règles de rejet à partir des seuils de main.py ;
-- conserve l'export rapport + best_of côté front.
+- conserve l'export rapport + best_of côté front ;
+- intègre une projection mannequin plus robuste et physiquement cohérente
+  avec la géométrie du main.py.
 """
 
 from __future__ import annotations
@@ -440,39 +442,69 @@ def build_candidate_row_compatible(
 # PROJECTION SUR SOLDAT MODÈLE (aperçu uniquement)
 # ============================================================
 
-
 @dataclass
 class ProjectionConfig:
-    # Détection du vert uniforme sur le soldat modèle.
-    hue_min: int = 32
-    hue_max: int = 92
-    sat_min: int = 55
-    val_min: int = 40
+    # Détection initiale large du vert.
+    hue_min: int = 35
+    hue_max: int = 95
+    sat_min: int = 20
+    val_min: int = 20
     sat_max: int = 255
-    val_max: int = 235
+    val_max: int = 190
 
-    # Protection des accessoires / zones non à repeindre.
-    dark_val_max: int = 65
-    dark_sat_max: int = 110
-
-    # Composition.
-    camo_scale_hat: float = 0.75
-    camo_scale_jacket: float = 0.95
-    camo_scale_pants: float = 1.05
-    shadow_strength: float = 0.95
-    detail_strength: float = 0.40
-    edge_darkening: float = 0.25
-    alpha_gamma: float = 1.0
+    # Protection des zones sombres non à repeindre.
+    dark_val_max: int = 70
+    dark_sat_max: int = 120
 
     # Morphologie.
     open_kernel: int = 3
-    close_kernel: int = 9
-    blur_radius: int = 9
+    close_kernel: int = 7
+    blur_radius: int = 7
+
+    # Répartition verticale du vêtement.
+    hat_ratio: float = 0.13
+    jacket_ratio: float = 0.41
+    pants_ratio: float = 0.46
+
+    # Approximation physique du mannequin visible.
+    uniform_visible_height_cm: float = 160.0
+
+    # Adaptation physique quand la source est un camouflage plein format.
+    hat_scale_multiplier: float = 0.92
+    jacket_scale_multiplier: float = 1.00
+    pants_scale_multiplier: float = 1.08
+
+    # Fallback quand la source est un petit tile.
+    tile_hat_width_ratio: float = 0.32
+    tile_jacket_width_ratio: float = 0.25
+    tile_pants_width_ratio: float = 0.22
+
+    # Bornes globales de scale.
+    min_region_scale: float = 0.16
+    max_region_scale: float = 1.55
+
+    # Composition.
+    shadow_strength: float = 0.95
+    detail_strength: float = 0.42
+    edge_darkening: float = 0.25
+    alpha_gamma: float = 1.0
 
 
 PROJECTION_CFG = ProjectionConfig()
 _PROJECTION_SUBJECT_CACHE: Optional[np.ndarray] = None
 _PROJECTION_SUBJECT_PATH: Optional[Path] = None
+_PROJECTION_ANALYSIS_CACHE: Optional["ProjectionSubjectAnalysis"] = None
+_PROJECTION_ANALYSIS_PATH: Optional[Path] = None
+
+
+@dataclass
+class ProjectionSubjectAnalysis:
+    model_path: Path
+    subject_bgr: np.ndarray
+    uniform_mask: np.ndarray
+    bbox: Tuple[int, int, int, int]
+    regions: Dict[str, np.ndarray]
+    mannequin_px_per_cm: float
 
 
 def ensure_odd(v: int) -> int:
@@ -517,7 +549,6 @@ def resolve_soldier_model_path() -> Path:
             Path.cwd() / "assets" / name,
         ])
 
-    # Fallback utile dans l'environnement de génération de cette conversation.
     candidates.append(Path("/mnt/data/1774949910078.png"))
 
     seen = set()
@@ -534,7 +565,7 @@ def resolve_soldier_model_path() -> Path:
 
     searched = "\n - ".join(str(p) for p in uniq)
     raise FileNotFoundError(
-        "Image modèle introuvable. Place 'soldat_modele_vert.png' à côté de start.py "
+        "Image modèle introuvable. Place '1774949910078.png' ou 'soldat_modele_vert.png' à côté de start.py, "
         "ou définis la variable CAMO_SOLDIER_MODEL. Emplacements testés:\n - " + searched
     )
 
@@ -576,44 +607,94 @@ def person_mask_from_foreground(bgr: np.ndarray) -> np.ndarray:
     return out
 
 
+def largest_component_mask(mask: np.ndarray) -> Tuple[np.ndarray, Tuple[int, int, int, int], int]:
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num_labels <= 1:
+        zero = np.zeros_like(mask)
+        return zero, (0, 0, 0, 0), 0
+
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    best = 1 + int(np.argmax(areas))
+
+    x = int(stats[best, cv2.CC_STAT_LEFT])
+    y = int(stats[best, cv2.CC_STAT_TOP])
+    w = int(stats[best, cv2.CC_STAT_WIDTH])
+    h = int(stats[best, cv2.CC_STAT_HEIGHT])
+    area = int(stats[best, cv2.CC_STAT_AREA])
+
+    out = np.zeros_like(mask)
+    out[labels == best] = 255
+    return out, (x, y, w, h), area
+
+
+def refine_green_thresholds(subject_bgr: np.ndarray, broad_mask: np.ndarray, cfg: ProjectionConfig) -> Tuple[np.ndarray, np.ndarray]:
+    hsv = cv2.cvtColor(subject_bgr, cv2.COLOR_BGR2HSV)
+    px = hsv[broad_mask > 0]
+    if px.size == 0:
+        lower = np.array([cfg.hue_min, cfg.sat_min, cfg.val_min], dtype=np.uint8)
+        upper = np.array([cfg.hue_max, cfg.sat_max, cfg.val_max], dtype=np.uint8)
+        return lower, upper
+
+    h_vals = px[:, 0].astype(np.float32)
+    s_vals = px[:, 1].astype(np.float32)
+    v_vals = px[:, 2].astype(np.float32)
+
+    lower = np.array([
+        max(cfg.hue_min, int(np.quantile(h_vals, 0.02)) - 4),
+        max(18, int(np.quantile(s_vals, 0.03)) - 10),
+        max(18, int(np.quantile(v_vals, 0.03)) - 10),
+    ], dtype=np.uint8)
+
+    upper = np.array([
+        min(cfg.hue_max, int(np.quantile(h_vals, 0.98)) + 4),
+        255,
+        min(cfg.val_max, int(np.quantile(v_vals, 0.98)) + 25),
+    ], dtype=np.uint8)
+
+    return lower, upper
+
+
 def green_uniform_mask(subject_bgr: np.ndarray, cfg: ProjectionConfig) -> np.ndarray:
     hsv = cv2.cvtColor(subject_bgr, cv2.COLOR_BGR2HSV)
     person = person_mask_from_foreground(subject_bgr)
 
-    lower = np.array([cfg.hue_min, cfg.sat_min, cfg.val_min], dtype=np.uint8)
-    upper = np.array([cfg.hue_max, cfg.sat_max, cfg.val_max], dtype=np.uint8)
-    green = cv2.inRange(hsv, lower, upper)
-    green = cv2.bitwise_and(green, person)
+    lower0 = np.array([cfg.hue_min, cfg.sat_min, cfg.val_min], dtype=np.uint8)
+    upper0 = np.array([cfg.hue_max, cfg.sat_max, cfg.val_max], dtype=np.uint8)
+
+    broad = cv2.inRange(hsv, lower0, upper0)
+    broad = cv2.bitwise_and(broad, person)
 
     dark = (((hsv[:, :, 2] <= cfg.dark_val_max) & (hsv[:, :, 1] <= cfg.dark_sat_max))).astype(np.uint8) * 255
-    green = cv2.bitwise_and(green, 255 - dark)
+    broad = cv2.bitwise_and(broad, 255 - dark)
 
     open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (cfg.open_kernel, cfg.open_kernel))
     close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (cfg.close_kernel, cfg.close_kernel))
-    green = cv2.morphologyEx(green, cv2.MORPH_OPEN, open_k)
-    green = cv2.morphologyEx(green, cv2.MORPH_CLOSE, close_k)
 
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(green, connectivity=8)
-    keep = np.zeros_like(green)
-    if num_labels > 1:
-        areas = stats[1:, cv2.CC_STAT_AREA]
-        largest_area = int(np.max(areas)) if len(areas) else 0
-        for label in range(1, num_labels):
-            area = int(stats[label, cv2.CC_STAT_AREA])
-            y = int(stats[label, cv2.CC_STAT_TOP])
-            w = int(stats[label, cv2.CC_STAT_WIDTH])
-            h = int(stats[label, cv2.CC_STAT_HEIGHT])
-            if area >= max(200, int(largest_area * 0.01)) and h >= 15 and w >= 8:
-                if not (y < 20 and area < 1500):
-                    keep[labels == label] = 255
-        green = keep
+    broad = cv2.morphologyEx(broad, cv2.MORPH_OPEN, open_k)
+    broad = cv2.morphologyEx(broad, cv2.MORPH_CLOSE, close_k)
+
+    broad_main, _bbox, area = largest_component_mask(broad)
+    if area <= 0:
+        blur_k = ensure_odd(cfg.blur_radius)
+        return cv2.GaussianBlur(broad, (blur_k, blur_k), 0)
+
+    lower, upper = refine_green_thresholds(subject_bgr, broad_main, cfg)
+
+    refined = cv2.inRange(hsv, lower, upper)
+    refined = cv2.bitwise_and(refined, person)
+    refined = cv2.bitwise_and(refined, 255 - dark)
+
+    refined = cv2.morphologyEx(refined, cv2.MORPH_OPEN, open_k)
+    refined = cv2.morphologyEx(refined, cv2.MORPH_CLOSE, close_k)
+
+    refined_main, _bbox2, _area2 = largest_component_mask(refined)
 
     blur_k = ensure_odd(cfg.blur_radius)
-    green = cv2.GaussianBlur(green, (blur_k, blur_k), 0)
-    return green
+    refined_main = cv2.GaussianBlur(refined_main, (blur_k, blur_k), 0)
+    return refined_main
 
 
-def split_uniform_regions(mask: np.ndarray) -> Dict[str, np.ndarray]:
+def split_uniform_regions(mask: np.ndarray, cfg: ProjectionConfig) -> Dict[str, np.ndarray]:
     yy, xx = np.where(mask > 32)
     if len(xx) == 0:
         zero = np.zeros_like(mask)
@@ -623,8 +704,8 @@ def split_uniform_regions(mask: np.ndarray) -> Dict[str, np.ndarray]:
     y1, y2 = int(np.min(yy)), int(np.max(yy))
     total_h = max(1, y2 - y1)
 
-    hat_y2 = y1 + int(total_h * 0.12)
-    jacket_y2 = y1 + int(total_h * 0.52)
+    hat_y2 = y1 + int(total_h * cfg.hat_ratio)
+    jacket_y2 = hat_y2 + int(total_h * cfg.jacket_ratio)
 
     hat = np.zeros_like(mask)
     jacket = np.zeros_like(mask)
@@ -642,16 +723,131 @@ def split_uniform_regions(mask: np.ndarray) -> Dict[str, np.ndarray]:
     return {"hat": hat, "jacket": jacket, "pants": pants}
 
 
+def bbox_from_mask(mask: np.ndarray) -> Tuple[int, int, int, int]:
+    yy, xx = np.where(mask > 32)
+    if len(xx) == 0:
+        return (0, 0, 0, 0)
+    x1, x2 = int(np.min(xx)), int(np.max(xx))
+    y1, y2 = int(np.min(yy)), int(np.max(yy))
+    return (x1, y1, x2 - x1 + 1, y2 - y1 + 1)
+
+
+def build_projection_subject_analysis(cfg: ProjectionConfig = PROJECTION_CFG) -> ProjectionSubjectAnalysis:
+    model_path = resolve_soldier_model_path()
+    subject_bgr = get_projection_subject_bgr()
+    uniform_mask = green_uniform_mask(subject_bgr, cfg)
+    bbox = bbox_from_mask(uniform_mask)
+    regions = split_uniform_regions(uniform_mask, cfg)
+
+    _, _, _, bbox_h = bbox
+    mannequin_px_per_cm = (bbox_h / max(1.0, cfg.uniform_visible_height_cm)) if bbox_h > 0 else 1.0
+
+    return ProjectionSubjectAnalysis(
+        model_path=model_path,
+        subject_bgr=subject_bgr,
+        uniform_mask=uniform_mask,
+        bbox=bbox,
+        regions=regions,
+        mannequin_px_per_cm=float(max(0.01, mannequin_px_per_cm)),
+    )
+
+
+def get_projection_subject_analysis(cfg: ProjectionConfig = PROJECTION_CFG) -> ProjectionSubjectAnalysis:
+    global _PROJECTION_ANALYSIS_CACHE, _PROJECTION_ANALYSIS_PATH
+    model_path = resolve_soldier_model_path()
+    if _PROJECTION_ANALYSIS_CACHE is None or _PROJECTION_ANALYSIS_PATH != model_path:
+        _PROJECTION_ANALYSIS_CACHE = build_projection_subject_analysis(cfg)
+        _PROJECTION_ANALYSIS_PATH = model_path
+    return _PROJECTION_ANALYSIS_CACHE
+
+
+def is_full_camo_canvas(camo_bgr: np.ndarray) -> bool:
+    h, w = camo_bgr.shape[:2]
+    expected_w = int(getattr(camo, "WIDTH", 0))
+    expected_h = int(getattr(camo, "HEIGHT", 0))
+
+    if expected_w > 0 and expected_h > 0:
+        ar_src = w / max(1, h)
+        ar_ref = expected_w / max(1, expected_h)
+        if w >= min(2048, expected_w // 2) and h >= min(1024, expected_h // 2):
+            if abs(ar_src - ar_ref) < 0.20:
+                return True
+
+    return w >= 2048 and h >= 1024
+
+
+def estimate_camo_px_per_cm(camo_bgr: np.ndarray) -> float:
+    h, w = camo_bgr.shape[:2]
+
+    physical_w = float(getattr(camo, "PHYSICAL_WIDTH_CM", max(1, w)))
+    physical_h = float(getattr(camo, "PHYSICAL_HEIGHT_CM", max(1, h)))
+
+    ppcm_x = w / max(1.0, physical_w)
+    ppcm_y = h / max(1.0, physical_h)
+
+    fallback = float(getattr(camo, "PX_PER_CM", max(1.0, min(ppcm_x, ppcm_y))))
+    ppcm = min(ppcm_x, ppcm_y)
+    return float(ppcm if ppcm > 0 else fallback)
+
+
+def adaptive_region_scale(
+    region_name: str,
+    region_mask: np.ndarray,
+    camo_bgr: np.ndarray,
+    analysis: ProjectionSubjectAnalysis,
+    cfg: ProjectionConfig,
+) -> float:
+    _rx, _ry, rw, rh = bbox_from_mask(region_mask)
+    if rw <= 0 or rh <= 0:
+        return 1.0
+
+    if is_full_camo_canvas(camo_bgr):
+        mannequin_ppcm = float(analysis.mannequin_px_per_cm)
+        camo_ppcm = float(max(1e-6, estimate_camo_px_per_cm(camo_bgr)))
+
+        base_scale = mannequin_ppcm / camo_ppcm
+
+        if region_name == "hat":
+            scale = base_scale * cfg.hat_scale_multiplier
+        elif region_name == "pants":
+            scale = base_scale * cfg.pants_scale_multiplier
+        else:
+            scale = base_scale * cfg.jacket_scale_multiplier
+
+        _ux, _uy, uniform_w, _uh = analysis.bbox
+        if uniform_w > 0:
+            width_ratio = rw / max(1.0, uniform_w)
+            scale *= np.clip(0.85 + width_ratio * 0.75, 0.80, 1.18)
+
+        return float(np.clip(scale, cfg.min_region_scale, cfg.max_region_scale))
+
+    _camo_h, camo_w = camo_bgr.shape[:2]
+    if region_name == "hat":
+        target_w = rw * cfg.tile_hat_width_ratio
+    elif region_name == "pants":
+        target_w = rw * cfg.tile_pants_width_ratio
+    else:
+        target_w = rw * cfg.tile_jacket_width_ratio
+
+    scale = target_w / max(1.0, float(camo_w))
+    return float(np.clip(scale, cfg.min_region_scale, cfg.max_region_scale))
+
+
 def tile_camo(camo_bgr: np.ndarray, shape_hw: Tuple[int, int], scale: float, seed: int) -> np.ndarray:
     h, w = shape_hw
     ch, cw = camo_bgr.shape[:2]
-    scale = max(0.15, float(scale))
+
+    scale = max(0.05, float(scale))
     nw = max(32, int(round(cw * scale)))
     nh = max(32, int(round(ch * scale)))
-    camo_resized = cv2.resize(camo_bgr, (nw, nh), interpolation=cv2.INTER_CUBIC)
+
+    interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+    camo_resized = cv2.resize(camo_bgr, (nw, nh), interpolation=interp)
+
     rep_x = int(np.ceil(w / nw)) + 2
     rep_y = int(np.ceil(h / nh)) + 2
     tiled = np.tile(camo_resized, (rep_y, rep_x, 1))
+
     ox = (seed * 37 + w * 3) % nw
     oy = (seed * 53 + h * 5) % nh
     return tiled[oy:oy + h, ox:ox + w]
@@ -693,21 +889,28 @@ def compose_region(base_bgr: np.ndarray, region_mask: np.ndarray, camo_bgr: np.n
 
 
 def apply_camo_to_reference(subject_bgr: np.ndarray, camo_bgr: np.ndarray, cfg: ProjectionConfig = PROJECTION_CFG) -> Tuple[np.ndarray, np.ndarray]:
-    mask = green_uniform_mask(subject_bgr, cfg)
-    regions = split_uniform_regions(mask)
+    analysis = get_projection_subject_analysis(cfg)
+    mask = analysis.uniform_mask
+    regions = analysis.regions
+
+    hat_scale = adaptive_region_scale("hat", regions["hat"], camo_bgr, analysis, cfg)
+    jacket_scale = adaptive_region_scale("jacket", regions["jacket"], camo_bgr, analysis, cfg)
+    pants_scale = adaptive_region_scale("pants", regions["pants"], camo_bgr, analysis, cfg)
 
     out = subject_bgr.copy()
-    out = compose_region(out, regions["hat"], camo_bgr, cfg.camo_scale_hat, seed=11, cfg=cfg)
-    out = compose_region(out, regions["jacket"], camo_bgr, cfg.camo_scale_jacket, seed=29, cfg=cfg)
-    out = compose_region(out, regions["pants"], camo_bgr, cfg.camo_scale_pants, seed=47, cfg=cfg)
+    out = compose_region(out, regions["hat"], camo_bgr, hat_scale, seed=11, cfg=cfg)
+    out = compose_region(out, regions["jacket"], camo_bgr, jacket_scale, seed=29, cfg=cfg)
+    out = compose_region(out, regions["pants"], camo_bgr, pants_scale, seed=47, cfg=cfg)
     return out, mask
 
 
 def projection_preview_image(camo_img: PILImage.Image, cfg: ProjectionConfig = PROJECTION_CFG) -> PILImage.Image:
-    subject_bgr = get_projection_subject_bgr()
+    analysis = get_projection_subject_analysis(cfg)
+    subject_bgr = analysis.subject_bgr.copy()
     camo_bgr = pil_rgb_to_bgr(camo_img)
     projected_bgr, _mask = apply_camo_to_reference(subject_bgr, camo_bgr, cfg=cfg)
     return bgr_to_pil_rgb(projected_bgr)
+
 
 # ============================================================
 # WIDGETS UI
@@ -1198,6 +1401,7 @@ class CamouflageApp(App):
 
     async def _async_build_gallery_projection(self, image_path: Path) -> PILImage.Image:
         pil_img = await asyncio.to_thread(read_pil_rgb, image_path)
+        await asyncio.to_thread(get_projection_subject_analysis, PROJECTION_CFG)
         projected = await asyncio.to_thread(projection_preview_image, pil_img)
         return await asyncio.to_thread(make_thumbnail, projected, THUMB_SIZE)
 
@@ -1232,6 +1436,7 @@ class CamouflageApp(App):
 
     async def _async_build_preview_projection(self, image_path: Path) -> PILImage.Image:
         pil_img = await asyncio.to_thread(read_pil_rgb, image_path)
+        await asyncio.to_thread(get_projection_subject_analysis, PROJECTION_CFG)
         return await asyncio.to_thread(projection_preview_image, pil_img)
 
     def _on_preview_projection_done(self, key: str, raw_img: PILImage.Image, fut: Future):
@@ -1258,6 +1463,8 @@ class CamouflageApp(App):
         try:
             model_path = resolve_soldier_model_path()
             self.log(f"Modèle soldat chargé : {model_path}")
+            # préchauffe le cache d'analyse du mannequin
+            _ = get_projection_subject_analysis(PROJECTION_CFG)
         except Exception as exc:
             self.log(str(exc))
             self.status("Modèle soldat introuvable", ok=False)
