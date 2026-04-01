@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
 
+import cv2
 import numpy as np
 from PIL import Image as PILImage
 from PIL import ImageDraw
@@ -155,6 +156,7 @@ RUN_MODE_SKIP_TESTS = "skip_tests"
 
 THUMB_SIZE = (240, 150)
 GALLERY_COLUMNS = 3
+DEFAULT_SOLDIER_MODEL_PATH = Path(os.getenv("CAMO_SOLDIER_MODEL", "/mnt/data/1774949910078.png"))
 
 ES_CONTINUOUS = 0x80000000
 ES_SYSTEM_REQUIRED = 0x00000001
@@ -368,145 +370,235 @@ async def async_write_report(rows: List[dict], output_dir: Path, filename: str =
 
 
 # ============================================================
-# SILHOUETTE (aperçu uniquement)
+# PROJECTION SUR SOLDAT MODÈLE (aperçu uniquement)
 # ============================================================
 
 
-def build_silhouette_alpha(width: int, height: int, supersample: int = 4) -> np.ndarray:
-    width = max(32, int(width))
-    height = max(32, int(height))
-    ss = max(2, int(supersample))
-    W = width * ss
-    H = height * ss
-    cx = W // 2
+@dataclass
+class ProjectionConfig:
+    # Détection du vert uniforme sur le soldat modèle.
+    hue_min: int = 32
+    hue_max: int = 92
+    sat_min: int = 55
+    val_min: int = 40
+    sat_max: int = 255
+    val_max: int = 235
 
-    img = PILImage.new("L", (W, H), 0)
-    draw = ImageDraw.Draw(img)
+    # Protection des accessoires / zones non à repeindre.
+    dark_val_max: int = 65
+    dark_sat_max: int = 110
 
-    def rr(box: Tuple[int, int, int, int], radius: int, fill: int = 255) -> None:
-        x1, y1, x2, y2 = [int(v) for v in box]
-        draw.rounded_rectangle([x1, y1, x2, y2], radius=max(1, int(radius)), fill=fill)
+    # Composition.
+    camo_scale_hat: float = 0.75
+    camo_scale_jacket: float = 0.95
+    camo_scale_pants: float = 1.05
+    shadow_strength: float = 0.95
+    detail_strength: float = 0.40
+    edge_darkening: float = 0.25
+    alpha_gamma: float = 1.0
 
-    def poly(points: List[Tuple[int, int]], fill: int = 255) -> None:
-        draw.polygon([(int(x), int(y)) for x, y in points], fill=fill)
-
-    helmet_w = int(W * 0.19)
-    helmet_h = int(H * 0.10)
-    helmet_y1 = int(H * 0.04)
-    rr((cx - helmet_w // 2, helmet_y1, cx + helmet_w // 2, helmet_y1 + helmet_h), radius=int(helmet_w * 0.36))
-
-    head_w = int(W * 0.15)
-    head_h = int(H * 0.095)
-    head_y1 = int(H * 0.055)
-    rr((cx - head_w // 2, head_y1, cx + head_w // 2, head_y1 + head_h), radius=int(head_w * 0.45))
-
-    neck_w = int(W * 0.055)
-    neck_h = int(H * 0.030)
-    neck_y1 = int(H * 0.145)
-    rr((cx - neck_w // 2, neck_y1, cx + neck_w // 2, neck_y1 + neck_h), radius=int(neck_w * 0.35))
-
-    torso_top_y = int(H * 0.17)
-    torso_bottom_y = int(H * 0.52)
-    shoulder_half = int(W * 0.195)
-    waist_half = int(W * 0.120)
-    poly([
-        (cx - shoulder_half, torso_top_y),
-        (cx + shoulder_half, torso_top_y),
-        (cx + waist_half, torso_bottom_y),
-        (cx - waist_half, torso_bottom_y),
-    ])
-    rr((cx - int(W * 0.145), int(H * 0.22), cx + int(W * 0.145), int(H * 0.47)), radius=int(W * 0.038))
-
-    left_arm = [
-        (cx - int(W * 0.17), int(H * 0.18)),
-        (cx - int(W * 0.29), int(H * 0.24)),
-        (cx - int(W * 0.25), int(H * 0.43)),
-        (cx - int(W * 0.17), int(H * 0.50)),
-        (cx - int(W * 0.12), int(H * 0.46)),
-        (cx - int(W * 0.16), int(H * 0.25)),
-    ]
-    right_arm = [(W - x, y) for x, y in left_arm]
-    poly(left_arm)
-    poly(right_arm)
-    rr((cx - int(W * 0.30), int(H * 0.23), cx - int(W * 0.23), int(H * 0.45)), radius=int(W * 0.018))
-    rr((cx + int(W * 0.23), int(H * 0.23), cx + int(W * 0.30), int(H * 0.45)), radius=int(W * 0.018))
-
-    pelvis_w = int(W * 0.26)
-    pelvis_h = int(H * 0.09)
-    pelvis_y1 = int(H * 0.50)
-    rr((cx - pelvis_w // 2, pelvis_y1, cx + pelvis_w // 2, pelvis_y1 + pelvis_h), radius=int(W * 0.030))
-
-    left_thigh = [
-        (cx - int(W * 0.09), int(H * 0.57)),
-        (cx - int(W * 0.02), int(H * 0.57)),
-        (cx - int(W * 0.03), int(H * 0.77)),
-        (cx - int(W * 0.10), int(H * 0.77)),
-    ]
-    right_thigh = [(W - x, y) for x, y in left_thigh]
-    poly(left_thigh)
-    poly(right_thigh)
-
-    left_calf = [
-        (cx - int(W * 0.10), int(H * 0.74)),
-        (cx - int(W * 0.03), int(H * 0.74)),
-        (cx - int(W * 0.04), int(H * 0.95)),
-        (cx - int(W * 0.11), int(H * 0.95)),
-    ]
-    right_calf = [(W - x, y) for x, y in left_calf]
-    poly(left_calf)
-    poly(right_calf)
-
-    rr((cx - int(W * 0.125), int(H * 0.93), cx - int(W * 0.015), int(H * 0.98)), radius=int(W * 0.018))
-    rr((cx + int(W * 0.015), int(H * 0.93), cx + int(W * 0.125), int(H * 0.98)), radius=int(W * 0.018))
-
-    img = img.filter(ImageFilter.GaussianBlur(radius=max(1, int(ss * 0.45))))
-    img = img.resize((width, height), resample=PILImage.Resampling.LANCZOS)
-    return np.asarray(img, dtype=np.float32) / 255.0
+    # Morphologie.
+    open_kernel: int = 3
+    close_kernel: int = 9
+    blur_radius: int = 9
 
 
-def build_silhouette_mask(width: int, height: int) -> np.ndarray:
-    return build_silhouette_alpha(width, height) >= 0.50
+PROJECTION_CFG = ProjectionConfig()
+_PROJECTION_SUBJECT_CACHE: Optional[np.ndarray] = None
 
 
-def silhouette_boundary(mask: np.ndarray) -> np.ndarray:
-    b = np.zeros_like(mask, dtype=bool)
-    b[1:, :] |= mask[1:, :] != mask[:-1, :]
-    b[:-1, :] |= mask[:-1, :] != mask[1:, :]
-    b[:, 1:] |= mask[:, 1:] != mask[:, :-1]
-    b[:, :-1] |= mask[:, :-1] != mask[:, 1:]
-    return b & mask
+def ensure_odd(v: int) -> int:
+    return v if int(v) % 2 == 1 else int(v) + 1
 
 
-def silhouette_projection_image(index_canvas: np.ndarray) -> PILImage.Image:
-    h, w = index_canvas.shape
-    alpha = build_silhouette_alpha(w, h)
-    mask_mid = alpha >= 0.42
-    mask_inner = alpha >= 0.72
-    edge_outer = silhouette_boundary(mask_mid)
-    edge_inner = silhouette_boundary(mask_inner)
+def pil_rgb_to_bgr(img: PILImage.Image) -> np.ndarray:
+    arr = np.array(img.convert("RGB"), dtype=np.uint8)
+    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
-    rgb = camo.RGB[index_canvas].astype(np.float32)
 
-    y = np.linspace(0.0, 1.0, h, dtype=np.float32)[:, None, None]
-    x = np.linspace(0.0, 1.0, w, dtype=np.float32)[None, :, None]
-    bg_top = np.array([18.0, 24.0, 31.0], dtype=np.float32)
-    bg_bottom = np.array([34.0, 42.0, 50.0], dtype=np.float32)
-    background = bg_top * (1.0 - y) + bg_bottom * y
-    vignette = 1.0 - 0.16 * np.sqrt((x - 0.5) ** 2 + (y - 0.52) ** 2) / 0.72
-    background = np.clip(background * vignette, 0.0, 255.0)
+def bgr_to_pil_rgb(bgr: np.ndarray) -> PILImage.Image:
+    rgb = cv2.cvtColor(np.ascontiguousarray(bgr), cv2.COLOR_BGR2RGB)
+    return PILImage.fromarray(rgb)
 
-    shadow = np.zeros_like(alpha, dtype=np.float32)
-    dy = max(1, h // 90)
-    dx = max(1, w // 85)
-    shadow[dy:, dx:] = alpha[:-dy, :-dx] * 0.28
-    background = background * (1.0 - shadow[..., None])
 
-    alpha3 = alpha[..., None]
-    comp = background * (1.0 - alpha3) + rgb * alpha3
-    comp[edge_outer] = np.array([244.0, 245.0, 240.0], dtype=np.float32)
-    comp[edge_inner] = comp[edge_inner] * 0.45 + np.array([12.0, 14.0, 18.0], dtype=np.float32) * 0.55
+def read_bgr(path: str | Path) -> np.ndarray:
+    img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if img is None:
+        raise FileNotFoundError(f"Impossible de lire l'image: {path}")
+    return img
 
-    return PILImage.fromarray(np.clip(comp, 0.0, 255.0).astype(np.uint8), "RGB")
+
+def get_projection_subject_bgr() -> np.ndarray:
+    global _PROJECTION_SUBJECT_CACHE
+    if _PROJECTION_SUBJECT_CACHE is None:
+        if not DEFAULT_SOLDIER_MODEL_PATH.exists():
+            raise FileNotFoundError(
+                f"Image modèle introuvable: {DEFAULT_SOLDIER_MODEL_PATH}"
+            )
+        _PROJECTION_SUBJECT_CACHE = read_bgr(DEFAULT_SOLDIER_MODEL_PATH)
+    return _PROJECTION_SUBJECT_CACHE.copy()
+
+
+def white_background_mask(bgr: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    white = ((hsv[:, :, 1] < 30) & (hsv[:, :, 2] > 190)).astype(np.uint8) * 255
+    white = cv2.GaussianBlur(white, (0, 0), 3)
+    return white
+
+
+def person_mask_from_foreground(bgr: np.ndarray) -> np.ndarray:
+    white = white_background_mask(bgr)
+    fg = 255 - white
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, kernel)
+    fg = cv2.morphologyEx(
+        fg,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+    )
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(fg, connectivity=8)
+    if num_labels <= 1:
+        return fg
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    largest = 1 + int(np.argmax(areas))
+    out = np.zeros_like(fg)
+    out[labels == largest] = 255
+    out = cv2.GaussianBlur(out, (0, 0), 2)
+    return out
+
+
+def green_uniform_mask(subject_bgr: np.ndarray, cfg: ProjectionConfig) -> np.ndarray:
+    hsv = cv2.cvtColor(subject_bgr, cv2.COLOR_BGR2HSV)
+    person = person_mask_from_foreground(subject_bgr)
+
+    lower = np.array([cfg.hue_min, cfg.sat_min, cfg.val_min], dtype=np.uint8)
+    upper = np.array([cfg.hue_max, cfg.sat_max, cfg.val_max], dtype=np.uint8)
+    green = cv2.inRange(hsv, lower, upper)
+    green = cv2.bitwise_and(green, person)
+
+    dark = (((hsv[:, :, 2] <= cfg.dark_val_max) & (hsv[:, :, 1] <= cfg.dark_sat_max))).astype(np.uint8) * 255
+    green = cv2.bitwise_and(green, 255 - dark)
+
+    open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (cfg.open_kernel, cfg.open_kernel))
+    close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (cfg.close_kernel, cfg.close_kernel))
+    green = cv2.morphologyEx(green, cv2.MORPH_OPEN, open_k)
+    green = cv2.morphologyEx(green, cv2.MORPH_CLOSE, close_k)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(green, connectivity=8)
+    keep = np.zeros_like(green)
+    if num_labels > 1:
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        largest_area = int(np.max(areas)) if len(areas) else 0
+        for label in range(1, num_labels):
+            area = int(stats[label, cv2.CC_STAT_AREA])
+            y = int(stats[label, cv2.CC_STAT_TOP])
+            w = int(stats[label, cv2.CC_STAT_WIDTH])
+            h = int(stats[label, cv2.CC_STAT_HEIGHT])
+            if area >= max(200, int(largest_area * 0.01)) and h >= 15 and w >= 8:
+                if not (y < 20 and area < 1500):
+                    keep[labels == label] = 255
+        green = keep
+
+    blur_k = ensure_odd(cfg.blur_radius)
+    green = cv2.GaussianBlur(green, (blur_k, blur_k), 0)
+    return green
+
+
+def split_uniform_regions(mask: np.ndarray) -> Dict[str, np.ndarray]:
+    yy, xx = np.where(mask > 32)
+    if len(xx) == 0:
+        zero = np.zeros_like(mask)
+        return {"hat": zero, "jacket": zero, "pants": zero}
+
+    x1, x2 = int(np.min(xx)), int(np.max(xx))
+    y1, y2 = int(np.min(yy)), int(np.max(yy))
+    total_h = max(1, y2 - y1)
+
+    hat_y2 = y1 + int(total_h * 0.12)
+    jacket_y2 = y1 + int(total_h * 0.52)
+
+    hat = np.zeros_like(mask)
+    jacket = np.zeros_like(mask)
+    pants = np.zeros_like(mask)
+
+    hat[y1:hat_y2, x1:x2 + 1] = mask[y1:hat_y2, x1:x2 + 1]
+    jacket[hat_y2:jacket_y2, x1:x2 + 1] = mask[hat_y2:jacket_y2, x1:x2 + 1]
+    pants[jacket_y2:y2 + 1, x1:x2 + 1] = mask[jacket_y2:y2 + 1, x1:x2 + 1]
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    hat = cv2.GaussianBlur(cv2.morphologyEx(hat, cv2.MORPH_OPEN, kernel), (0, 0), 1.0)
+    jacket = cv2.GaussianBlur(cv2.morphologyEx(jacket, cv2.MORPH_OPEN, kernel), (0, 0), 1.0)
+    pants = cv2.GaussianBlur(cv2.morphologyEx(pants, cv2.MORPH_OPEN, kernel), (0, 0), 1.0)
+
+    return {"hat": hat, "jacket": jacket, "pants": pants}
+
+
+def tile_camo(camo_bgr: np.ndarray, shape_hw: Tuple[int, int], scale: float, seed: int) -> np.ndarray:
+    h, w = shape_hw
+    ch, cw = camo_bgr.shape[:2]
+    scale = max(0.15, float(scale))
+    nw = max(32, int(round(cw * scale)))
+    nh = max(32, int(round(ch * scale)))
+    camo_resized = cv2.resize(camo_bgr, (nw, nh), interpolation=cv2.INTER_CUBIC)
+    rep_x = int(np.ceil(w / nw)) + 2
+    rep_y = int(np.ceil(h / nh)) + 2
+    tiled = np.tile(camo_resized, (rep_y, rep_x, 1))
+    ox = (seed * 37 + w * 3) % nw
+    oy = (seed * 53 + h * 5) % nh
+    return tiled[oy:oy + h, ox:ox + w]
+
+
+def shading_detail_edges(subject_bgr: np.ndarray, alpha_mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    gray = cv2.cvtColor(subject_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+    alpha = alpha_mask.astype(np.float32) / 255.0
+
+    soft = cv2.GaussianBlur(gray, (0, 0), sigmaX=23, sigmaY=23)
+    soft = np.clip(soft, 1e-4, 1.0)
+    shading = np.clip(gray / soft, 0.55, 1.50)
+
+    detail = gray - cv2.GaussianBlur(gray, (0, 0), sigmaX=4, sigmaY=4)
+    detail = np.clip(detail, -0.25, 0.25)
+
+    edges = cv2.Canny((gray * 255).astype(np.uint8), 40, 110).astype(np.float32) / 255.0
+    edges = cv2.GaussianBlur(edges, (0, 0), sigmaX=2, sigmaY=2)
+    edges *= alpha
+    return shading, detail, edges
+
+
+def compose_region(base_bgr: np.ndarray, region_mask: np.ndarray, camo_bgr: np.ndarray, scale: float, seed: int, cfg: ProjectionConfig) -> np.ndarray:
+    alpha = (region_mask.astype(np.float32) / 255.0) ** max(0.2, cfg.alpha_gamma)
+    alpha = alpha[..., None]
+
+    tiled = tile_camo(camo_bgr, base_bgr.shape[:2], scale=scale, seed=seed).astype(np.float32) / 255.0
+    shading, detail, edges = shading_detail_edges(base_bgr, region_mask)
+
+    camo_layer = tiled.copy()
+    camo_layer *= (1.0 + (shading[..., None] - 1.0) * cfg.shadow_strength)
+    camo_layer += detail[..., None] * cfg.detail_strength
+    camo_layer *= (1.0 - edges[..., None] * cfg.edge_darkening)
+    camo_layer = np.clip(camo_layer, 0.0, 1.0)
+
+    base = base_bgr.astype(np.float32) / 255.0
+    out = base * (1.0 - alpha) + camo_layer * alpha
+    return (np.clip(out, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+
+def apply_camo_to_reference(subject_bgr: np.ndarray, camo_bgr: np.ndarray, cfg: ProjectionConfig = PROJECTION_CFG) -> Tuple[np.ndarray, np.ndarray]:
+    mask = green_uniform_mask(subject_bgr, cfg)
+    regions = split_uniform_regions(mask)
+
+    out = subject_bgr.copy()
+    out = compose_region(out, regions["hat"], camo_bgr, cfg.camo_scale_hat, seed=11, cfg=cfg)
+    out = compose_region(out, regions["jacket"], camo_bgr, cfg.camo_scale_jacket, seed=29, cfg=cfg)
+    out = compose_region(out, regions["pants"], camo_bgr, cfg.camo_scale_pants, seed=47, cfg=cfg)
+    return out, mask
+
+
+def projection_preview_image(camo_img: PILImage.Image, cfg: ProjectionConfig = PROJECTION_CFG) -> PILImage.Image:
+    subject_bgr = get_projection_subject_bgr()
+    camo_bgr = pil_rgb_to_bgr(camo_img)
+    projected_bgr, _mask = apply_camo_to_reference(subject_bgr, camo_bgr, cfg=cfg)
+    return bgr_to_pil_rgb(projected_bgr)
 
 # ============================================================
 # WIDGETS UI
@@ -695,16 +787,19 @@ class GalleryThumb(Button):
     def load_thumbnail(self):
         try:
             img = PILImage.open(self.image_path).convert("RGB")
-            self.thumb.texture = pil_to_coreimage(make_thumbnail(img, THUMB_SIZE)).texture
+            try:
+                thumb_img = projection_preview_image(img)
+            except Exception:
+                thumb_img = img
+            self.thumb.texture = pil_to_coreimage(make_thumbnail(thumb_img, THUMB_SIZE)).texture
         except Exception:
             pass
 
     def _open_preview(self, *_):
         try:
             pil_img = PILImage.open(self.image_path).convert("RGB")
-            idx = rgb_image_to_index_canvas(pil_img)
-            sil = silhouette_projection_image(idx)
-            self.app_ref.update_preview(pil_img, sil)
+            projected = projection_preview_image(pil_img)
+            self.app_ref.update_preview(pil_img, projected)
             self.app_ref.log(f"Aperçu galerie : {self.image_path.name}")
         except Exception as exc:
             self.app_ref.log(f"Impossible d'ouvrir {self.image_path.name} : {exc}")
@@ -890,7 +985,7 @@ class CamouflageApp(App):
         self.preview_silhouette = Image()
         self.live_preview_img = Image()
         previews.add_widget(self._carded_view("Camouflage courant", self.preview_img))
-        previews.add_widget(self._carded_view("Projection silhouette", self.preview_silhouette))
+        previews.add_widget(self._carded_view("Projection sur soldat modèle", self.preview_silhouette))
 
         live_card = GlassCard(orientation="vertical")
         live_card.add_widget(self._label("Suivi direct de construction"))
@@ -1061,11 +1156,11 @@ class CamouflageApp(App):
             self.progress_bar.value = current
 
     @mainthread
-    def update_preview(self, pil_img: PILImage.Image, silhouette_img: PILImage.Image):
+    def update_preview(self, pil_img: PILImage.Image, projection_img: PILImage.Image):
         if self.preview_img is not None:
             self.preview_img.texture = pil_to_coreimage(pil_img).texture
         if self.preview_silhouette is not None:
-            self.preview_silhouette.texture = pil_to_coreimage(silhouette_img).texture
+            self.preview_silhouette.texture = pil_to_coreimage(projection_img).texture
 
     @mainthread
     def update_live_stage(
@@ -1433,8 +1528,12 @@ class CamouflageApp(App):
                     candidate = await async_generate_candidate_from_seed(seed)
                     valid = await async_validate_candidate_result(candidate)
                     scores = extract_backend_scores(candidate.ratios, candidate.metrics)
-                    silhouette_img = await asyncio.to_thread(silhouette_projection_image, rgb_image_to_index_canvas(candidate.image))
-                    self.update_preview(candidate.image, silhouette_img)
+                    try:
+                        projection_img = await asyncio.to_thread(projection_preview_image, candidate.image)
+                    except Exception as exc:
+                        projection_img = candidate.image
+                        self.log(f"Projection modèle indisponible : {exc}")
+                    self.update_preview(candidate.image, projection_img)
                     await self._register_live_diag(candidate, target_index, local_attempt, valid)
 
                     metrics_text = (
@@ -1444,7 +1543,7 @@ class CamouflageApp(App):
                     )
 
                     if not valid:
-                        self.update_live_stage("rejeté", target_index, local_attempt, seed, metrics_text=metrics_text, pil_img=candidate.image)
+                        self.update_live_stage("rejeté", target_index, local_attempt, seed, metrics_text=metrics_text, pil_img=projection_img)
                         self._update_attempt_status(
                             target_index,
                             local_attempt,
@@ -1467,7 +1566,7 @@ class CamouflageApp(App):
                         continue
 
                     filename = self.current_output_dir / f"camouflage_{target_index:03d}.png"
-                    self.update_live_stage("export image", target_index, local_attempt, seed, metrics_text=metrics_text, pil_img=candidate.image)
+                    self.update_live_stage("export image", target_index, local_attempt, seed, metrics_text=metrics_text, pil_img=projection_img)
                     await async_save_candidate_image(candidate, filename)
                     record = CandidateRecord(
                         index=target_index,
@@ -1485,7 +1584,7 @@ class CamouflageApp(App):
                     rows.append(row)
                     self.accepted_count = len(rows)
                     self.update_progress(len(rows), target_count)
-                    self.update_live_stage("accepté", target_index, local_attempt, seed, metrics_text=metrics_text, pil_img=candidate.image)
+                    self.update_live_stage("accepté", target_index, local_attempt, seed, metrics_text=metrics_text, pil_img=projection_img)
                     self._update_attempt_status(
                         target_index,
                         local_attempt,
