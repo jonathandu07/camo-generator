@@ -193,6 +193,7 @@ class PendingManualReview:
     outcome: Any
     projection_img: PILImage.Image
     metrics_text: str
+    manually_saved: bool = False
 
 
 class AsyncioThreadRunner:
@@ -526,22 +527,24 @@ def build_candidate_row_compatible(
 
 @dataclass
 class ProjectionConfig:
-    # Détection initiale large du vert.
-    hue_min: int = 30
-    hue_max: int = 105
-    sat_min: int = 15
-    val_min: int = 15
+    # Détection resserrée du vert réellement visible sur l'uniforme.
+    hue_min: int = 38
+    hue_max: int = 78
+    sat_min: int = 48
+    val_min: int = 35
     sat_max: int = 255
-    val_max: int = 190
+    val_max: int = 235
 
     # Protection des zones sombres non à repeindre.
-    dark_val_max: int = 40
-    dark_sat_max: int = 60
+    dark_val_max: int = 42
+    dark_sat_max: int = 58
 
-    # Morphologie.
+    # Morphologie : volontairement modérée pour ne pas recouvrir l'arme,
+    # les sangles, les poches noires ou les bottes.
     open_kernel: int = 3
-    close_kernel: int = 11
-    blur_radius: int = 9
+    close_kernel: int = 5
+    blur_radius: int = 3
+    min_component_area_px: int = 260
 
     # Répartition verticale du vêtement.
     hat_ratio: float = 0.13
@@ -689,6 +692,20 @@ def person_mask_from_foreground(bgr: np.ndarray) -> np.ndarray:
     return out
 
 
+def keep_significant_components(mask: np.ndarray, min_area: int) -> np.ndarray:
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num_labels <= 1:
+        return np.zeros_like(mask)
+
+    out = np.zeros_like(mask)
+    min_area = max(1, int(min_area))
+    for label_idx in range(1, num_labels):
+        area = int(stats[label_idx, cv2.CC_STAT_AREA])
+        if area >= min_area:
+            out[labels == label_idx] = 255
+    return out
+
+
 def largest_component_mask(mask: np.ndarray) -> Tuple[np.ndarray, Tuple[int, int, int, int], int]:
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     if num_labels <= 1:
@@ -743,7 +760,14 @@ def green_uniform_mask(subject_bgr: np.ndarray, cfg: ProjectionConfig) -> np.nda
     lower0 = np.array([cfg.hue_min, cfg.sat_min, cfg.val_min], dtype=np.uint8)
     upper0 = np.array([cfg.hue_max, cfg.sat_max, cfg.val_max], dtype=np.uint8)
 
-    broad = cv2.inRange(hsv, lower0, upper0)
+    hsv_green = cv2.inRange(hsv, lower0, upper0)
+
+    b = subject_bgr[:, :, 0].astype(np.int16)
+    g = subject_bgr[:, :, 1].astype(np.int16)
+    r = subject_bgr[:, :, 2].astype(np.int16)
+    green_dominance = (((g > r + 10) & (g > b + 8) & (g > 55))).astype(np.uint8) * 255
+
+    broad = cv2.bitwise_and(hsv_green, green_dominance)
     broad = cv2.bitwise_and(broad, person)
 
     dark = (((hsv[:, :, 2] <= cfg.dark_val_max) & (hsv[:, :, 1] <= cfg.dark_sat_max))).astype(np.uint8) * 255
@@ -754,26 +778,26 @@ def green_uniform_mask(subject_bgr: np.ndarray, cfg: ProjectionConfig) -> np.nda
 
     broad = cv2.morphologyEx(broad, cv2.MORPH_OPEN, open_k)
     broad = cv2.morphologyEx(broad, cv2.MORPH_CLOSE, close_k)
+    broad = keep_significant_components(broad, cfg.min_component_area_px)
 
-    broad_main, _bbox, area = largest_component_mask(broad)
-    if area <= 0:
+    if not np.any(broad > 0):
         blur_k = ensure_odd(cfg.blur_radius)
         return cv2.GaussianBlur(broad, (blur_k, blur_k), 0)
 
-    lower, upper = refine_green_thresholds(subject_bgr, broad_main, cfg)
+    lower, upper = refine_green_thresholds(subject_bgr, broad, cfg)
 
     refined = cv2.inRange(hsv, lower, upper)
+    refined = cv2.bitwise_and(refined, green_dominance)
     refined = cv2.bitwise_and(refined, person)
     refined = cv2.bitwise_and(refined, 255 - dark)
-
     refined = cv2.morphologyEx(refined, cv2.MORPH_OPEN, open_k)
     refined = cv2.morphologyEx(refined, cv2.MORPH_CLOSE, close_k)
-
-    refined_main, _bbox2, _area2 = largest_component_mask(refined)
+    refined = keep_significant_components(refined, cfg.min_component_area_px)
 
     blur_k = ensure_odd(cfg.blur_radius)
-    refined_main = cv2.GaussianBlur(refined_main, (blur_k, blur_k), 0)
-    return refined_main
+    refined = cv2.GaussianBlur(refined, (blur_k, blur_k), 0)
+    refined = cv2.bitwise_and(refined, person)
+    return refined
 
 
 def split_uniform_regions(mask: np.ndarray, cfg: ProjectionConfig) -> Dict[str, np.ndarray]:
@@ -1306,8 +1330,7 @@ class CamouflageApp(App):
         self.preview_projection_cache: Dict[str, PILImage.Image] = {}
         self._current_preview_raw_img: Optional[PILImage.Image] = None
         self.pending_manual_review: Optional[PendingManualReview] = None
-        self.manual_review_pending = False
-        self.manual_review_decision: Optional[str] = None
+        self.generated_rows: List[dict] = self.generated_rows
 
         self.status_label: Optional[Label] = None
         self.attempt_text: Optional[Label] = None
@@ -1430,7 +1453,7 @@ class CamouflageApp(App):
         controls.add_widget(self._label("Validation manuelle d'un rejet"))
         manual_row = BoxLayout(size_hint_y=None, height=dp(58), spacing=dp(10))
         self.manual_accept_btn = self._button("Valider ce rejet", "launch", self.manual_accept_current_reject)
-        self.manual_skip_btn = self._button("Continuer", "neutral", self.manual_skip_current_reject)
+        self.manual_skip_btn = self._button("Oublier ce rejet", "neutral", self.manual_skip_current_reject)
         manual_row.add_widget(self.manual_accept_btn)
         manual_row.add_widget(self.manual_skip_btn)
         controls.add_widget(manual_row)
@@ -1838,11 +1861,11 @@ class CamouflageApp(App):
             self.stop_btn.disabled = not (self.running or self.preflight_running or self.stopping)
         if self.open_btn is not None:
             self.open_btn.disabled = False
-        manual_enabled = bool(self.manual_review_pending and self.pending_manual_review is not None)
+        manual_enabled = bool(self.pending_manual_review is not None and not bool(getattr(self.pending_manual_review, "manually_saved", False)))
         if self.manual_accept_btn is not None:
             self.manual_accept_btn.disabled = not manual_enabled
         if self.manual_skip_btn is not None:
-            self.manual_skip_btn.disabled = not manual_enabled
+            self.manual_skip_btn.disabled = self.pending_manual_review is None
         self._refresh_run_mode_buttons()
 
     def _apply_backend_motif_scale(self) -> float:
@@ -1892,45 +1915,69 @@ class CamouflageApp(App):
     @mainthread
     def _arm_manual_review(self, review: PendingManualReview):
         self.pending_manual_review = review
-        self.manual_review_pending = True
-        self.manual_review_decision = None
         if self.manual_review_label is not None:
             rules = " | ".join(rejection_rules_for_candidate(review.candidate, review.outcome)[:4]) or "rejet backend"
             self.manual_review_label.text = (
-                f"Rejet en attente : image {review.target_index:03d} | essai {review.local_attempt:04d} | "
+                f"Dernier rejet mémorisé : image {review.target_index:03d} | essai {review.local_attempt:04d} | "
                 f"seed {review.candidate.seed} | {rules}"
             )
-        self.status("Rejet en attente de décision", ok=False)
         self._refresh_controls_state()
 
     @mainthread
     def _clear_manual_review(self):
         self.pending_manual_review = None
-        self.manual_review_pending = False
-        self.manual_review_decision = None
         if self.manual_review_label is not None:
             self.manual_review_label.text = "Aucun rejet en attente."
         self._refresh_controls_state()
 
     def manual_accept_current_reject(self, *_):
-        if not self.manual_review_pending or self.pending_manual_review is None:
+        review = self.pending_manual_review
+        if review is None or bool(review.manually_saved):
             return
-        self.manual_review_decision = "accept"
-        self.log("Validation manuelle demandée pour le rejet courant.")
+        self.log("Validation manuelle demandée pour le dernier rejet mémorisé.")
+        fut = self.async_runner.submit(self._async_manual_accept_review(review))
+        fut.add_done_callback(lambda f: self._on_manual_accept_done(f))
 
     def manual_skip_current_reject(self, *_):
-        if not self.manual_review_pending or self.pending_manual_review is None:
+        if self.pending_manual_review is None:
             return
-        self.manual_review_decision = "skip"
-        self.log("Rejet courant ignoré, reprise de la génération.")
-
-    async def _await_manual_review_decision(self, review: PendingManualReview) -> bool:
-        self._arm_manual_review(review)
-        while self.manual_review_decision is None and not self.stop_flag:
-            await asyncio.sleep(0.05)
-        decision = self.manual_review_decision or "skip"
+        self.log("Dernier rejet oublié manuellement.")
         self._clear_manual_review()
-        return decision == "accept"
+
+    async def _async_manual_accept_review(self, review: PendingManualReview) -> Tuple[Path, Path, PendingManualReview]:
+        saved_path, mannequin_saved_path = await self._async_save_candidate_bundle(
+            self.generated_rows,
+            target_index=review.target_index,
+            local_attempt=review.local_attempt,
+            global_attempt=review.global_attempt,
+            candidate=review.candidate,
+            outcome=review.outcome,
+            projection_img=review.projection_img,
+            manual_accept=True,
+        )
+        review.manually_saved = True
+        return saved_path, mannequin_saved_path, review
+
+    def _on_manual_accept_done(self, fut: Future):
+        try:
+            saved_path, mannequin_saved_path, review = fut.result()
+        except Exception as exc:
+            Clock.schedule_once(lambda _dt, e=str(exc): self.log(f"Validation manuelle impossible : {e}"), 0)
+            return
+        Clock.schedule_once(lambda _dt, sp=saved_path, mp=mannequin_saved_path, rv=review: self._finish_manual_accept(sp, mp, rv), 0)
+
+    @mainthread
+    def _finish_manual_accept(self, saved_path: Path, mannequin_saved_path: Path, review: PendingManualReview):
+        self.accepted_count = len(self.generated_rows)
+        self.log(
+            f"Rejet validé manuellement -> {saved_path.name} | mannequin -> {mannequin_saved_path.name}"
+        )
+        if self.manual_review_label is not None:
+            self.manual_review_label.text = (
+                f"Rejet déjà enregistré : image {review.target_index:03d} | seed {review.candidate.seed}"
+            )
+        self.reload_gallery()
+        self._refresh_controls_state()
 
     def _run_mode_text(self, mode: Optional[str] = None) -> str:
         mode = self.run_mode if mode is None else mode
@@ -2134,6 +2181,7 @@ class CamouflageApp(App):
         self.current_output_dir = DEFAULT_OUTPUT_DIR
         self.current_output_dir.mkdir(parents=True, exist_ok=True)
         self.best_records.clear()
+        self.generated_rows = []
         self.stop_flag = False
         self.stopping = False
         self.running = True
@@ -2259,40 +2307,7 @@ class CamouflageApp(App):
                             projection_img=projection_img,
                             metrics_text=metrics_text,
                         )
-                        manual_accept = await self._await_manual_review_decision(review)
-                        if manual_accept:
-                            self.update_live_stage("validation manuelle", target_index, local_attempt, seed, metrics_text=metrics_text, pil_img=projection_img)
-                            saved_path, mannequin_saved_path = await self._async_save_candidate_bundle(
-                                rows,
-                                target_index=target_index,
-                                local_attempt=local_attempt,
-                                global_attempt=total_attempts,
-                                candidate=candidate,
-                                outcome=outcome,
-                                projection_img=projection_img,
-                                manual_accept=True,
-                            )
-                            self.update_live_stage("accepté manuellement", target_index, local_attempt, seed, metrics_text=metrics_text, pil_img=projection_img)
-                            self._update_attempt_status(
-                                target_index,
-                                local_attempt,
-                                total_attempts,
-                                seed,
-                                target_count,
-                                self.accepted_count,
-                                self.diag_rejects,
-                                True,
-                                candidate.ratios,
-                                scores,
-                                candidate.metrics,
-                            )
-                            self.log(
-                                f"[img={target_index:03d}] validé manuellement -> {saved_path.name} | "
-                                f"mannequin -> {mannequin_saved_path.name}"
-                            )
-                            await self._adaptive_pause()
-                            await asyncio.sleep(0)
-                            break
+                        self._arm_manual_review(review)
                         await self._adaptive_pause()
                         await asyncio.sleep(0)
                         continue
@@ -2544,7 +2559,6 @@ class CamouflageApp(App):
     def on_stop(self):
         self.stop_flag = True
         self.stopping = True
-        self.manual_review_decision = "skip"
         prevent_sleep(False)
         self._emit_runtime("INFO", "start", "Arrêt de l'interface Kivy")
         self._unsubscribe_runtime_feed()
