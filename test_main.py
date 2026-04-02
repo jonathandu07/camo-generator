@@ -86,6 +86,26 @@ def configure_logger() -> logging.Logger:
 
 
 LOGGER = configure_logger()
+LOGGER.info("Module cible importé pour les tests: %s", getattr(mut, "__name__", type(mut).__name__))
+LOGGER.info("Fichier de log des tests: %s", LOG_FILE)
+
+
+class LoggedTestMixin:
+    def setUp(self) -> None:
+        super().setUp()
+        self._test_started_at = time.perf_counter()
+        LOGGER.info("▶ START %s", self.id())
+
+    def tearDown(self) -> None:
+        elapsed = time.perf_counter() - getattr(self, "_test_started_at", time.perf_counter())
+        LOGGER.info("■ END   %s | %.3fs", self.id(), elapsed)
+        super().tearDown()
+
+    def log_state(self, message: str, **payload: Any) -> None:
+        if payload:
+            LOGGER.info("%s | %s", message, json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str))
+        else:
+            LOGGER.info("%s", message)
 
 
 class TempDirMixin:
@@ -93,8 +113,10 @@ class TempDirMixin:
         super().setUp()
         self._tmpdir_obj = tempfile.TemporaryDirectory(prefix="test_main_generic_")
         self.tmpdir = Path(self._tmpdir_obj.name)
+        LOGGER.info("tmpdir prêt: %s", self.tmpdir)
 
     def tearDown(self) -> None:
+        LOGGER.info("tmpdir cleanup: %s", getattr(self, "tmpdir", "<absent>"))
         self._tmpdir_obj.cleanup()
         super().tearDown()
 
@@ -156,12 +178,28 @@ class AssertionsMixin:
         self.assertEqual(candidate.ratios.shape, (mut.N_CLASSES,))
         self.assertAlmostEqual(float(np.sum(candidate.ratios)), 1.0, places=5)
         self.assertIsInstance(candidate.metrics, dict)
+        LOGGER.info(
+            "candidate ok | seed=%s | size=%sx%s | ratio_sum=%.6f | metrics=%s",
+            getattr(candidate, "seed", "?"),
+            getattr(candidate.image, "size", ("?", "?"))[0],
+            getattr(candidate.image, "size", ("?", "?"))[1],
+            float(np.sum(candidate.ratios)),
+            sorted(candidate.metrics.keys()),
+        )
 
     def assertOutcomeLooksConsistent(self, outcome: Any) -> None:
         self.assertIsInstance(outcome, mut.ValidationOutcome)
         self.assertIsInstance(outcome.reasons, list)
         self.assertIsInstance(outcome.fragmentation, dict)
         self.assertIsInstance(outcome.subscores, dict)
+        LOGGER.info(
+            "outcome ok | accepted=%s | strict=%s | bestof_ok=%s | score=%.6f | reasons=%s",
+            bool(outcome.accepted),
+            bool(outcome.passed_strict),
+            bool(outcome.bestof_ok),
+            float(outcome.bestof_score),
+            list(outcome.reasons),
+        )
 
 
 REQUIRED_METRIC_KEYS = {
@@ -298,6 +336,34 @@ def fake_snapshot(*, machine_intensity: float = 0.90, available_mb: float = 8192
     )
 
 
+def log_json_preview(path: Path) -> None:
+    if not path.exists():
+        LOGGER.info("json absent: %s", path)
+        return
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        LOGGER.info("json illisible: %s | %s", path, exc)
+        return
+    if isinstance(payload, dict):
+        LOGGER.info("json %s | keys=%s", path.name, sorted(payload.keys()))
+    else:
+        LOGGER.info("json %s | type=%s", path.name, type(payload).__name__)
+
+
+def log_csv_preview(path: Path, max_lines: int = 3) -> None:
+    if not path.exists():
+        LOGGER.info("csv absent: %s", path)
+        return
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception as exc:
+        LOGGER.info("csv illisible: %s | %s", path, exc)
+        return
+    preview = "\n".join(text.splitlines()[:max_lines])
+    LOGGER.info("csv %s | preview=\n%s", path.name, preview)
+
+
 def iter_metric_failure_cases() -> Iterable[tuple[str, float]]:
     yield "boundary_density", mut.MIN_BOUNDARY_DENSITY - 0.001
     yield "boundary_density", mut.MAX_BOUNDARY_DENSITY + 0.001
@@ -310,7 +376,7 @@ def iter_metric_failure_cases() -> Iterable[tuple[str, float]]:
     yield "edge_contact_ratio", mut.MAX_EDGE_CONTACT_RATIO + 0.001
 
 
-class TestConstantsAndDataclasses(AssertionsMixin, unittest.TestCase):
+class TestConstantsAndDataclasses(LoggedTestMixin, AssertionsMixin, unittest.TestCase):
     def test_global_constants_are_coherent(self) -> None:
         self.assertEqual(mut.N_CLASSES, 4)
         self.assertEqual(tuple(mut.RGB.shape), (4, 3))
@@ -371,7 +437,7 @@ class TestConstantsAndDataclasses(AssertionsMixin, unittest.TestCase):
         self.assertEqual(len(p1.palette_bias), 4)
 
 
-class TestSystemHelpers(GlobalStateMixin, TempDirMixin, GeometryMixin, AssertionsMixin, unittest.TestCase):
+class TestSystemHelpers(LoggedTestMixin, GlobalStateMixin, TempDirMixin, GeometryMixin, AssertionsMixin, unittest.TestCase):
     def test_worker_initializer_can_limit_numeric_threads(self) -> None:
         with patch.dict(os.environ, {"TEXTURE_LIMIT_NUMERIC_THREADS": "1"}, clear=True):
             mut._worker_initializer()
@@ -469,7 +535,7 @@ class TestSystemHelpers(GlobalStateMixin, TempDirMixin, GeometryMixin, Assertion
             mut.validate_generation_request(target_count=1, output_dir=self.tmpdir, base_seed=1, machine_intensity=0.5, max_workers=1, attempt_batch_size=0)
 
 
-class TestPureUtilities(TempDirMixin, AssertionsMixin, GeometryMixin, unittest.TestCase):
+class TestPureUtilities(LoggedTestMixin, TempDirMixin, AssertionsMixin, GeometryMixin, unittest.TestCase):
     def test_build_seed_and_build_batch_are_deterministic(self) -> None:
         self.assertEqual(mut.build_seed(3, 7, 1000), mut.build_seed(3, 7, 1000))
         self.assertNotEqual(mut.build_seed(3, 7, 1000), mut.build_seed(4, 7, 1000))
@@ -517,7 +583,7 @@ class TestPureUtilities(TempDirMixin, AssertionsMixin, GeometryMixin, unittest.T
         self.assertGreaterEqual(cells_y, 3)
 
 
-class TestCleanupAndFragmentation(AssertionsMixin, unittest.TestCase):
+class TestCleanupAndFragmentation(LoggedTestMixin, AssertionsMixin, unittest.TestCase):
     def test_neighbors_same_and_dominant_class(self) -> None:
         label_map = np.zeros((3, 3), dtype=np.uint8)
         label_map[1, 1] = 1
@@ -553,7 +619,7 @@ class TestCleanupAndFragmentation(AssertionsMixin, unittest.TestCase):
         self.assertGreaterEqual(report["micro_components_total"], 1)
 
 
-class TestBestOfAndValidation(TempDirMixin, AssertionsMixin, GeometryMixin, unittest.TestCase):
+class TestBestOfAndValidation(LoggedTestMixin, TempDirMixin, AssertionsMixin, GeometryMixin, unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
         mut.set_canvas_geometry(80, 80, 40.0, 40.0, 0.55)
@@ -621,7 +687,7 @@ class TestBestOfAndValidation(TempDirMixin, AssertionsMixin, GeometryMixin, unit
         self.assertEqual(payload_ko["accepted"], False)
 
 
-class TestGeneratorInternals(AssertionsMixin, GeometryMixin, unittest.TestCase):
+class TestGeneratorInternals(LoggedTestMixin, AssertionsMixin, GeometryMixin, unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
         mut.set_canvas_geometry(128, 72, 40.0, 22.5, 0.55)
@@ -732,7 +798,7 @@ class TestExports(TempDirMixin, AssertionsMixin, GeometryMixin, unittest.TestCas
         self.assertEqual(csv2.read_text(encoding="utf-8"), "")
 
 
-class TestAsyncHelpersAndOrchestrator(GlobalStateMixin, TempDirMixin, GeometryMixin, AssertionsMixin, unittest.IsolatedAsyncioTestCase):
+class TestAsyncHelpersAndOrchestrator(LoggedTestMixin, GlobalStateMixin, TempDirMixin, GeometryMixin, AssertionsMixin, unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         super().setUp()
         mut.set_canvas_geometry(128, 72, 40.0, 22.5, 0.55)
@@ -845,7 +911,7 @@ class TestAsyncHelpersAndOrchestrator(GlobalStateMixin, TempDirMixin, GeometryMi
         get_pool_mock.assert_not_called()
 
 
-class TestCliEntrypoints(GlobalStateMixin, TempDirMixin, GeometryMixin, AssertionsMixin, unittest.TestCase):
+class TestCliEntrypoints(LoggedTestMixin, GlobalStateMixin, TempDirMixin, GeometryMixin, AssertionsMixin, unittest.TestCase):
     def test_parse_cli_args_defaults(self) -> None:
         with patch.object(sys, "argv", ["prog"]):
             args = mut.parse_cli_args()
@@ -882,6 +948,19 @@ class TestCliEntrypoints(GlobalStateMixin, TempDirMixin, GeometryMixin, Assertio
         geometry_mock.assert_called_once_with(width=128, height=72, physical_width_cm=40.0, physical_height_cm=22.5, motif_scale=0.61)
         async_mock.assert_awaited_once()
         shutdown_mock.assert_called_once()
+
+
+class TestLoggingArtifacts(LoggedTestMixin, TempDirMixin, unittest.TestCase):
+    def test_logger_file_exists_and_helpers_preview_files(self) -> None:
+        self.assertTrue(LOG_FILE.exists() or LOG_FILE.parent.exists())
+        sample_json = self.tmpdir / "sample.json"
+        sample_csv = self.tmpdir / "sample.csv"
+        sample_json.write_text(json.dumps({"ok": True, "items": [1, 2, 3]}, ensure_ascii=False), encoding="utf-8")
+        sample_csv.write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+        log_json_preview(sample_json)
+        log_csv_preview(sample_csv)
+        self.assertTrue(sample_json.exists())
+        self.assertTrue(sample_csv.exists())
 
 
 if __name__ == "__main__":
