@@ -1,16 +1,9 @@
 [
   {
-    "ts": 1775141295.8302069,
+    "ts": 1775141714.3563406,
     "level": "INFO",
     "source": "start",
     "message": "Interface Kivy démarrée",
-    "payload": {}
-  },
-  {
-    "ts": 1775141407.603376,
-    "level": "INFO",
-    "source": "start",
-    "message": "Arrêt de l'interface Kivy",
     "payload": {}
   }
 ]
