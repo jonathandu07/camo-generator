@@ -1330,7 +1330,7 @@ class CamouflageApp(App):
         self.preview_projection_cache: Dict[str, PILImage.Image] = {}
         self._current_preview_raw_img: Optional[PILImage.Image] = None
         self.pending_manual_review: Optional[PendingManualReview] = None
-        self.generated_rows: List[dict] = self.generated_rows
+        self.generated_rows: List[dict] = []
 
         self.status_label: Optional[Label] = None
         self.attempt_text: Optional[Label] = None
