@@ -1347,6 +1347,9 @@ class CamouflageApp(App):
         self.manual_accept_btn: Optional[SoftButton] = None
         self.manual_skip_btn: Optional[SoftButton] = None
         self.manual_review_label: Optional[Label] = None
+        self.manual_review_mini_label: Optional[Label] = None
+        self.diag_summary_mini_label: Optional[Label] = None
+        self.diag_top_rules_mini_label: Optional[Label] = None
         self.resource_text: Optional[Label] = None
         self.tests_label: Optional[Label] = None
         self.run_mode_label: Optional[Label] = None
@@ -1534,13 +1537,16 @@ class CamouflageApp(App):
 
         backend_card = GlassCard(orientation="vertical", spacing=dp(8))
         backend_card.add_widget(self._section_title("Validation stricte", "Synthèse instantanée du backend."))
-        backend_card.add_widget(self.diag_summary_label)
-        backend_card.add_widget(self.diag_top_rules_label)
+        self.diag_summary_mini_label = self._small_label("Tentatives 0 | acceptés 0 | rejetés 0 | taux 0.00%")
+        self.diag_top_rules_mini_label = self._small_label("Top règles : --")
+        backend_card.add_widget(self.diag_summary_mini_label)
+        backend_card.add_widget(self.diag_top_rules_mini_label)
         top_strip.add_widget(backend_card)
 
         manual_card = GlassCard(orientation="vertical", spacing=dp(8))
         manual_card.add_widget(self._section_title("Revue manuelle", "Dernier rejet disponible à l’enregistrement."))
-        manual_card.add_widget(self.manual_review_label)
+        self.manual_review_mini_label = self._small_label("Aucun rejet en attente.")
+        manual_card.add_widget(self.manual_review_mini_label)
         top_strip.add_widget(manual_card)
         right.add_widget(top_strip)
 
@@ -1975,12 +1981,15 @@ class CamouflageApp(App):
     @mainthread
     def _arm_manual_review(self, review: PendingManualReview):
         self.pending_manual_review = review
+        rules = " | ".join(rejection_rules_for_candidate(review.candidate, review.outcome)[:4]) or "rejet backend"
+        text = (
+            f"Dernier rejet mémorisé : image {review.target_index:03d} | essai {review.local_attempt:04d} | "
+            f"seed {review.candidate.seed} | {rules}"
+        )
         if self.manual_review_label is not None:
-            rules = " | ".join(rejection_rules_for_candidate(review.candidate, review.outcome)[:4]) or "rejet backend"
-            self.manual_review_label.text = (
-                f"Dernier rejet mémorisé : image {review.target_index:03d} | essai {review.local_attempt:04d} | "
-                f"seed {review.candidate.seed} | {rules}"
-            )
+            self.manual_review_label.text = text
+        if self.manual_review_mini_label is not None:
+            self.manual_review_mini_label.text = text
         self._refresh_controls_state()
 
     @mainthread
@@ -1988,6 +1997,8 @@ class CamouflageApp(App):
         self.pending_manual_review = None
         if self.manual_review_label is not None:
             self.manual_review_label.text = "Aucun rejet en attente."
+        if self.manual_review_mini_label is not None:
+            self.manual_review_mini_label.text = "Aucun rejet en attente."
         self._refresh_controls_state()
 
     def manual_accept_current_reject(self, *_):
@@ -2032,10 +2043,11 @@ class CamouflageApp(App):
         self.log(
             f"Rejet validé manuellement -> {saved_path.name} | mannequin -> {mannequin_saved_path.name}"
         )
+        text = f"Rejet déjà enregistré : image {review.target_index:03d} | seed {review.candidate.seed}"
         if self.manual_review_label is not None:
-            self.manual_review_label.text = (
-                f"Rejet déjà enregistré : image {review.target_index:03d} | seed {review.candidate.seed}"
-            )
+            self.manual_review_label.text = text
+        if self.manual_review_mini_label is not None:
+            self.manual_review_mini_label.text = text
         self.reload_gallery()
         self._refresh_controls_state()
 
@@ -2074,15 +2086,21 @@ class CamouflageApp(App):
 
     @mainthread
     def _refresh_diag_labels(self):
+        rate = (self.diag_accepts / self.diag_total) if self.diag_total else 0.0
+        summary_text = f"Tentatives {self.diag_total} | acceptés {self.diag_accepts} | rejetés {self.diag_rejects} | taux {rate:.2%}"
         if self.diag_summary_label is not None:
-            rate = (self.diag_accepts / self.diag_total) if self.diag_total else 0.0
-            self.diag_summary_label.text = f"Tentatives {self.diag_total} | acceptés {self.diag_accepts} | rejetés {self.diag_rejects} | taux {rate:.2%}"
+            self.diag_summary_label.text = summary_text
+        if self.diag_summary_mini_label is not None:
+            self.diag_summary_mini_label.text = summary_text
+        if self.diag_rule_counter:
+            top = " | ".join(f"{n}:{c}" for n, c in self.diag_rule_counter.most_common(3))
+            top_text = f"Top règles : {top}"
+        else:
+            top_text = "Top règles : --"
         if self.diag_top_rules_label is not None:
-            if self.diag_rule_counter:
-                top = " | ".join(f"{n}:{c}" for n, c in self.diag_rule_counter.most_common(3))
-                self.diag_top_rules_label.text = f"Top règles : {top}"
-            else:
-                self.diag_top_rules_label.text = "Top règles : --"
+            self.diag_top_rules_label.text = top_text
+        if self.diag_top_rules_mini_label is not None:
+            self.diag_top_rules_mini_label.text = top_text
         if self.diag_last_fail_label is not None:
             self.diag_last_fail_label.text = "Dernier rejet : " + (" | ".join(self.diag_last_rules[:4]) if self.diag_last_rules else "--")
 
