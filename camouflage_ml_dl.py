@@ -52,7 +52,7 @@ def _resolve_camo_module():
     """
     for name in ("main", "__main__"):
         mod = sys.modules.get(name)
-        if mod is not None and hasattr(mod, "generate_candidate_from_seed") and hasattr(mod, "validate_candidate_result"):
+        if mod is not None and hasattr(mod, "generate_and_validate_from_seed") and hasattr(mod, "validate_with_reasons"):
             return mod
     return importlib.import_module("main")
 
@@ -74,7 +74,7 @@ FEATURE_KEYS: tuple[str, ...] = (
     "abs_err_terre",
     "abs_err_gris",
     "mean_abs_error",
-    "largest_olive_component_ratio",
+    "largest_component_ratio_class_1",
     "boundary_density",
     "boundary_density_small",
     "boundary_density_tiny",
@@ -180,16 +180,16 @@ def candidate_to_feature_dict(candidate: camo.CandidateResult) -> Dict[str, floa
     abs_err = np.abs(rs - camo.TARGET)
     m = dict(candidate.metrics)
     return {
-        "ratio_coyote": float(rs[camo.IDX_COYOTE]),
-        "ratio_olive": float(rs[camo.IDX_OLIVE]),
-        "ratio_terre": float(rs[camo.IDX_TERRE]),
-        "ratio_gris": float(rs[camo.IDX_GRIS]),
-        "abs_err_coyote": float(abs_err[camo.IDX_COYOTE]),
-        "abs_err_olive": float(abs_err[camo.IDX_OLIVE]),
-        "abs_err_terre": float(abs_err[camo.IDX_TERRE]),
-        "abs_err_gris": float(abs_err[camo.IDX_GRIS]),
+        "ratio_coyote": float(rs[camo.IDX_0]),
+        "ratio_olive": float(rs[camo.IDX_1]),
+        "ratio_terre": float(rs[camo.IDX_2]),
+        "ratio_gris": float(rs[camo.IDX_3]),
+        "abs_err_coyote": float(abs_err[camo.IDX_0]),
+        "abs_err_olive": float(abs_err[camo.IDX_1]),
+        "abs_err_terre": float(abs_err[camo.IDX_2]),
+        "abs_err_gris": float(abs_err[camo.IDX_3]),
         "mean_abs_error": float(np.mean(abs_err)),
-        "largest_olive_component_ratio": _safe_float(m.get("largest_olive_component_ratio", 0.0)),
+        "largest_component_ratio_class_1": _safe_float(m.get("largest_component_ratio_class_1", 0.0)),
         "boundary_density": _safe_float(m.get("boundary_density", 0.0)),
         "boundary_density_small": _safe_float(m.get("boundary_density_small", 0.0)),
         "boundary_density_tiny": _safe_float(m.get("boundary_density_tiny", 0.0)),
@@ -233,7 +233,7 @@ def analyze_rejection(candidate: camo.CandidateResult, target_index: int, local_
 
     if feat["mirror_similarity"] > float(camo.MAX_MIRROR_SIMILARITY):
         failures.append("mirror_similarity_high")
-    if feat["largest_olive_component_ratio"] < float(camo.MIN_LARGEST_OLIVE_COMPONENT_RATIO):
+    if feat["largest_component_ratio_class_1"] < float(camo.MIN_LARGEST_COMPONENT_RATIO_CLASS_1):
         failures.append("largest_olive_component_ratio_low")
     if feat["edge_contact_ratio"] > float(camo.MAX_EDGE_CONTACT_RATIO):
         failures.append("edge_contact_ratio_high")
@@ -243,7 +243,7 @@ def analyze_rejection(candidate: camo.CandidateResult, target_index: int, local_
     severity += max(0.0, float(camo.MIN_BOUNDARY_DENSITY) - feat["boundary_density"]) * 10.0
     severity += max(0.0, feat["boundary_density"] - float(camo.MAX_BOUNDARY_DENSITY)) * 10.0
     severity += max(0.0, feat["mirror_similarity"] - float(camo.MAX_MIRROR_SIMILARITY)) * 5.0
-    severity += max(0.0, float(camo.MIN_LARGEST_OLIVE_COMPONENT_RATIO) - feat["largest_olive_component_ratio"]) * 10.0
+    severity += max(0.0, float(camo.MIN_LARGEST_COMPONENT_RATIO_CLASS_1) - feat["largest_component_ratio_class_1"]) * 10.0
     severity += max(0.0, feat["edge_contact_ratio"] - float(camo.MAX_EDGE_CONTACT_RATIO)) * 10.0
 
     if not failures:
@@ -292,7 +292,7 @@ def candidate_reward(candidate: camo.CandidateResult, accepted: bool) -> float:
     score += 0.50 * interval_score(feat["boundary_density"], float(camo.MIN_BOUNDARY_DENSITY), float(camo.MAX_BOUNDARY_DENSITY))
     score += 0.35 * interval_score(feat["boundary_density_small"], float(camo.MIN_BOUNDARY_DENSITY_SMALL), float(camo.MAX_BOUNDARY_DENSITY_SMALL))
     score += 0.25 * interval_score(feat["boundary_density_tiny"], float(camo.MIN_BOUNDARY_DENSITY_TINY), float(camo.MAX_BOUNDARY_DENSITY_TINY))
-    score += 0.45 * feat["largest_olive_component_ratio"]
+    score += 0.45 * feat["largest_component_ratio_class_1"]
     score += 0.20 * (1.0 - min(1.0, feat["mirror_similarity"]))
     score += 0.15 * (1.0 - min(1.0, feat["edge_contact_ratio"]))
     return float(score)
@@ -455,7 +455,7 @@ class DeepSurrogate:
             reward = (
                 1.0
                 - 100.0 * x[:, FEATURE_KEYS.index("mean_abs_error")]
-                + 0.5 * x[:, FEATURE_KEYS.index("largest_olive_component_ratio")]
+                + 0.5 * x[:, FEATURE_KEYS.index("largest_component_ratio_class_1")]
                 - 0.3 * x[:, FEATURE_KEYS.index("mirror_similarity")]
                 - 0.2 * x[:, FEATURE_KEYS.index("edge_contact_ratio")]
             ).astype(np.float32)
@@ -632,8 +632,8 @@ class CamouflageMLDLGenerator:
     def warmup(self) -> None:
         for i in range(self.cfg.warmup_samples):
             seed = camo.build_seed(0, i + 1, self.cfg.base_seed)
-            candidate = camo.generate_candidate_from_seed(seed)
-            accepted = camo.validate_candidate_result(candidate)
+            candidate, outcome = camo.generate_and_validate_from_seed(seed)
+            accepted = bool(outcome.accepted)
             self.buffer.add(candidate, accepted)
             if not accepted:
                 self.last_rejected_candidate = candidate
@@ -705,7 +705,16 @@ class CamouflageMLDLGenerator:
 
         for rank, proposal in enumerate(proposals[: self.cfg.validate_top_k], start=1):
             self.total_attempts += 1
-            real_ok = camo.validate_candidate_result(proposal.candidate)
+            final_candidate, final_outcome = camo.generate_and_validate_from_seed(proposal.seed)
+            proposal = Proposal(
+                seed=proposal.seed,
+                action_idx=proposal.action_idx,
+                action_name=proposal.action_name,
+                candidate=final_candidate,
+                pred_valid=proposal.pred_valid,
+                pred_reward=proposal.pred_reward,
+            )
+            real_ok = bool(final_outcome.accepted)
             reward = self.buffer.add(proposal.candidate, real_ok)
             self.maybe_train(force=False)
 
@@ -758,12 +767,14 @@ class CamouflageMLDLGenerator:
 
                 if accepted_proposal is not None:
                     filename = self.output_dir / f"camouflage_{target_index:03d}.png"
-                    camo.save_candidate_image(accepted_proposal.candidate, filename)
+                    saved_path = camo.save_candidate_image(accepted_proposal.candidate, filename)
                     self.rows.append(camo.candidate_row(
                         target_index,
                         local_attempt,
                         self.total_attempts,
                         accepted_proposal.candidate,
+                        image_name=saved_path.name,
+                        image_path=str(saved_path),
                     ))
                     break
 
