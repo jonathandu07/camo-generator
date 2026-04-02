@@ -45,9 +45,11 @@ DEFAULT_RUNTIME_SNAPSHOT_FILE = "runtime_snapshot.json"
 DEFAULT_DIAG_CSV = "diagnostic_candidates.csv"
 DEFAULT_DIAG_JSON = "diagnostic_summary.json"
 DEFAULT_TEST_SUMMARY_FILE = "tests_summary.json"
+DEFAULT_COMPILED_LOGS_FILE = "compiled_logs.txt"
+DEFAULT_COMPILED_LOGS_JSON = "compiled_logs.json"
 DEFAULT_HISTORY_LIMIT = 5000
 DEFAULT_ANALYSIS_COUNT = 64
-DEFAULT_TEST_MODULES: tuple[str, ...] = ("test_main", "test_start")
+DEFAULT_TEST_MODULES: tuple[str, ...] = ("test_main", "test_start", "test_camouflage_ml_dl_precise")
 DEFAULT_TEST_TIMEOUT_S: float | None = None
 
 LOGGER_NAME = "camo_supervisor"
@@ -217,6 +219,18 @@ def _normalize_timeout(timeout_s: float | None) -> float | None:
 def _subprocess_env(output_dir: Path | None = None) -> Dict[str, str]:
     env = os.environ.copy()
     env["LOG_OUTPUT_DIR"] = str(Path(output_dir or DEFAULT_OUTPUT_DIR).resolve())
+    env.setdefault("MUT_MODULE", "main")
+    env.setdefault("CAMO_MLDL_MODULE", "camouflage_ml_dl")
+    return env
+
+
+def _module_specific_env(module_name: str, output_dir: Path | None = None) -> Dict[str, str]:
+    env = _subprocess_env(output_dir)
+    name = str(module_name).strip().lower()
+    if name.startswith("test_main"):
+        env["MUT_MODULE"] = "main"
+    if "camouflage_ml_dl" in name:
+        env["CAMO_MLDL_MODULE"] = "camouflage_ml_dl"
     return env
 
 
@@ -401,7 +415,9 @@ def analyze_candidate(candidate: camo.CandidateResult, target_index: int, local_
     if fail is not None:
         failures.append(fail)
 
-    fail = _fail_min("largest_olive_component_ratio", _metric(m, "largest_olive_component_ratio"), float(camo.MIN_LARGEST_OLIVE_COMPONENT_RATIO))
+    largest_metric_name = "largest_component_ratio_class_1" if "largest_component_ratio_class_1" in m else "largest_olive_component_ratio"
+    largest_metric_min = float(getattr(camo, "MIN_LARGEST_COMPONENT_RATIO_CLASS_1", getattr(camo, "MIN_LARGEST_OLIVE_COMPONENT_RATIO", 0.0)))
+    fail = _fail_min(largest_metric_name, _metric(m, largest_metric_name), largest_metric_min)
     if fail is not None:
         failures.append(fail)
 
@@ -418,7 +434,7 @@ def analyze_candidate(candidate: camo.CandidateResult, target_index: int, local_
         target_index=int(target_index),
         local_attempt=int(local_attempt),
         accepted=not failures,
-        ratios={camo.COLOR_NAMES[i]: float(rs[i]) for i in range(4)},
+        ratios={(getattr(camo, "CLASS_NAMES", getattr(camo, "COLOR_NAMES", [f"class_{i}" for i in range(4)]))[i]): float(rs[i]) for i in range(4)},
         metrics={k: _safe_float(v) for k, v in m.items()},
         failures=failures,
     )
@@ -628,7 +644,7 @@ def _run_test_module(module_name: str, timeout_s: float | None, output_dir: Path
             capture_output=True,
             text=True,
             encoding="utf-8",
-            env=_subprocess_env(output_dir),
+            env=_module_specific_env(module_name, output_dir),
             timeout=_normalize_timeout(timeout_s),
         )
         return TestModuleSummary(
@@ -708,6 +724,52 @@ def _collect_preflight_counts(results: Sequence[TestModuleSummary]) -> Dict[str,
     }
 
 
+def _truncate_text(text: str, limit: int = 4000) -> str:
+    raw = str(text or "")
+    return raw if len(raw) <= limit else raw[:limit] + "\n...<truncated>..."
+
+
+def compile_test_and_runtime_logs(output_dir: Path = DEFAULT_OUTPUT_DIR) -> Dict[str, Any]:
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    candidates = [
+        out / DEFAULT_RUNTIME_LOG_FILE,
+        out / "test_main.log",
+        out / "test_start.log",
+        out / "test_camouflage_ml_dl_guided.log",
+        out / "test_camouflage_ml_dl_precise.log",
+    ]
+
+    sections: List[str] = []
+    files_meta: List[Dict[str, Any]] = []
+    for path in candidates:
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:
+            text = f"<unreadable: {exc}>"
+        files_meta.append({
+            "path": str(path.resolve()),
+            "name": path.name,
+            "size_bytes": int(path.stat().st_size) if path.exists() else 0,
+            "line_count": int(len(text.splitlines())),
+            "tail_preview": _truncate_text("\n".join(text.splitlines()[-80:])),
+        })
+        sections.append(f"===== {path.name} =====\n{text}\n")
+
+    compiled_txt = out / DEFAULT_COMPILED_LOGS_FILE
+    compiled_json = out / DEFAULT_COMPILED_LOGS_JSON
+    compiled_txt.write_text("\n".join(sections), encoding="utf-8")
+    compiled_json.write_text(json.dumps({"files": files_meta}, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {
+        "compiled_text": str(compiled_txt),
+        "compiled_json": str(compiled_json),
+        "files": files_meta,
+    }
+
+
 def run_preflight_tests(
     module_names: Sequence[str] | None = None,
     *,
@@ -718,6 +780,7 @@ def run_preflight_tests(
     results = [_run_test_module(name, timeout_s=timeout_s, output_dir=output_dir) for name in modules]
     ok = all(item.ok for item in results)
     counts = _collect_preflight_counts(results)
+    compiled = compile_test_and_runtime_logs(output_dir=output_dir)
     summary = {
         "ok": bool(ok),
         "modules": [r.to_dict() for r in results],
@@ -728,11 +791,23 @@ def run_preflight_tests(
         "failures": int(counts["failures"]),
         "errors": int(counts["errors"]),
         "per_module": counts["per_module"],
+        "compiled_logs": compiled,
         "short_text": f"{int(counts['total'])} tests | {int(counts['failures'])} échec(s) | {int(counts['errors'])} erreur(s)",
     }
     path = Path(output_dir) / DEFAULT_TEST_SUMMARY_FILE
     path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    log_event("INFO" if ok else "ERROR", "preflight", "Préflight tests terminé", summary=summary)
+    log_event("INFO" if ok else "ERROR", "preflight", "Préflight tests terminé", summary={
+        "ok": summary["ok"],
+        "failed_modules": summary["failed_modules"],
+        "total": summary["total"],
+        "failures": summary["failures"],
+        "errors": summary["errors"],
+        "compiled_logs": {
+            "compiled_text": compiled["compiled_text"],
+            "compiled_json": compiled["compiled_json"],
+            "file_count": len(compiled["files"]),
+        },
+    })
     return summary
 
 
