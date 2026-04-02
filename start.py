@@ -1330,7 +1330,7 @@ class CamouflageApp(App):
         self.preview_projection_cache: Dict[str, PILImage.Image] = {}
         self._current_preview_raw_img: Optional[PILImage.Image] = None
         self.pending_manual_review: Optional[PendingManualReview] = None
-        self.generated_rows: List[dict] = []
+        self.generated_rows: List[dict] = self.generated_rows
 
         self.status_label: Optional[Label] = None
         self.attempt_text: Optional[Label] = None
@@ -1373,48 +1373,69 @@ class CamouflageApp(App):
 
     def build(self):
         Window.clearcolor = C["bg_root"]
-        root = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(10))
+        root = BoxLayout(orientation="vertical", spacing=dp(12), padding=dp(12))
 
-        header = GlassCard(orientation="horizontal", size_hint_y=None, height=dp(120))
-        title_box = BoxLayout(orientation="vertical", spacing=dp(4))
-        self.attempt_text = self._small_label("Image 000 | essai 0000 | total 000000 | seed --")
-        title = self._label(APP_TITLE, font_size=sp(19), height=dp(28))
+        # =====================
+        # HEADER / HERO
+        # =====================
+        header = GlassCard(orientation="horizontal", size_hint_y=None, height=dp(112), spacing=dp(14))
+
+        hero_left = BoxLayout(orientation="vertical", spacing=dp(4))
+        self.attempt_text = self._small_label("Image 000 | essai 0000 | total 000000 | seed --", color=C["text_muted"])
+        title = self._label(APP_TITLE, font_size=sp(22), height=dp(30))
         title.bold = True
-        title_box.add_widget(self.attempt_text)
-        title_box.add_widget(title)
-        self.status_label = self._label("Prêt", size_hint_x=0.20, halign="right")
-        header.add_widget(title_box)
-        header.add_widget(self.status_label)
+        subtitle = self._small_label(
+            "Pilotage temps réel, validation stricte, galerie, mannequin et revue manuelle des rejets.",
+            color=C["text_soft"],
+            height=dp(24),
+        )
+        hero_left.add_widget(self.attempt_text)
+        hero_left.add_widget(title)
+        hero_left.add_widget(subtitle)
+
+        hero_right = BoxLayout(orientation="vertical", spacing=dp(6), size_hint_x=0.28)
+        self.status_label = self._label("Prêt", halign="right", font_size=sp(18), height=dp(30))
+        self.status_label.bold = True
+        hero_hint = self._small_label("Sortie : textures + mannequins", halign="right", color=C["text_muted"])
+        hero_right.add_widget(self.status_label)
+        hero_right.add_widget(hero_hint)
+
+        header.add_widget(hero_left)
+        header.add_widget(hero_right)
         root.add_widget(header)
 
-        body = BoxLayout(spacing=dp(10))
-        left = BoxLayout(orientation="vertical", spacing=dp(10), size_hint_x=0.36)
-        right = BoxLayout(orientation="vertical", spacing=dp(10))
+        body = BoxLayout(spacing=dp(12))
+        left = BoxLayout(orientation="vertical", spacing=dp(12), size_hint_x=0.33)
+        right = BoxLayout(orientation="vertical", spacing=dp(12), size_hint_x=0.67)
 
+        # =====================
+        # COLONNE GAUCHE
+        # =====================
         control_scroll = ScrollView(do_scroll_x=False, bar_width=dp(8))
-        control_content = BoxLayout(orientation="vertical", spacing=dp(10), size_hint_y=None)
+        control_content = BoxLayout(orientation="vertical", spacing=dp(12), size_hint_y=None)
         control_content.bind(minimum_height=control_content.setter("height"))
 
-        controls = GlassCard(orientation="vertical", size_hint_y=None)
-        controls.bind(minimum_height=controls.setter("height"))
-        controls.add_widget(self._label("Paramètres"))
-        self.count_input = SoftTextInput(text=str(DEFAULT_TARGET_COUNT), multiline=False, input_filter="int", size_hint_y=None, height=dp(50))
-        controls.add_widget(self.count_input)
-
-        row = BoxLayout(size_hint_y=None, height=dp(58), spacing=dp(10))
+        actions_card = GlassCard(orientation="vertical", size_hint_y=None, spacing=dp(10))
+        actions_card.bind(minimum_height=actions_card.setter("height"))
+        actions_card.add_widget(self._section_title("Commandes", "Tout le pilotage principal au même endroit."))
+        self.count_input = SoftTextInput(text=str(DEFAULT_TARGET_COUNT), multiline=False, input_filter="int", size_hint_y=None, height=dp(52))
+        actions_card.add_widget(self.count_input)
+        btn_row = BoxLayout(size_hint_y=None, height=dp(58), spacing=dp(10))
         self.start_btn = self._button("Commencer", "launch", self.start_generation)
         self.stop_btn = self._button("Arrêter", "stop", self.stop_generation)
-        self.open_btn = self._button("Ouvrir le dossier", "neutral", lambda *_: open_folder(self.current_output_dir))
-        row.add_widget(self.start_btn)
-        row.add_widget(self.stop_btn)
-        controls.add_widget(row)
-        controls.add_widget(self.open_btn)
+        btn_row.add_widget(self.start_btn)
+        btn_row.add_widget(self.stop_btn)
+        actions_card.add_widget(btn_row)
+        self.open_btn = self._button("Ouvrir le dossier de sortie", "neutral", lambda *_: open_folder(self.current_output_dir))
+        actions_card.add_widget(self.open_btn)
+        control_content.add_widget(actions_card)
 
-        controls.add_widget(self._label("Préflight"))
+        runtime_card = GlassCard(orientation="vertical", size_hint_y=None, spacing=dp(10))
+        runtime_card.bind(minimum_height=runtime_card.setter("height"))
+        runtime_card.add_widget(self._section_title("Exécution", "Préflight, mode de lancement et validation manuelle."))
         self.tests_label = self._small_label(self.tests_summary)
-        controls.add_widget(self.tests_label)
+        runtime_card.add_widget(self.tests_label)
 
-        controls.add_widget(self._label("Mode de démarrage"))
         mode_grid = GridLayout(cols=1, size_hint_y=None, spacing=dp(8), height=dp(194))
         self.mode_blocking_btn = self._button("● Tests bloquants", "launch", lambda *_: self._set_run_mode(RUN_MODE_BLOCKING))
         self.mode_non_blocking_btn = self._button("○ Tests non bloquants", "neutral", lambda *_: self._set_run_mode(RUN_MODE_NON_BLOCKING))
@@ -1422,90 +1443,118 @@ class CamouflageApp(App):
         mode_grid.add_widget(self.mode_blocking_btn)
         mode_grid.add_widget(self.mode_non_blocking_btn)
         mode_grid.add_widget(self.mode_skip_tests_btn)
-        controls.add_widget(mode_grid)
-        self.run_mode_label = self._small_label("Mode actuel : tests bloquants")
-        controls.add_widget(self.run_mode_label)
+        runtime_card.add_widget(mode_grid)
+        self.run_mode_label = self._small_label("Mode actuel : tests bloquants", color=C["text_muted"])
+        runtime_card.add_widget(self.run_mode_label)
 
-        controls.add_widget(self._label("Chargement"))
-        self.progress_bar = GlassProgressBar()
-        self.progress_text = self._small_label("0 / 0 validé(s) | tentatives 0 | rejetés 0")
-        controls.add_widget(self.progress_bar)
-        controls.add_widget(self.progress_text)
-
-        controls.add_widget(self._label("Scale des motifs"))
-        motif_row = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(8))
-        self.motif_scale_slider = Slider(min=0.35, max=1.20, value=DEFAULT_UI_MOTIF_SCALE, step=0.01)
-        self.motif_scale_label = self._small_label(f"{DEFAULT_UI_MOTIF_SCALE:.2f}", size_hint_x=0.22)
-        self.motif_scale_slider.bind(value=self._on_motif_scale_change)
-        motif_row.add_widget(self.motif_scale_slider)
-        motif_row.add_widget(self.motif_scale_label)
-        controls.add_widget(motif_row)
-
-        controls.add_widget(self._label("Scale projection mannequin"))
-        projection_row = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(8))
-        self.projection_scale_slider = Slider(min=0.15, max=0.95, value=self.projection_preview_scale, step=0.01)
-        self.projection_scale_label = self._small_label(f"{self.projection_preview_scale:.2f}", size_hint_x=0.22)
-        self.projection_scale_slider.bind(value=self._on_projection_scale_change)
-        projection_row.add_widget(self.projection_scale_slider)
-        projection_row.add_widget(self.projection_scale_label)
-        controls.add_widget(projection_row)
-
-        controls.add_widget(self._label("Validation manuelle d'un rejet"))
+        runtime_card.add_widget(self._section_title("Dernier rejet mémorisé", "Tu peux le sauver sans interrompre la génération."))
         manual_row = BoxLayout(size_hint_y=None, height=dp(58), spacing=dp(10))
         self.manual_accept_btn = self._button("Valider ce rejet", "launch", self.manual_accept_current_reject)
         self.manual_skip_btn = self._button("Oublier ce rejet", "neutral", self.manual_skip_current_reject)
         manual_row.add_widget(self.manual_accept_btn)
         manual_row.add_widget(self.manual_skip_btn)
-        controls.add_widget(manual_row)
+        runtime_card.add_widget(manual_row)
         self.manual_review_label = self._small_label("Aucun rejet en attente.")
-        controls.add_widget(self.manual_review_label)
+        runtime_card.add_widget(self.manual_review_label)
+        control_content.add_widget(runtime_card)
 
-        controls.add_widget(self._label("Monitoring"))
+        tuning_card = GlassCard(orientation="vertical", size_hint_y=None, spacing=dp(10))
+        tuning_card.bind(minimum_height=tuning_card.setter("height"))
+        tuning_card.add_widget(self._section_title("Réglages", "Deux curseurs simples pour le motif et sa projection mannequin."))
+
+        tuning_card.add_widget(self._small_label("Scale des motifs", color=C["text_muted"]))
+        motif_row = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(8))
+        self.motif_scale_slider = Slider(min=0.35, max=1.20, value=DEFAULT_UI_MOTIF_SCALE, step=0.01)
+        self.motif_scale_label = self._small_label(f"{DEFAULT_UI_MOTIF_SCALE:.2f}", size_hint_x=0.22, halign="right")
+        self.motif_scale_slider.bind(value=self._on_motif_scale_change)
+        motif_row.add_widget(self.motif_scale_slider)
+        motif_row.add_widget(self.motif_scale_label)
+        tuning_card.add_widget(motif_row)
+
+        tuning_card.add_widget(self._small_label("Scale projection mannequin", color=C["text_muted"]))
+        projection_row = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(8))
+        self.projection_scale_slider = Slider(min=0.15, max=0.95, value=self.projection_preview_scale, step=0.01)
+        self.projection_scale_label = self._small_label(f"{self.projection_preview_scale:.2f}", size_hint_x=0.22, halign="right")
+        self.projection_scale_slider.bind(value=self._on_projection_scale_change)
+        projection_row.add_widget(self.projection_scale_slider)
+        projection_row.add_widget(self.projection_scale_label)
+        tuning_card.add_widget(projection_row)
+        control_content.add_widget(tuning_card)
+
+        health_card = GlassCard(orientation="vertical", size_hint_y=None, spacing=dp(10))
+        health_card.bind(minimum_height=health_card.setter("height"))
+        health_card.add_widget(self._section_title("Santé & qualité", "Lisibilité immédiate de l’état machine et des métriques backend."))
         self.resource_text = self._small_label("CPU -- | RAM -- | Disque -- | Processus -- | scale --")
-        controls.add_widget(self.resource_text)
-
-        controls.add_widget(self._label("Validation backend"))
         self.score_text = self._small_label("MAE ratio -- | max abs -- | olive comp. -- | miroir --")
         self.color_text = self._small_label("C -- | O -- | T -- | G --")
         self.extra_text = self._small_label("bd -- | bd/4 -- | bd/8 -- | bord --")
         self.struct_text = self._small_label("overscan -- | shift -- | px/cm --")
-        controls.add_widget(self.score_text)
-        controls.add_widget(self.color_text)
-        controls.add_widget(self.extra_text)
-        controls.add_widget(self.struct_text)
-
-        controls.add_widget(self._label("Runtime / diagnostic"))
         self.runtime_last_label = self._small_label("Dernier runtime : --")
         self.diag_summary_label = self._small_label("Tentatives 0 | acceptés 0 | rejetés 0 | taux 0.00%")
         self.diag_top_rules_label = self._small_label("Top règles : --")
         self.diag_last_fail_label = self._small_label("Dernier rejet : --")
-        controls.add_widget(self.runtime_last_label)
-        controls.add_widget(self.diag_summary_label)
-        controls.add_widget(self.diag_top_rules_label)
-        controls.add_widget(self.diag_last_fail_label)
+        for widget in [
+            self.resource_text,
+            self.score_text,
+            self.color_text,
+            self.extra_text,
+            self.struct_text,
+            self.runtime_last_label,
+            self.diag_summary_label,
+            self.diag_top_rules_label,
+            self.diag_last_fail_label,
+        ]:
+            health_card.add_widget(widget)
+        control_content.add_widget(health_card)
 
-        control_content.add_widget(controls)
-
-        gallery_card = GlassCard(orientation="vertical", size_hint_y=None, height=dp(500))
-        gallery_card.add_widget(self._label("Galerie"))
-        gallery_scroll = ScrollView(do_scroll_x=False)
+        gallery_card = GlassCard(orientation="vertical", size_hint_y=None, height=dp(430), spacing=dp(10))
+        gallery_card.add_widget(self._section_title("Galerie récente", "Clique une vignette pour la charger immédiatement dans les aperçus."))
+        gallery_scroll = ScrollView(do_scroll_x=False, bar_width=dp(8))
         self.gallery_grid = GridLayout(cols=GALLERY_COLUMNS, spacing=dp(10), padding=dp(2), size_hint_y=None)
         self.gallery_grid.bind(minimum_height=self.gallery_grid.setter("height"))
         gallery_scroll.add_widget(self.gallery_grid)
         gallery_card.add_widget(gallery_scroll)
         control_content.add_widget(gallery_card)
+
         control_scroll.add_widget(control_content)
         left.add_widget(control_scroll)
 
-        previews = GridLayout(cols=3, spacing=dp(10), size_hint_y=0.46)
+        # =====================
+        # COLONNE DROITE
+        # =====================
+        top_strip = GridLayout(cols=3, spacing=dp(12), size_hint_y=None, height=dp(118))
+
+        progress_card = GlassCard(orientation="vertical", spacing=dp(8))
+        progress_card.add_widget(self._section_title("Progression", "Suivi du lot courant."))
+        self.progress_bar = GlassProgressBar()
+        self.progress_text = self._small_label("0 / 0 validé(s) | tentatives 0 | rejetés 0")
+        progress_card.add_widget(self.progress_bar)
+        progress_card.add_widget(self.progress_text)
+        top_strip.add_widget(progress_card)
+
+        backend_card = GlassCard(orientation="vertical", spacing=dp(8))
+        backend_card.add_widget(self._section_title("Validation stricte", "Synthèse instantanée du backend."))
+        backend_card.add_widget(self.diag_summary_label)
+        backend_card.add_widget(self.diag_top_rules_label)
+        top_strip.add_widget(backend_card)
+
+        manual_card = GlassCard(orientation="vertical", spacing=dp(8))
+        manual_card.add_widget(self._section_title("Revue manuelle", "Dernier rejet disponible à l’enregistrement."))
+        manual_card.add_widget(self.manual_review_label)
+        top_strip.add_widget(manual_card)
+        right.add_widget(top_strip)
+
+        previews = BoxLayout(orientation="vertical", spacing=dp(12), size_hint_y=0.56)
+        previews_top = GridLayout(cols=2, spacing=dp(12), size_hint_y=0.62)
         self.preview_img = Image()
         self.preview_silhouette = Image()
-        self.live_preview_img = Image()
-        previews.add_widget(self._carded_view("Camouflage courant", self.preview_img))
-        previews.add_widget(self._carded_view("Projection sur soldat modèle", self.preview_silhouette))
+        previews_top.add_widget(self._carded_view("Camouflage courant", self.preview_img))
+        previews_top.add_widget(self._carded_view("Projection sur soldat modèle", self.preview_silhouette))
+        previews.add_widget(previews_top)
 
-        live_card = GlassCard(orientation="vertical")
-        live_card.add_widget(self._label("Suivi direct de construction"))
+        self.live_preview_img = Image()
+        live_card = GlassCard(orientation="vertical", size_hint_y=0.38, spacing=dp(8))
+        live_card.add_widget(self._section_title("Suivi direct de construction", "Ce que le pipeline est en train de faire maintenant."))
         self.live_stage_label = self._small_label("Étape : attente")
         self.live_counts_label = self._small_label("État backend strict")
         self.live_meta_label = self._small_label("Image -- | essai -- | seed --")
@@ -1518,16 +1567,17 @@ class CamouflageApp(App):
         previews.add_widget(live_card)
         right.add_widget(previews)
 
-        bottom = BoxLayout(spacing=dp(10), size_hint_y=0.54)
-        log_card = GlassCard(orientation="vertical")
-        log_card.add_widget(self._label("Journal"))
+        bottom = GridLayout(cols=2, spacing=dp(12), size_hint_y=0.44)
+        log_card = GlassCard(orientation="vertical", spacing=dp(10))
+        log_card.add_widget(self._section_title("Journal opérationnel", "Événements généraux, export et états du front."))
         self.log_view = LogView()
         log_card.add_widget(self.log_view)
-        diag_card = GlassCard(orientation="vertical")
-        diag_card.add_widget(self._label("Diagnostic live"))
+        bottom.add_widget(log_card)
+
+        diag_card = GlassCard(orientation="vertical", spacing=dp(10))
+        diag_card.add_widget(self._section_title("Diagnostic live", "Raisons de rejet et détails candidat par candidat."))
         self.diag_log_view = LogView()
         diag_card.add_widget(self.diag_log_view)
-        bottom.add_widget(log_card)
         bottom.add_widget(diag_card)
         right.add_widget(bottom)
 
@@ -1565,14 +1615,24 @@ class CamouflageApp(App):
         lbl.bind(size=lambda *a: setattr(lbl, "text_size", lbl.size))
         return lbl
 
+    def _section_title(self, title: str, subtitle: str = "") -> Widget:
+        box = BoxLayout(orientation="vertical", spacing=dp(2), size_hint_y=None)
+        box.bind(minimum_height=box.setter("height"))
+        ttl = self._label(title, font_size=sp(16), height=dp(24))
+        ttl.bold = True
+        box.add_widget(ttl)
+        if subtitle:
+            box.add_widget(self._small_label(subtitle, color=C["text_muted"], height=dp(20)))
+        return box
+
     def _button(self, text: str, role: str, callback) -> SoftButton:
         btn = SoftButton(text=text, role=role)
         btn.bind(on_release=callback)
         return btn
 
     def _carded_view(self, title: str, image_widget: Image) -> Widget:
-        box = GlassCard(orientation="vertical")
-        box.add_widget(self._label(title))
+        box = GlassCard(orientation="vertical", spacing=dp(8))
+        box.add_widget(self._section_title(title))
         pane = SoftPane(orientation="vertical")
         pane.add_widget(image_widget)
         box.add_widget(pane)
