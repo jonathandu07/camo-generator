@@ -37,6 +37,7 @@ import numpy as np
 from PIL import Image as PILImage
 from PIL import ImageDraw
 from PIL import ImageFilter
+from PIL import ImageOps
 
 try:
     import psutil
@@ -158,7 +159,7 @@ RUN_MODE_BLOCKING = "blocking"
 RUN_MODE_NON_BLOCKING = "non_blocking"
 RUN_MODE_SKIP_TESTS = "skip_tests"
 
-THUMB_SIZE = (240, 150)
+THUMB_SIZE = (320, 320)
 GALLERY_COLUMNS = 3
 MAX_GALLERY_ITEMS = 24
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -250,16 +251,11 @@ def pil_to_coreimage(pil_img: PILImage.Image) -> CoreImage:
 
 
 def make_thumbnail(pil_img: PILImage.Image, size: Tuple[int, int]) -> PILImage.Image:
-    img = pil_img.copy()
-    img.thumbnail(size, PILImage.Resampling.LANCZOS)
-    canvas = PILImage.new("RGB", size, tuple(int(v * 255) for v in C["bg_root"][:3]))
-    x = (size[0] - img.width) // 2
-    y = (size[1] - img.height) // 2
-    canvas.paste(img, (x, y))
-    return canvas
+    img = pil_img.convert("RGB")
+    return ImageOps.fit(img, size, method=PILImage.Resampling.LANCZOS, centering=(0.5, 0.5))
 
 
-DEFAULT_UI_MOTIF_SCALE = float(getattr(camo, "DEFAULT_MOTIF_SCALE", 0.58))
+DEFAULT_UI_MOTIF_SCALE = float(max(0.18, min(getattr(camo, "DEFAULT_MOTIF_SCALE", 0.55), 0.30)))
 DEFAULT_BACKEND_MACHINE_INTENSITY = float(getattr(camo, "DEFAULT_MACHINE_INTENSITY", 0.98))
 DEFAULT_PROJECTION_PREVIEW_SCALE = 0.40
 
@@ -1245,7 +1241,7 @@ class GalleryThumb(Button):
         self.container = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
         self.add_widget(self.container)
         self.stage = SoftPane(orientation="vertical", size_hint_y=1)
-        self.thumb = Image()
+        self.thumb = Image(allow_stretch=True, keep_ratio=False)
         self.stage.add_widget(self.thumb)
         self.caption = Label(text=image_path.name, size_hint_y=None, height=dp(22), font_size=sp(11), color=C["text_soft"], halign="center", valign="middle")
         self.caption.bind(size=lambda *a: setattr(self.caption, "text_size", self.caption.size))
@@ -1467,7 +1463,7 @@ class CamouflageApp(App):
 
         tuning_card.add_widget(self._small_label("Scale des motifs", color=C["text_muted"]))
         motif_row = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(8))
-        self.motif_scale_slider = Slider(min=0.35, max=1.20, value=DEFAULT_UI_MOTIF_SCALE, step=0.01)
+        self.motif_scale_slider = Slider(min=0.18, max=1.20, value=DEFAULT_UI_MOTIF_SCALE, step=0.01)
         self.motif_scale_label = self._small_label(f"{DEFAULT_UI_MOTIF_SCALE:.2f}", size_hint_x=0.22, halign="right")
         self.motif_scale_slider.bind(value=self._on_motif_scale_change)
         motif_row.add_widget(self.motif_scale_slider)
@@ -1476,7 +1472,7 @@ class CamouflageApp(App):
 
         tuning_card.add_widget(self._small_label("Scale projection mannequin", color=C["text_muted"]))
         projection_row = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(8))
-        self.projection_scale_slider = Slider(min=0.15, max=0.95, value=self.projection_preview_scale, step=0.01)
+        self.projection_scale_slider = Slider(min=0.08, max=0.95, value=self.projection_preview_scale, step=0.01)
         self.projection_scale_label = self._small_label(f"{self.projection_preview_scale:.2f}", size_hint_x=0.22, halign="right")
         self.projection_scale_slider.bind(value=self._on_projection_scale_change)
         projection_row.add_widget(self.projection_scale_slider)
@@ -1935,7 +1931,7 @@ class CamouflageApp(App):
         self._refresh_run_mode_buttons()
 
     def _apply_backend_motif_scale(self) -> float:
-        scale = max(0.25, float(self.motif_scale))
+        scale = max(0.18, float(self.motif_scale))
         setter = getattr(camo, "set_motif_scale", None)
         if callable(setter):
             setter(scale)
