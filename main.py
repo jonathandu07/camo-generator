@@ -5,6 +5,13 @@ Générateur générique de textures multi-classes 8K horizontal, asynchrone,
 strict, orienté production, avec suivi temps réel, rejet/acceptation en direct,
 best-of obligatoire et export exhaustif des motifs de rejet vers logs / ML / DL.
 
+Version corrigée :
+- évite la constitution de pixels orphelins dès le début ;
+- sème des macros aléatoires par classe ;
+- fait croître les classes uniquement depuis leur frontière ;
+- garde un rééquilibrage des proportions sécurisé ;
+- conserve les outils de réparation, logs, best-of et orchestration async.
+
 Usage :
     python main.py
     python main.py --target-count 20 --width 3840 --height 2160
@@ -78,13 +85,12 @@ CLASS_NAMES = [
     "class_3",
 ]
 
-# Palette neutre, non tactique.
 RGB = np.array(
     [
-        (0x81, 0x61, 0x3C),  # Coyote Brown  #81613C
-        (0x55, 0x54, 0x3F),  # Vert Olive    #55543F
-        (0x7C, 0x6D, 0x66),  # Terre de France #7C6D66
-        (0x57, 0x5D, 0x57),  # Vert-de-gris  #575D57
+        (0x81, 0x61, 0x3C),
+        (0x55, 0x54, 0x3F),
+        (0x7C, 0x6D, 0x66),
+        (0x57, 0x5D, 0x57),
     ],
     dtype=np.uint8,
 )
@@ -137,6 +143,26 @@ REJECTIONS_JSONL = "ml_rejections.jsonl"
 FULL_DATASET_JSONL = "ml_dataset_all_attempts.jsonl"
 
 MAX_REPAIR_ROUNDS = 3
+
+# Nouveau pipeline topologique.
+UNASSIGNED_LABEL = np.uint8(255)
+
+SEED_CANDIDATE_SAMPLES = 96
+SEED_RETRY_LIMIT = 32
+
+SEEDS_PER_MP = (0.26, 0.15, 0.22, 0.20)
+MIN_SEEDS_PER_CLASS = (5, 3, 4, 4)
+MAX_SEEDS_PER_CLASS = (18, 10, 14, 12)
+
+SEED_RADIUS_CM_BASE = (0.60, 0.72, 0.56, 0.52)
+PRIMARY_SEED_RADIUS_MULTIPLIER = (1.45, 2.20, 1.55, 1.50)
+
+GROWTH_MIN_BATCH = 2048
+GROWTH_MAX_BATCH = 262144
+
+SAFE_TRANSFER_MIN_SOURCE_SAME = 2
+SAFE_TRANSFER_MIN_DEST_NEIGHBORS = 1
+SAFE_REBALANCE_ROUNDS = 24
 
 
 # ============================================================
@@ -467,7 +493,6 @@ def validate_generation_request(
 # PROFILS
 # ============================================================
 
-
 def build_seed(target_index: int, local_attempt: int, base_seed: int = DEFAULT_BASE_SEED) -> int:
     return int(base_seed + target_index * 100000 + local_attempt)
 
@@ -488,7 +513,6 @@ def make_profile(seed: int) -> VariantProfile:
 # ============================================================
 # OUTILS GÉNÉRAUX
 # ============================================================
-
 
 def compute_ratios(label_map: np.ndarray) -> np.ndarray:
     counts = np.bincount(label_map.ravel(), minlength=N_CLASSES).astype(np.float64)
@@ -610,10 +634,338 @@ def scaled_patch_size(patch_cm_x: float, patch_cm_y: float, motif_scale: float) 
     return float(patch_cm_x) * motif_scale, float(patch_cm_y) * motif_scale
 
 
-# ============================================================
-# GÉNÉRATEUR
-# ============================================================
+def _neighbor_count_from_mask(mask: np.ndarray) -> np.ndarray:
+    padded = np.pad(mask.astype(np.uint8), ((1, 1), (1, 1)), mode="constant")
+    return (
+        padded[0:-2, 0:-2] +
+        padded[0:-2, 1:-1] +
+        padded[0:-2, 2:] +
+        padded[1:-1, 0:-2] +
+        padded[1:-1, 2:] +
+        padded[2:, 0:-2] +
+        padded[2:, 1:-1] +
+        padded[2:, 2:]
+    ).astype(np.uint8, copy=False)
 
+
+def _disk_offsets(radius_px: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    radius_px = max(1, int(radius_px))
+    yy, xx = np.mgrid[-radius_px:radius_px + 1, -radius_px:radius_px + 1]
+    mask = (yy * yy + xx * xx) <= (radius_px * radius_px)
+    dy = yy[mask].astype(np.int32, copy=False)
+    dx = xx[mask].astype(np.int32, copy=False)
+    dist2 = (dy.astype(np.int64) * dy.astype(np.int64) + dx.astype(np.int64) * dx.astype(np.int64))
+    return dy, dx, dist2
+
+
+def estimate_seed_radius_px(class_idx: int, motif_scale: float) -> int:
+    base_cm = float(SEED_RADIUS_CM_BASE[class_idx] if class_idx < len(SEED_RADIUS_CM_BASE) else SEED_RADIUS_CM_BASE[-1])
+    ms = _clip_float(float(motif_scale), MIN_MOTIF_SCALE, MAX_MOTIF_SCALE)
+    cm = max(0.28, base_cm * (0.65 + 0.35 * ms))
+    radius_px = int(round(cm * PX_PER_CM))
+    return max(2, radius_px)
+
+
+def estimate_seed_count(class_idx: int, target_count: int, total_pixels: int, motif_scale: float) -> int:
+    megapixels = max(1e-9, total_pixels / 1_000_000.0)
+    per_mp = float(SEEDS_PER_MP[class_idx] if class_idx < len(SEEDS_PER_MP) else SEEDS_PER_MP[-1])
+    ms = _clip_float(float(motif_scale), MIN_MOTIF_SCALE, MAX_MOTIF_SCALE)
+    scale_factor = 1.25 - 0.35 * ms
+    raw = int(round(per_mp * megapixels * scale_factor))
+    min_n = int(MIN_SEEDS_PER_CLASS[class_idx] if class_idx < len(MIN_SEEDS_PER_CLASS) else MIN_SEEDS_PER_CLASS[-1])
+    max_n = int(MAX_SEEDS_PER_CLASS[class_idx] if class_idx < len(MAX_SEEDS_PER_CLASS) else MAX_SEEDS_PER_CLASS[-1])
+    return max(min_n, min(max_n, raw))
+
+
+def pick_seed_center(
+    labels: np.ndarray,
+    field_for_class: np.ndarray,
+    rng: np.random.Generator,
+    samples: int = SEED_CANDIDATE_SAMPLES,
+) -> Optional[Tuple[int, int]]:
+    unassigned = np.flatnonzero(labels.ravel() == UNASSIGNED_LABEL)
+    if unassigned.size == 0:
+        return None
+
+    take = min(int(samples), int(unassigned.size))
+    choice = rng.choice(unassigned, size=take, replace=False)
+    scores = field_for_class.ravel()[choice].astype(np.float32, copy=False)
+    best_idx = int(choice[int(np.argmax(scores))])
+    h, w = labels.shape
+    y = best_idx // w
+    x = best_idx % w
+    return int(y), int(x)
+
+
+def stamp_seed_macro(
+    labels: np.ndarray,
+    class_idx: int,
+    center_y: int,
+    center_x: int,
+    radius_px: int,
+    remaining_need: int,
+    field_for_class: np.ndarray,
+) -> int:
+    if remaining_need <= 0:
+        return 0
+
+    h, w = labels.shape
+    dy, dx, dist2 = _disk_offsets(radius_px)
+
+    yy = center_y + dy
+    xx = center_x + dx
+
+    valid = (yy >= 0) & (yy < h) & (xx >= 0) & (xx < w)
+    if not np.any(valid):
+        return 0
+
+    yy = yy[valid]
+    xx = xx[valid]
+    dist2 = dist2[valid]
+
+    flat = yy.astype(np.int64) * int(w) + xx.astype(np.int64)
+    flat_labels = labels.ravel()
+
+    avail_mask = flat_labels[flat] == UNASSIGNED_LABEL
+    if not np.any(avail_mask):
+        return 0
+
+    flat = flat[avail_mask]
+    yy = yy[avail_mask]
+    xx = xx[avail_mask]
+    dist2 = dist2[avail_mask]
+
+    if flat.size == 0:
+        return 0
+
+    if flat.size > remaining_need:
+        local_scores = field_for_class[yy, xx].astype(np.float32, copy=False)
+        order = np.lexsort((-local_scores, dist2))
+        flat = flat[order[:remaining_need]]
+
+    flat_labels[flat] = np.uint8(class_idx)
+    return int(flat.size)
+
+
+def frontier_mask_for_class(labels: np.ndarray, class_idx: int) -> Tuple[np.ndarray, np.ndarray]:
+    class_mask = (labels == class_idx)
+    support = _neighbor_count_from_mask(class_mask)
+    frontier = (labels == UNASSIGNED_LABEL) & (support > 0)
+    return frontier, support
+
+
+def grow_from_frontier(
+    labels: np.ndarray,
+    class_idx: int,
+    need: int,
+    field_for_class: np.ndarray,
+    rng: np.random.Generator,
+) -> int:
+    if need <= 0:
+        return 0
+
+    frontier, support = frontier_mask_for_class(labels, class_idx)
+    frontier_idx = np.flatnonzero(frontier.ravel())
+    if frontier_idx.size == 0:
+        return 0
+
+    frontier_size = int(frontier_idx.size)
+    dynamic_batch = max(
+        GROWTH_MIN_BATCH,
+        min(
+            GROWTH_MAX_BATCH,
+            frontier_size,
+            int(max(need * 0.12, frontier_size * 0.28)),
+        ),
+    )
+    take = min(int(need), int(dynamic_batch))
+    if take <= 0:
+        return 0
+
+    flat_scores = field_for_class.ravel()[frontier_idx].astype(np.float32, copy=False)
+    flat_support = support.ravel()[frontier_idx].astype(np.float32, copy=False)
+    jitter = rng.random(frontier_idx.size, dtype=np.float32) * np.float32(1e-4)
+    composite = flat_scores + (flat_support * np.float32(0.035)) + jitter
+
+    if frontier_idx.size > take:
+        local = np.argpartition(composite, -take)[-take:]
+        chosen = frontier_idx[local]
+    else:
+        chosen = frontier_idx
+
+    labels.ravel()[chosen] = np.uint8(class_idx)
+    return int(chosen.size)
+
+
+def macro_seeded_assign(
+    fields: np.ndarray,
+    target_counts: np.ndarray,
+    seed: int,
+    motif_scale: float,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    _, height, width = fields.shape
+    total_pixels = int(height * width)
+    labels = np.full((height, width), UNASSIGNED_LABEL, dtype=np.uint8)
+    rng = np.random.default_rng(int(seed) ^ 0xA5A5A5A5)
+
+    counts = np.zeros(N_CLASSES, dtype=np.int64)
+    seed_counts_used = [0] * N_CLASSES
+    seed_radius_used = [estimate_seed_radius_px(c, motif_scale) for c in range(N_CLASSES)]
+
+    # Une macro primaire par classe pour éviter l'éparpillement.
+    for c in range(N_CLASSES):
+        remaining_need = int(target_counts[c] - counts[c])
+        if remaining_need <= 0:
+            continue
+
+        center = pick_seed_center(labels, fields[c], rng)
+        if center is not None:
+            primary_radius = max(
+                seed_radius_used[c],
+                int(round(seed_radius_used[c] * float(
+                    PRIMARY_SEED_RADIUS_MULTIPLIER[c]
+                    if c < len(PRIMARY_SEED_RADIUS_MULTIPLIER)
+                    else PRIMARY_SEED_RADIUS_MULTIPLIER[-1]
+                )))
+            )
+            placed = stamp_seed_macro(
+                labels=labels,
+                class_idx=c,
+                center_y=center[0],
+                center_x=center[1],
+                radius_px=primary_radius,
+                remaining_need=remaining_need,
+                field_for_class=fields[c],
+            )
+            if placed > 0:
+                seed_counts_used[c] += 1
+                counts[c] += int(placed)
+
+    # Semis complémentaires.
+    for c in range(N_CLASSES):
+        wanted = int(target_counts[c])
+        radius_px = int(seed_radius_used[c])
+        n_seeds = estimate_seed_count(c, wanted, total_pixels, motif_scale)
+
+        for _ in range(max(0, n_seeds - seed_counts_used[c])):
+            remaining_need = int(target_counts[c] - counts[c])
+            if remaining_need <= 0:
+                break
+
+            placed = 0
+            for _retry in range(SEED_RETRY_LIMIT):
+                center = pick_seed_center(labels, fields[c], rng)
+                if center is None:
+                    break
+
+                placed = stamp_seed_macro(
+                    labels=labels,
+                    class_idx=c,
+                    center_y=center[0],
+                    center_x=center[1],
+                    radius_px=radius_px,
+                    remaining_need=remaining_need,
+                    field_for_class=fields[c],
+                )
+                if placed > 0:
+                    seed_counts_used[c] += 1
+                    counts[c] += int(placed)
+                    break
+
+    # Croissance depuis la frontière uniquement.
+    growth_rounds = 0
+    while True:
+        remaining = target_counts.astype(np.int64) - counts
+        if np.all(remaining <= 0):
+            break
+
+        growth_rounds += 1
+        progressed = False
+
+        active_classes = [int(c) for c in np.argsort(-remaining) if remaining[c] > 0]
+        for c in active_classes:
+            need = int(remaining[c])
+            if need <= 0:
+                continue
+
+            added = grow_from_frontier(
+                labels=labels,
+                class_idx=c,
+                need=need,
+                field_for_class=fields[c],
+                rng=rng,
+            )
+            if added > 0:
+                counts[c] += int(added)
+                progressed = True
+                continue
+
+            # Si la classe n'a plus de frontière, on replante une macro.
+            radius_px = int(seed_radius_used[c])
+            for _retry in range(SEED_RETRY_LIMIT):
+                center = pick_seed_center(labels, fields[c], rng)
+                if center is None:
+                    break
+
+                added = stamp_seed_macro(
+                    labels=labels,
+                    class_idx=c,
+                    center_y=center[0],
+                    center_x=center[1],
+                    radius_px=radius_px,
+                    remaining_need=need,
+                    field_for_class=fields[c],
+                )
+                if added > 0:
+                    seed_counts_used[c] += 1
+                    counts[c] += int(added)
+                    progressed = True
+                    break
+
+        if not progressed:
+            break
+
+    # Fallback strict : normalement rare.
+    remaining = target_counts.astype(np.int64) - counts
+    if np.any(remaining > 0):
+        unassigned = np.flatnonzero(labels.ravel() == UNASSIGNED_LABEL)
+        for c in np.argsort(-remaining):
+            need = int(remaining[c])
+            if need <= 0 or unassigned.size == 0:
+                continue
+
+            scores = fields[c].ravel()[unassigned].astype(np.float32, copy=False)
+            take = min(need, int(unassigned.size))
+            if take <= 0:
+                continue
+
+            if unassigned.size > take:
+                chosen_local = np.argpartition(scores, -take)[-take:]
+                chosen = unassigned[chosen_local]
+                labels.ravel()[chosen] = np.uint8(c)
+                counts[c] += int(chosen.size)
+
+                keep = np.ones(unassigned.size, dtype=bool)
+                keep[chosen_local] = False
+                unassigned = unassigned[keep]
+            else:
+                chosen = unassigned
+                labels.ravel()[chosen] = np.uint8(c)
+                counts[c] += int(chosen.size)
+                unassigned = unassigned[:0]
+
+    info = {
+        "seed_counts_used": [int(x) for x in seed_counts_used],
+        "seed_radius_px": [int(x) for x in seed_radius_used],
+        "growth_rounds": int(growth_rounds),
+        "assigned_pixels": int(np.sum(labels != UNASSIGNED_LABEL)),
+    }
+    return labels, info
+
+
+# ============================================================
+# GÉNÉRATEUR DE CHAMPS
+# ============================================================
 
 def random_blob_layer(
     width: int,
@@ -742,133 +1094,9 @@ def build_all_fields(
     return np.stack(fields, axis=0)
 
 
-def sequential_assign(fields: np.ndarray, target_counts: np.ndarray) -> np.ndarray:
-    _, height, width = fields.shape
-    labels = np.zeros((height, width), dtype=np.uint8)
-    remaining = np.ones((height, width), dtype=bool)
-
-    for c in (IDX_1, IDX_2, IDX_3):
-        count = int(target_counts[c])
-        remaining_flat = np.flatnonzero(remaining.ravel())
-        values = fields[c].ravel()[remaining_flat]
-        best_local = np.argpartition(values, -count)[-count:]
-        selected_flat = remaining_flat[best_local]
-        labels.ravel()[selected_flat] = c
-        remaining.ravel()[selected_flat] = False
-
-    return labels
-
-
-def exactify_proportions(labels: np.ndarray, fields: np.ndarray, target_counts: np.ndarray) -> np.ndarray:
-    n_classes, height, width = fields.shape
-    labels = labels.copy()
-
-    for _ in range(24):
-        counts = np.bincount(labels.ravel(), minlength=n_classes)
-        delta = target_counts - counts
-        if np.all(delta == 0):
-            break
-
-        flat_labels = labels.ravel()
-        flat_fields = fields.reshape(n_classes, -1)
-        flat_boundary = boundary_mask(labels).ravel()
-        changed = False
-
-        under = np.where(delta > 0)[0]
-        over = np.where(delta < 0)[0]
-        if len(under) == 0 or len(over) == 0:
-            break
-
-        for u in under:
-            need = int(delta[u])
-            if need <= 0:
-                continue
-            candidate_mask = flat_boundary & np.isin(flat_labels, over)
-            idx = np.where(candidate_mask)[0]
-            if idx.size == 0:
-                continue
-            current = flat_labels[idx]
-            gain = flat_fields[u, idx].astype(np.float32) - flat_fields[current, idx].astype(np.float32)
-            order = np.argsort(gain)[::-1]
-            selected = idx[order[:need]]
-            if selected.size == 0:
-                continue
-            flat_labels[selected] = u
-            changed = True
-
-        labels = flat_labels.reshape(height, width)
-        if not changed:
-            break
-
-    return labels.astype(np.uint8)
-
-
-def force_exact_target_counts(labels: np.ndarray, fields: np.ndarray, target_counts: np.ndarray) -> np.ndarray:
-    labels = labels.copy()
-    flat_labels = labels.ravel()
-    flat_fields = fields.reshape(fields.shape[0], -1).astype(np.float32, copy=False)
-    shape = labels.shape
-
-    for _ in range(16):
-        counts = np.bincount(flat_labels, minlength=fields.shape[0]).astype(int)
-        delta = target_counts.astype(int) - counts
-        if np.all(delta == 0):
-            break
-
-        boundary = boundary_mask(flat_labels.reshape(shape)).ravel()
-        under = [int(c) for c in np.where(delta > 0)[0]]
-        over = [int(c) for c in np.where(delta < 0)[0]]
-        moved = False
-
-        for dst in under:
-            need = int(delta[dst])
-            if need <= 0:
-                continue
-
-            for src in over:
-                excess = -int(delta[src])
-                if excess <= 0:
-                    continue
-
-                take = min(need, excess)
-
-                idx_boundary = np.where((flat_labels == src) & boundary)[0]
-                idx_pool = idx_boundary
-
-                if idx_pool.size < take:
-                    idx_inner = np.where((flat_labels == src) & (~boundary))[0]
-                    if idx_inner.size:
-                        idx_pool = np.concatenate([idx_boundary, idx_inner], axis=0)
-
-                if idx_pool.size == 0:
-                    continue
-
-                gain = flat_fields[dst, idx_pool] - flat_fields[src, idx_pool]
-                order = np.argsort(gain)[::-1]
-                picked = idx_pool[order[:take]]
-
-                if picked.size == 0:
-                    continue
-
-                flat_labels[picked] = dst
-                delta[dst] -= picked.size
-                delta[src] += picked.size
-                need -= picked.size
-                moved = True
-
-                if need <= 0:
-                    break
-
-        if not moved:
-            break
-
-    return flat_labels.reshape(shape).astype(np.uint8)
-
-
 # ============================================================
 # NETTOYAGE DES PIXELS ORPHELINS
 # ============================================================
-
 
 def _neighbors8(labels: np.ndarray) -> List[np.ndarray]:
     padded = np.pad(labels, ((1, 1), (1, 1)), mode="edge")
@@ -946,7 +1174,6 @@ def cleanup_orphan_pixels(
 # ============================================================
 # FRAGMENTATION / MICRO-ÎLOTS
 # ============================================================
-
 
 def _connected_component_areas_cv2(mask: np.ndarray) -> List[int]:
     num_labels, _, stats, _ = cv2.connectedComponentsWithStats(mask.astype(np.uint8), connectivity=8)
@@ -1040,7 +1267,6 @@ def fragmentation_report(
 # ============================================================
 # BEST-OF / VALIDATION
 # ============================================================
-
 
 def compute_bestof_score(
     *,
@@ -1153,8 +1379,6 @@ def validate_with_reasons(candidate: CandidateResult) -> ValidationOutcome:
     )
 
 
-
-
 def validate_candidate_result(candidate: CandidateResult) -> bool:
     return bool(validate_with_reasons(candidate).accepted)
 
@@ -1226,12 +1450,13 @@ def derive_repair_plan(
 
     if "largest_component_ratio_class_1" in reasons:
         bias[IDX_1] += np.float32(0.0045)
-        shift_strength = _clip_float(shift_strength - 0.05, 0.50, 1.10)
-        motif_scale *= 1.05
+        shift_strength = _clip_float(shift_strength - 0.06, 0.50, 1.10)
+        motif_scale *= 1.08
 
     if "orphan_pixels" in reasons or "micro_islands" in reasons:
         extra_cleanup_passes += 2
         merge_micro = True
+        motif_scale *= 1.05
 
     if any(r.startswith("ratio_class_") for r in reasons) or "mean_abs_error" in reasons:
         bias += ((TARGET - candidate.ratios) * 0.25).astype(np.float32)
@@ -1288,7 +1513,6 @@ def rebalance_edge_pixels(
     fraction: float = 0.12,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     labels = label_map.copy()
-    _, _ = labels.shape
     m = max(1, int(edge_margin))
 
     border = np.zeros_like(labels, dtype=bool)
@@ -1365,10 +1589,88 @@ def break_mirror_pattern(
     }
 
 
+def safe_target_rebalance(
+    labels: np.ndarray,
+    fields: np.ndarray,
+    target_counts: np.ndarray,
+    max_rounds: int = SAFE_REBALANCE_ROUNDS,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    labels = labels.copy()
+    flat_fields = fields.reshape(fields.shape[0], -1).astype(np.float32, copy=False)
+    total_moved = 0
+
+    for _ in range(max(1, int(max_rounds))):
+        flat_labels = labels.ravel()
+        counts = np.bincount(flat_labels, minlength=N_CLASSES).astype(np.int64)
+        delta = target_counts.astype(np.int64) - counts
+        if np.all(delta == 0):
+            break
+
+        boundary = boundary_mask(labels).ravel()
+        same = same_neighbor_count(labels).ravel()
+        winner, winner_count = dominant_neighbor_class(labels, class_count=N_CLASSES)
+        winner = winner.ravel()
+        winner_count = winner_count.ravel()
+
+        moved = False
+        under = [int(c) for c in np.where(delta > 0)[0]]
+        over = [int(c) for c in np.where(delta < 0)[0]]
+
+        for dst in under:
+            need = int(delta[dst])
+            if need <= 0:
+                continue
+
+            for src in over:
+                excess = int(-delta[src])
+                if excess <= 0:
+                    continue
+
+                take = min(need, excess)
+                candidate_idx = np.where(
+                    (flat_labels == src) &
+                    boundary &
+                    (winner == dst) &
+                    (winner_count >= SAFE_TRANSFER_MIN_DEST_NEIGHBORS) &
+                    (same >= SAFE_TRANSFER_MIN_SOURCE_SAME)
+                )[0]
+
+                if candidate_idx.size == 0:
+                    continue
+
+                gains = flat_fields[dst, candidate_idx] - flat_fields[src, candidate_idx]
+                if candidate_idx.size > take:
+                    best_local = np.argpartition(gains, -take)[-take:]
+                    picked = candidate_idx[best_local]
+                else:
+                    picked = candidate_idx
+
+                if picked.size == 0:
+                    continue
+
+                flat_labels[picked] = np.uint8(dst)
+                total_moved += int(picked.size)
+                need -= int(picked.size)
+                delta[dst] -= int(picked.size)
+                delta[src] += int(picked.size)
+                moved = True
+
+                if need <= 0:
+                    break
+
+        if not moved:
+            break
+
+        labels = flat_labels.reshape(labels.shape)
+
+    return labels.astype(np.uint8, copy=False), {
+        "safe_rebalanced_pixels": int(total_moved),
+    }
+
+
 # ============================================================
 # LOGS / DATASET ML-DL
 # ============================================================
-
 
 def _append_jsonl(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1423,7 +1725,6 @@ def emit_validation_payload(
 # GÉNÉRATION D'UNE VARIANTE
 # ============================================================
 
-
 def generate_one_variant(
     profile: VariantProfile,
     *,
@@ -1452,19 +1753,36 @@ def generate_one_variant(
         motif_scale=motif_scale,
     )
 
-    target_counts = np.rint(TARGET * (width * height)).astype(int)
+    target_counts = np.rint(TARGET * (width * height)).astype(np.int64)
     target_counts[-1] = (width * height) - int(target_counts[:-1].sum())
 
-    label_map = sequential_assign(fields, target_counts)
-    label_map = exactify_proportions(label_map, fields, target_counts)
-    label_map = force_exact_target_counts(label_map, fields, target_counts)
+    label_map, seed_growth_info = macro_seeded_assign(
+        fields=fields,
+        target_counts=target_counts,
+        seed=profile.seed,
+        motif_scale=motif_scale,
+    )
+
+    label_map, rebalance_info_0 = safe_target_rebalance(
+        label_map,
+        fields,
+        target_counts,
+        max_rounds=SAFE_REBALANCE_ROUNDS,
+    )
 
     label_map, orphan_info = cleanup_orphan_pixels(
         label_map,
         class_count=N_CLASSES,
-        passes=STRAY_CLEANUP_PASSES + int(extra_cleanup_passes),
+        passes=max(1, 1 + int(extra_cleanup_passes)),
         orphan_max_same_neighbors=ORPHAN_MAX_SAME_NEIGHBORS,
         orphan_min_winner_neighbors=ORPHAN_MIN_WINNER_NEIGHBORS,
+    )
+
+    label_map, rebalance_info_1 = safe_target_rebalance(
+        label_map,
+        fields,
+        target_counts,
+        max_rounds=max(4, SAFE_REBALANCE_ROUNDS // 2),
     )
 
     smoothing_info = {"majority_smoothed_pixels": 0}
@@ -1501,8 +1819,26 @@ def generate_one_variant(
         orphan_min_winner_neighbors=ORPHAN_MIN_WINNER_NEIGHBORS,
     )
 
-    label_map = exactify_proportions(label_map, fields, target_counts)
-    label_map = force_exact_target_counts(label_map, fields, target_counts)
+    label_map, rebalance_info_2 = safe_target_rebalance(
+        label_map,
+        fields,
+        target_counts,
+        max_rounds=max(4, SAFE_REBALANCE_ROUNDS // 2),
+    )
+
+    residual_unassigned = np.flatnonzero(label_map.ravel() == UNASSIGNED_LABEL)
+    if residual_unassigned.size:
+        flat_fields = fields.reshape(N_CLASSES, -1).astype(np.float32, copy=False)
+        best_cls = np.argmax(flat_fields[:, residual_unassigned], axis=0).astype(np.uint8, copy=False)
+        label_map.ravel()[residual_unassigned] = best_cls
+        label_map, rebalance_info_3 = safe_target_rebalance(
+            label_map,
+            fields,
+            target_counts,
+            max_rounds=max(4, SAFE_REBALANCE_ROUNDS // 2),
+        )
+    else:
+        rebalance_info_3 = {"safe_rebalanced_pixels": 0}
 
     ratios = compute_ratios(label_map)
     small = downsample_nearest(label_map, 4)
@@ -1535,6 +1871,23 @@ def generate_one_variant(
         "repair_rebalance_edges": float(1 if rebalance_edges else 0),
         "repair_anti_mirror": float(1 if anti_mirror else 0),
         "repair_extra_cleanup_passes": float(extra_cleanup_passes),
+
+        "seed_macros_total": float(sum(seed_growth_info["seed_counts_used"])),
+        "seed_macros_class_0": float(seed_growth_info["seed_counts_used"][0]),
+        "seed_macros_class_1": float(seed_growth_info["seed_counts_used"][1]),
+        "seed_macros_class_2": float(seed_growth_info["seed_counts_used"][2]),
+        "seed_macros_class_3": float(seed_growth_info["seed_counts_used"][3]),
+        "seed_radius_px_class_0": float(seed_growth_info["seed_radius_px"][0]),
+        "seed_radius_px_class_1": float(seed_growth_info["seed_radius_px"][1]),
+        "seed_radius_px_class_2": float(seed_growth_info["seed_radius_px"][2]),
+        "seed_radius_px_class_3": float(seed_growth_info["seed_radius_px"][3]),
+        "growth_rounds": float(seed_growth_info["growth_rounds"]),
+        "safe_rebalanced_pixels": float(
+            rebalance_info_0["safe_rebalanced_pixels"] +
+            rebalance_info_1["safe_rebalanced_pixels"] +
+            rebalance_info_2["safe_rebalanced_pixels"] +
+            rebalance_info_3["safe_rebalanced_pixels"]
+        ),
     }
 
     return CandidateResult(
@@ -1625,7 +1978,6 @@ def generate_and_validate_from_seed(
 # ============================================================
 # EXPORT / RAPPORT
 # ============================================================
-
 
 def build_unique_pattern_name(
     target_index: int,
@@ -1727,6 +2079,9 @@ def candidate_row(
         "physical_height_cm": round(float(metrics["physical_height_cm"]), 3),
         "px_per_cm": round(float(metrics["px_per_cm"]), 6),
         "motif_scale": round(float(metrics["motif_scale"]), 6),
+        "seed_macros_total": round(float(metrics.get("seed_macros_total", 0.0)), 3),
+        "growth_rounds": round(float(metrics.get("growth_rounds", 0.0)), 3),
+        "safe_rebalanced_pixels": round(float(metrics.get("safe_rebalanced_pixels", 0.0)), 3),
         "bestof_score": round(float(outcome.bestof_score), 6),
         "accepted": int(outcome.accepted),
         "reasons": "|".join(outcome.reasons),
@@ -1751,7 +2106,6 @@ def write_report(rows: List[Dict[str, object]], output_dir: Path, filename: str 
 # ============================================================
 # ASYNC / LIVE
 # ============================================================
-
 
 async def _await_attempt(
     fut: asyncio.Future,
@@ -1942,7 +2296,6 @@ async def async_generate_all(
 # ============================================================
 # CLI
 # ============================================================
-
 
 def parse_cli_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
