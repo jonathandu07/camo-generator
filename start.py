@@ -149,7 +149,7 @@ APP_TITLE = "Camouflage Armée Fédérale Europe"
 DEFAULT_OUTPUT_DIR = Path(getattr(camo, "OUTPUT_DIR", "camouflages_federale_europe_8k"))
 DEFAULT_TARGET_COUNT = int(getattr(camo, "N_VARIANTS_REQUIRED", 100))
 DEFAULT_TOP_K = 20
-REPORT_NAME = "rapport_camouflages.csv"
+REPORT_NAME = "rapport_textures.csv" if hasattr(camo, "validate_with_reasons") else "rapport_camouflages.csv"
 BEST_DIR_NAME = "best_of"
 MANNEQUIN_DIR_NAME = "mannequin_previews"
 
@@ -250,12 +250,20 @@ DEFAULT_UI_MOTIF_SCALE = float(getattr(camo, "DEFAULT_MOTIF_SCALE", 0.58))
 DEFAULT_BACKEND_MACHINE_INTENSITY = float(getattr(camo, "DEFAULT_MACHINE_INTENSITY", 0.98))
 
 
+BACKEND_IDX_0 = getattr(camo, "IDX_0", getattr(camo, "IDX_COYOTE", 0))
+BACKEND_IDX_1 = getattr(camo, "IDX_1", getattr(camo, "IDX_OLIVE", 1))
+BACKEND_IDX_2 = getattr(camo, "IDX_2", getattr(camo, "IDX_TERRE", 2))
+BACKEND_IDX_3 = getattr(camo, "IDX_3", getattr(camo, "IDX_GRIS", 3))
+BACKEND_CLASS_LABELS = list(getattr(camo, "CLASS_NAMES", ["class_0", "class_1", "class_2", "class_3"]))
+PRIMARY_COMPONENT_METRIC = "largest_component_ratio_class_1" if hasattr(camo, "validate_with_reasons") else "largest_olive_component_ratio"
+
+
 def palette_map() -> Dict[Tuple[int, int, int], int]:
     return {
-        tuple(camo.RGB[camo.IDX_COYOTE].tolist()): camo.IDX_COYOTE,
-        tuple(camo.RGB[camo.IDX_OLIVE].tolist()): camo.IDX_OLIVE,
-        tuple(camo.RGB[camo.IDX_TERRE].tolist()): camo.IDX_TERRE,
-        tuple(camo.RGB[camo.IDX_GRIS].tolist()): camo.IDX_GRIS,
+        tuple(camo.RGB[BACKEND_IDX_0].tolist()): BACKEND_IDX_0,
+        tuple(camo.RGB[BACKEND_IDX_1].tolist()): BACKEND_IDX_1,
+        tuple(camo.RGB[BACKEND_IDX_2].tolist()): BACKEND_IDX_2,
+        tuple(camo.RGB[BACKEND_IDX_3].tolist()): BACKEND_IDX_3,
     }
 
 
@@ -287,7 +295,7 @@ def extract_backend_scores(ratios: np.ndarray, metrics: Dict[str, float]) -> Dic
     return {
         "ratio_mae": float(np.mean(abs_err)),
         "ratio_max_abs": float(np.max(abs_err)),
-        "largest_olive_component_ratio": safe_metric(metrics, "largest_olive_component_ratio"),
+        "primary_component_ratio": safe_metric(metrics, PRIMARY_COMPONENT_METRIC),
         "boundary_density": safe_metric(metrics, "boundary_density"),
         "boundary_density_small": safe_metric(metrics, "boundary_density_small"),
         "boundary_density_tiny": safe_metric(metrics, "boundary_density_tiny"),
@@ -296,22 +304,38 @@ def extract_backend_scores(ratios: np.ndarray, metrics: Dict[str, float]) -> Dic
         "overscan": safe_metric(metrics, "overscan"),
         "shift_strength": safe_metric(metrics, "shift_strength"),
         "px_per_cm": safe_metric(metrics, "px_per_cm"),
+        "bestof_score": safe_metric(metrics, "bestof_score"),
     }
 
 
-def rejection_rules_for_candidate(candidate: camo.CandidateResult) -> List[str]:
+def rejection_rules_for_candidate(candidate: camo.CandidateResult, outcome: Optional[Any] = None) -> List[str]:
+    if outcome is None:
+        validator = getattr(camo, "validate_with_reasons", None)
+        if callable(validator):
+            try:
+                outcome = validator(candidate)
+            except Exception:
+                outcome = None
+
+    if outcome is not None and hasattr(outcome, "reasons"):
+        reasons = list(getattr(outcome, "reasons", []) or [])
+        if reasons:
+            return reasons
+        if hasattr(outcome, "accepted") and not bool(getattr(outcome, "accepted")):
+            return ["rejet_backend_non_detaille"]
+        return []
+
     ratios = candidate.ratios
     metrics = candidate.metrics
     rules: List[str] = []
 
     abs_err = np.abs(ratios - camo.TARGET)
-    color_labels = ["coyote", "olive", "terre", "gris"]
     for idx, err in enumerate(abs_err):
         if float(err) > float(camo.MAX_ABS_ERROR_PER_COLOR[idx]):
-            rules.append(f"ratio_{color_labels[idx]}")
+            rules.append(f"ratio_class_{idx}_abs_error")
 
     if float(np.mean(abs_err)) > float(camo.MAX_MEAN_ABS_ERROR):
-        rules.append("ratio_mean_abs")
+        rules.append("mean_abs_error")
 
     bd = safe_metric(metrics, "boundary_density")
     if bd < float(camo.MIN_BOUNDARY_DENSITY):
@@ -335,16 +359,16 @@ def rejection_rules_for_candidate(candidate: camo.CandidateResult) -> List[str]:
     if mirror > float(camo.MAX_MIRROR_SIMILARITY):
         rules.append("mirror_similarity")
 
-    olive = safe_metric(metrics, "largest_olive_component_ratio")
-    if olive < float(camo.MIN_LARGEST_OLIVE_COMPONENT_RATIO):
-        rules.append("largest_olive_component_ratio")
+    primary = safe_metric(metrics, PRIMARY_COMPONENT_METRIC)
+    threshold_name = "MIN_LARGEST_COMPONENT_RATIO_CLASS_1" if hasattr(camo, "MIN_LARGEST_COMPONENT_RATIO_CLASS_1") else "MIN_LARGEST_OLIVE_COMPONENT_RATIO"
+    threshold = float(getattr(camo, threshold_name, 0.08))
+    if primary < threshold:
+        rules.append(PRIMARY_COMPONENT_METRIC)
 
     edge = safe_metric(metrics, "edge_contact_ratio")
     if edge > float(camo.MAX_EDGE_CONTACT_RATIO):
         rules.append("edge_contact_ratio")
 
-    if not rules and not camo.validate_candidate_result(candidate):
-        rules.append("rejet_backend_non_detaille")
     return rules
 
 
@@ -362,8 +386,17 @@ async def async_generate_candidate_from_seed(seed: int) -> camo.CandidateResult:
     return await asyncio.to_thread(camo.generate_candidate_from_seed, seed)
 
 
-async def async_validate_candidate_result(candidate: camo.CandidateResult) -> bool:
-    return await asyncio.to_thread(camo.validate_candidate_result, candidate)
+async def async_validate_candidate_result(candidate: camo.CandidateResult) -> Any:
+    validator = getattr(camo, "validate_with_reasons", None)
+    if callable(validator):
+        return await asyncio.to_thread(validator, candidate)
+
+    simple_validator = getattr(camo, "validate_candidate_result", None)
+    if callable(simple_validator):
+        accepted = await asyncio.to_thread(simple_validator, candidate)
+        return accepted
+
+    raise RuntimeError("Aucune fonction de validation compatible trouvée dans main.py")
 
 
 async def async_save_candidate_image(candidate: camo.CandidateResult, path: Path) -> Path:
@@ -393,23 +426,25 @@ def build_backend_compatible_output_path(
     global_attempt: int,
     candidate: camo.CandidateResult,
 ) -> Path:
-    builder = getattr(camo, "build_unique_camo_path", None)
-    if callable(builder):
-        try:
-            return Path(builder(
-                output_dir=output_dir,
-                target_index=target_index,
-                seed=int(candidate.seed),
-                local_attempt=local_attempt,
-                global_attempt=global_attempt,
-            ))
-        except Exception:
-            pass
+    for builder_name in ("build_unique_pattern_path", "build_unique_camo_path"):
+        builder = getattr(camo, builder_name, None)
+        if callable(builder):
+            try:
+                return Path(builder(
+                    output_dir=output_dir,
+                    target_index=target_index,
+                    seed=int(candidate.seed),
+                    local_attempt=local_attempt,
+                    global_attempt=global_attempt,
+                ))
+            except Exception:
+                pass
 
+    prefix = "pattern" if hasattr(camo, "validate_with_reasons") else "camouflage"
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     nano = time.time_ns() % 1_000_000_000
     return output_dir / (
-        f"camouflage_{int(target_index):03d}"
+        f"{prefix}_{int(target_index):03d}"
         f"_s{int(candidate.seed)}"
         f"_a{int(local_attempt):04d}"
         f"_g{int(global_attempt):06d}"
@@ -422,6 +457,7 @@ def build_candidate_row_compatible(
     local_attempt: int,
     global_attempt: int,
     candidate: camo.CandidateResult,
+    outcome: Optional[Any],
     saved_path: Path,
 ) -> Dict[str, Any]:
     row_builder = getattr(camo, "candidate_row", None)
@@ -432,15 +468,32 @@ def build_candidate_row_compatible(
                 local_attempt,
                 global_attempt,
                 candidate,
+                outcome,
                 image_name=saved_path.name,
                 image_path=str(saved_path),
             )
         except TypeError:
-            row = row_builder(target_index, local_attempt, global_attempt, candidate)
-            if isinstance(row, dict):
-                row["image_name"] = saved_path.name
-                row["image_path"] = str(saved_path)
-                return row
+            try:
+                return row_builder(
+                    target_index,
+                    local_attempt,
+                    global_attempt,
+                    candidate,
+                    image_name=saved_path.name,
+                    image_path=str(saved_path),
+                )
+            except TypeError:
+                row = row_builder(target_index, local_attempt, global_attempt, candidate)
+                if isinstance(row, dict):
+                    row["image_name"] = saved_path.name
+                    row["image_path"] = str(saved_path)
+                    if outcome is not None and hasattr(outcome, "bestof_score"):
+                        row.setdefault("bestof_score", float(getattr(outcome, "bestof_score", 0.0)))
+                    if outcome is not None and hasattr(outcome, "reasons"):
+                        row.setdefault("reasons", "|".join(getattr(outcome, "reasons", []) or []))
+                    if outcome is not None and hasattr(outcome, "accepted"):
+                        row.setdefault("accepted", int(bool(getattr(outcome, "accepted"))))
+                    return row
     return {
         "index": target_index,
         "seed": int(candidate.seed),
@@ -448,6 +501,9 @@ def build_candidate_row_compatible(
         "global_attempt": global_attempt,
         "image_name": saved_path.name,
         "image_path": str(saved_path),
+        "bestof_score": float(getattr(outcome, "bestof_score", 0.0)) if outcome is not None else 0.0,
+        "accepted": int(bool(getattr(outcome, "accepted", False))) if outcome is not None else 0,
+        "reasons": "|".join(getattr(outcome, "reasons", []) or []) if outcome is not None else "",
     }
 
 
@@ -1801,8 +1857,9 @@ class CamouflageApp(App):
             self.status("Préflight KO", ok=False)
 
     # ---------- diagnostics ----------
-    async def _register_live_diag(self, candidate: camo.CandidateResult, target_index: int, local_attempt: int, accepted: bool):
+    async def _register_live_diag(self, candidate: camo.CandidateResult, target_index: int, local_attempt: int, outcome: Any):
         self.diag_total += 1
+        accepted = bool(getattr(outcome, "accepted", bool(outcome)))
         if accepted:
             self.diag_accepts += 1
             self.diag_last_rules = []
@@ -1810,7 +1867,7 @@ class CamouflageApp(App):
             self._refresh_diag_labels()
             return
         self.diag_rejects += 1
-        rules = rejection_rules_for_candidate(candidate)
+        rules = rejection_rules_for_candidate(candidate, outcome)
         self.diag_last_rules = rules[:]
         for rule in rules:
             self.diag_rule_counter[rule] += 1
@@ -1940,7 +1997,8 @@ class CamouflageApp(App):
                     seed = camo.build_seed(target_index, local_attempt, base_seed=camo.DEFAULT_BASE_SEED)
                     self.update_live_stage("génération backend", target_index, local_attempt, seed)
                     candidate = await async_generate_candidate_from_seed(seed)
-                    valid = await async_validate_candidate_result(candidate)
+                    outcome = await async_validate_candidate_result(candidate)
+                    valid = bool(getattr(outcome, "accepted", bool(outcome)))
                     scores = extract_backend_scores(candidate.ratios, candidate.metrics)
                     try:
                         projection_img = await asyncio.to_thread(projection_preview_image, candidate.image)
@@ -1948,7 +2006,7 @@ class CamouflageApp(App):
                         projection_img = candidate.image
                         self.log(f"Projection modèle indisponible : {exc}")
                     self.update_preview(candidate.image, projection_img)
-                    await self._register_live_diag(candidate, target_index, local_attempt, valid)
+                    await self._register_live_diag(candidate, target_index, local_attempt, outcome)
 
                     metrics_text = (
                         f"bd {scores['boundary_density']:.4f} | "
@@ -2009,6 +2067,7 @@ class CamouflageApp(App):
                         local_attempt=local_attempt,
                         global_attempt=total_attempts,
                         candidate=candidate,
+                        outcome=outcome,
                         saved_path=saved_path,
                     )
                     row["mannequin_image_name"] = mannequin_saved_path.name
@@ -2033,7 +2092,7 @@ class CamouflageApp(App):
                     self.log(
                         f"[img={target_index:03d}] accepté -> {saved_path.name} | "
                         f"mannequin -> {mannequin_saved_path.name} | "
-                        f"MAE={scores['ratio_mae']:.6f} | olive={scores['largest_olive_component_ratio']:.4f}"
+                        f"MAE={scores['ratio_mae']:.6f} | composant={scores['primary_component_ratio']:.4f}"
                     )
                     self.reload_gallery()
                     await self._adaptive_pause()
@@ -2054,12 +2113,18 @@ class CamouflageApp(App):
             verdict = "accepté" if accepted else "rejeté"
             self.attempt_text.text = f"Image {target_index:03d} | essai {attempt_idx:04d} | total {global_attempt:06d} | seed {seed} | {verdict}"
         if self.color_text is not None:
-            self.color_text.text = f"C {rs[camo.IDX_COYOTE]*100:.4f}% | O {rs[camo.IDX_OLIVE]*100:.4f}% | T {rs[camo.IDX_TERRE]*100:.4f}% | G {rs[camo.IDX_GRIS]*100:.4f}%"
+            labels = BACKEND_CLASS_LABELS[:4] if len(BACKEND_CLASS_LABELS) >= 4 else ["class_0", "class_1", "class_2", "class_3"]
+            self.color_text.text = (
+                f"{labels[0]} {rs[BACKEND_IDX_0]*100:.4f}% | "
+                f"{labels[1]} {rs[BACKEND_IDX_1]*100:.4f}% | "
+                f"{labels[2]} {rs[BACKEND_IDX_2]*100:.4f}% | "
+                f"{labels[3]} {rs[BACKEND_IDX_3]*100:.4f}%"
+            )
         if self.score_text is not None:
             self.score_text.text = (
                 f"MAE ratio {scores['ratio_mae']:.6f} | "
                 f"max abs {scores['ratio_max_abs']:.6f} | "
-                f"olive comp. {scores['largest_olive_component_ratio']:.4f} | "
+                f"composant {scores['primary_component_ratio']:.4f} | "
                 f"miroir {scores['mirror_similarity']:.4f}"
             )
         if self.extra_text is not None:
@@ -2099,16 +2164,16 @@ class CamouflageApp(App):
                 "attempts_for_this_image": rec.local_attempt,
                 "ratio_mae": round(float(np.mean(np.abs(rec.ratios - camo.TARGET))), 8),
                 "ratio_max_abs": round(float(np.max(np.abs(rec.ratios - camo.TARGET))), 8),
-                "largest_olive_component_ratio": round(safe_metric(rec.metrics, "largest_olive_component_ratio"), 6),
+                "primary_component_ratio": round(safe_metric(rec.metrics, PRIMARY_COMPONENT_METRIC), 6),
                 "boundary_density": round(safe_metric(rec.metrics, "boundary_density"), 6),
                 "boundary_density_small": round(safe_metric(rec.metrics, "boundary_density_small"), 6),
                 "boundary_density_tiny": round(safe_metric(rec.metrics, "boundary_density_tiny"), 6),
                 "mirror_similarity": round(safe_metric(rec.metrics, "mirror_similarity"), 6),
                 "edge_contact_ratio": round(safe_metric(rec.metrics, "edge_contact_ratio"), 6),
-                "coyote_brown_pct": round(float(rec.ratios[camo.IDX_COYOTE] * 100), 4),
-                "vert_olive_pct": round(float(rec.ratios[camo.IDX_OLIVE] * 100), 4),
-                "terre_de_france_pct": round(float(rec.ratios[camo.IDX_TERRE] * 100), 4),
-                "vert_de_gris_pct": round(float(rec.ratios[camo.IDX_GRIS] * 100), 4),
+                "class_0_pct": round(float(rec.ratios[BACKEND_IDX_0] * 100), 4),
+                "class_1_pct": round(float(rec.ratios[BACKEND_IDX_1] * 100), 4),
+                "class_2_pct": round(float(rec.ratios[BACKEND_IDX_2] * 100), 4),
+                "class_3_pct": round(float(rec.ratios[BACKEND_IDX_3] * 100), 4),
             })
         if rows:
             await asyncio.to_thread(self._write_csv_sync, best_dir / "best_of.csv", rows)
