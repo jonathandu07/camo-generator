@@ -515,21 +515,21 @@ def build_candidate_row_compatible(
 @dataclass
 class ProjectionConfig:
     # Détection initiale large du vert.
-    hue_min: int = 45
-    hue_max: int = 70
-    sat_min: int = 25
-    val_min: int = 35
+    hue_min: int = 30
+    hue_max: int = 105
+    sat_min: int = 15
+    val_min: int = 15
     sat_max: int = 255
-    val_max: int = 210
+    val_max: int = 190
 
     # Protection des zones sombres non à repeindre.
-    dark_val_max: int = 35
-    dark_sat_max: int = 50
+    dark_val_max: int = 40
+    dark_sat_max: int = 60
 
     # Morphologie.
     open_kernel: int = 3
-    close_kernel: int = 5
-    blur_radius: int = 5
+    close_kernel: int = 11
+    blur_radius: int = 9
 
     # Répartition verticale du vêtement.
     hat_ratio: float = 0.13
@@ -540,9 +540,9 @@ class ProjectionConfig:
     uniform_visible_height_cm: float = 160.0
 
     # Adaptation physique quand la source est un camouflage plein format.
-    hat_scale_multiplier: float = 0.42
-    jacket_scale_multiplier: float = 0.46
-    pants_scale_multiplier: float = 0.50
+    hat_scale_multiplier: float = 0.48
+    jacket_scale_multiplier: float = 0.52
+    pants_scale_multiplier: float = 0.56
 
     # Fallback quand la source est un petit tile.
     tile_hat_width_ratio: float = 0.14
@@ -550,8 +550,8 @@ class ProjectionConfig:
     tile_pants_width_ratio: float = 0.11
 
     # Bornes globales de scale.
-    min_region_scale: float = 0.04
-    max_region_scale: float = 0.80
+    min_region_scale: float = 0.06
+    max_region_scale: float = 0.95
 
     # Composition.
     shadow_strength: float = 0.62
@@ -866,7 +866,6 @@ def adaptive_region_scale(
     camo_bgr: np.ndarray,
     analysis: ProjectionSubjectAnalysis,
     cfg: ProjectionConfig,
-    user_scale: float = 1.0,
 ) -> float:
     _rx, _ry, rw, rh = bbox_from_mask(region_mask)
     if rw <= 0 or rh <= 0:
@@ -890,7 +889,7 @@ def adaptive_region_scale(
             width_ratio = rw / max(1.0, uniform_w)
             scale *= np.clip(0.85 + width_ratio * 0.75, 0.80, 1.18)
 
-        return float(np.clip(scale * max(0.10, float(user_scale)), cfg.min_region_scale, cfg.max_region_scale))
+        return float(np.clip(scale, cfg.min_region_scale, cfg.max_region_scale))
 
     _camo_h, camo_w = camo_bgr.shape[:2]
     if region_name == "hat":
@@ -901,7 +900,7 @@ def adaptive_region_scale(
         target_w = rw * cfg.tile_jacket_width_ratio
 
     scale = target_w / max(1.0, float(camo_w))
-    return float(np.clip(scale * max(0.10, float(user_scale)), cfg.min_region_scale, cfg.max_region_scale))
+    return float(np.clip(scale, cfg.min_region_scale, cfg.max_region_scale))
 
 
 def tile_camo(camo_bgr: np.ndarray, shape_hw: Tuple[int, int], scale: float, seed: int) -> np.ndarray:
@@ -959,24 +958,24 @@ def compose_region(base_bgr: np.ndarray, region_mask: np.ndarray, camo_bgr: np.n
     return (np.clip(out, 0.0, 1.0) * 255.0).astype(np.uint8)
 
 
-def apply_camo_to_reference(subject_bgr: np.ndarray, camo_bgr: np.ndarray, cfg: ProjectionConfig = PROJECTION_CFG, user_scale: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
+def apply_camo_to_reference(subject_bgr: np.ndarray, camo_bgr: np.ndarray, cfg: ProjectionConfig = PROJECTION_CFG) -> Tuple[np.ndarray, np.ndarray]:
     analysis = get_projection_subject_analysis(cfg)
     mask = analysis.uniform_mask
 
     # Passe unique sur tout ce qui est vert : ainsi la veste, le pantalon et le chapeau
     # reçoivent tous le camouflage partout où le masque détecte du vert.
-    full_scale = adaptive_region_scale("jacket", mask, camo_bgr, analysis, cfg, user_scale=user_scale)
+    full_scale = adaptive_region_scale("jacket", mask, camo_bgr, analysis, cfg)
 
     out = subject_bgr.copy()
     out = compose_region(out, mask, camo_bgr, full_scale, seed=23, cfg=cfg)
     return out, mask
 
 
-def projection_preview_image(camo_img: PILImage.Image, cfg: ProjectionConfig = PROJECTION_CFG, user_scale: float = 1.0) -> PILImage.Image:
+def projection_preview_image(camo_img: PILImage.Image, cfg: ProjectionConfig = PROJECTION_CFG) -> PILImage.Image:
     analysis = get_projection_subject_analysis(cfg)
     subject_bgr = analysis.subject_bgr.copy()
     camo_bgr = pil_rgb_to_bgr(camo_img)
-    projected_bgr, _mask = apply_camo_to_reference(subject_bgr, camo_bgr, cfg=cfg, user_scale=user_scale)
+    projected_bgr, _mask = apply_camo_to_reference(subject_bgr, camo_bgr, cfg=cfg)
     return bgr_to_pil_rgb(projected_bgr)
 
 
@@ -1198,6 +1197,7 @@ class CamouflageApp(App):
         self.async_runner = AsyncioThreadRunner()
         self.current_future: Optional[Future] = None
         self.preflight_future: Optional[Future] = None
+        self.projection_warmup_future: Optional[Future] = None
         self.stop_flag = False
         self.running = False
         self.stopping = False
@@ -1209,7 +1209,6 @@ class CamouflageApp(App):
         self.total_attempts = 0
         self.machine_intensity = DEFAULT_BACKEND_MACHINE_INTENSITY * 100.0
         self.motif_scale = DEFAULT_UI_MOTIF_SCALE
-        self.projection_preview_scale = 0.40
         self.process = psutil.Process() if psutil else None
         self.tests_ran = False
         self.tests_ok = False
@@ -1225,7 +1224,6 @@ class CamouflageApp(App):
         self.gallery_projection_cache: Dict[str, PILImage.Image] = {}
         self.gallery_projection_pending: Dict[str, List["GalleryThumb"]] = {}
         self.preview_projection_cache: Dict[str, PILImage.Image] = {}
-        self._current_preview_raw_img: Optional[PILImage.Image] = None
 
         self.status_label: Optional[Label] = None
         self.attempt_text: Optional[Label] = None
@@ -1237,8 +1235,6 @@ class CamouflageApp(App):
         self.progress_text: Optional[Label] = None
         self.motif_scale_slider: Optional[Slider] = None
         self.motif_scale_label: Optional[Label] = None
-        self.projection_scale_slider: Optional[Slider] = None
-        self.projection_scale_label: Optional[Label] = None
         self.resource_text: Optional[Label] = None
         self.tests_label: Optional[Label] = None
         self.run_mode_label: Optional[Label] = None
@@ -1332,15 +1328,6 @@ class CamouflageApp(App):
         motif_row.add_widget(self.motif_scale_slider)
         motif_row.add_widget(self.motif_scale_label)
         controls.add_widget(motif_row)
-
-        controls.add_widget(self._label("Scale projection mannequin"))
-        projection_row = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(8))
-        self.projection_scale_slider = Slider(min=0.15, max=0.80, value=self.projection_preview_scale, step=0.01)
-        self.projection_scale_label = self._small_label(f"{self.projection_preview_scale:.2f}", size_hint_x=0.22)
-        self.projection_scale_slider.bind(value=self._on_projection_scale_change)
-        projection_row.add_widget(self.projection_scale_slider)
-        projection_row.add_widget(self.projection_scale_label)
-        controls.add_widget(projection_row)
 
         controls.add_widget(self._label("Monitoring"))
         self.resource_text = self._small_label("CPU -- | RAM -- | Disque -- | Processus -- | scale --")
@@ -1463,9 +1450,9 @@ class CamouflageApp(App):
     def _projection_cache_key(self, image_path: Path) -> str:
         try:
             stat = image_path.stat()
-            return f"{image_path.resolve()}::{stat.st_mtime_ns}::{stat.st_size}::projscale={self.projection_preview_scale:.2f}"
+            return f"{image_path.resolve()}::{stat.st_mtime_ns}::{stat.st_size}"
         except Exception:
-            return f"{image_path.resolve()}::projscale={self.projection_preview_scale:.2f}"
+            return str(image_path.resolve())
 
     def request_gallery_projection(self, image_path: Path, thumb_widget: "GalleryThumb"):
         key = self._projection_cache_key(image_path)
@@ -1483,7 +1470,7 @@ class CamouflageApp(App):
     async def _async_build_gallery_projection(self, image_path: Path) -> PILImage.Image:
         pil_img = await asyncio.to_thread(read_pil_rgb, image_path)
         await asyncio.to_thread(get_projection_subject_analysis, PROJECTION_CFG)
-        projected = await asyncio.to_thread(projection_preview_image, pil_img, PROJECTION_CFG, self.projection_preview_scale)
+        projected = await asyncio.to_thread(projection_preview_image, pil_img)
         return await asyncio.to_thread(make_thumbnail, projected, THUMB_SIZE)
 
     def _on_gallery_projection_done(self, key: str, fut: Future):
@@ -1518,7 +1505,7 @@ class CamouflageApp(App):
     async def _async_build_preview_projection(self, image_path: Path) -> PILImage.Image:
         pil_img = await asyncio.to_thread(read_pil_rgb, image_path)
         await asyncio.to_thread(get_projection_subject_analysis, PROJECTION_CFG)
-        return await asyncio.to_thread(projection_preview_image, pil_img, PROJECTION_CFG, self.projection_preview_scale)
+        return await asyncio.to_thread(projection_preview_image, pil_img)
 
     def _on_preview_projection_done(self, key: str, raw_img: PILImage.Image, fut: Future):
         try:
@@ -1541,14 +1528,52 @@ class CamouflageApp(App):
             pass
         self._subscribe_runtime_feed()
         self._emit_runtime("INFO", "start", "Interface Kivy démarrée")
+        Clock.schedule_once(lambda _dt: self._deferred_startup_projection_warmup(), 0)
+
+    def _deferred_startup_projection_warmup(self):
         try:
             model_path = resolve_soldier_model_path()
             self.log(f"Modèle soldat chargé : {model_path}")
-            # préchauffe le cache d'analyse du mannequin
-            _ = get_projection_subject_analysis(PROJECTION_CFG)
+            if not self.running and not self.preflight_running:
+                self.status("Initialisation mannequin…", ok=True)
         except Exception as exc:
             self.log(str(exc))
             self.status("Modèle soldat introuvable", ok=False)
+            return
+
+        try:
+            fut = self.async_runner.submit(self._async_warmup_projection_subject())
+            self.projection_warmup_future = fut
+            fut.add_done_callback(self._on_projection_warmup_done)
+        except Exception as exc:
+            self.log(f"Préchargement mannequin impossible : {exc}")
+            if not self.running and not self.preflight_running:
+                self.status("Mannequin indisponible", ok=False)
+
+    async def _async_warmup_projection_subject(self) -> ProjectionSubjectAnalysis:
+        return await asyncio.to_thread(get_projection_subject_analysis, PROJECTION_CFG)
+
+    def _on_projection_warmup_done(self, fut: Future):
+        try:
+            analysis = fut.result()
+            model_path = getattr(analysis, "model_path", None)
+            payload = str(model_path) if model_path is not None else ""
+            Clock.schedule_once(lambda _dt, p=payload: self._finish_projection_warmup(True, p), 0)
+        except Exception as exc:
+            Clock.schedule_once(lambda _dt, e=str(exc): self._finish_projection_warmup(False, e), 0)
+
+    @mainthread
+    def _finish_projection_warmup(self, ok: bool, payload: str):
+        self.projection_warmup_future = None
+        if ok:
+            self.log(f"Analyse mannequin prête : {payload}")
+            if not self.running and not self.preflight_running:
+                self.status("Prêt", ok=True)
+            return
+
+        self.log(f"Préchargement mannequin impossible : {payload}")
+        if not self.running and not self.preflight_running:
+            self.status("Mannequin indisponible", ok=False)
 
     def _emit_runtime(self, level: str, source: str, message: str, **payload: Any):
         if camo_log is None or not hasattr(camo_log, "log_event"):
@@ -1636,7 +1661,6 @@ class CamouflageApp(App):
 
     @mainthread
     def update_preview(self, pil_img: PILImage.Image, projection_img: PILImage.Image):
-        self._current_preview_raw_img = pil_img.copy()
         if self.preview_img is not None:
             self.preview_img.texture = pil_to_coreimage(pil_img).texture
         if self.preview_silhouette is not None:
@@ -1727,31 +1751,6 @@ class CamouflageApp(App):
         applied = self._apply_backend_motif_scale()
         if self.motif_scale_label is not None:
             self.motif_scale_label.text = f"{applied:.2f}"
-
-    def _on_projection_scale_change(self, _slider, value):
-        self.projection_preview_scale = float(value)
-        if self.projection_scale_label is not None:
-            self.projection_scale_label.text = f"{self.projection_preview_scale:.2f}"
-        self.gallery_projection_cache.clear()
-        self.gallery_projection_pending.clear()
-        self.preview_projection_cache.clear()
-        self.reload_gallery()
-        if self._current_preview_raw_img is not None:
-            raw = self._current_preview_raw_img.copy()
-            fut = self.async_runner.submit(self._async_build_projection_from_raw(raw))
-            fut.add_done_callback(lambda f, img=raw: self._on_projection_from_raw_done(img, f))
-
-    async def _async_build_projection_from_raw(self, raw_img: PILImage.Image) -> PILImage.Image:
-        await asyncio.to_thread(get_projection_subject_analysis, PROJECTION_CFG)
-        return await asyncio.to_thread(projection_preview_image, raw_img, PROJECTION_CFG, self.projection_preview_scale)
-
-    def _on_projection_from_raw_done(self, raw_img: PILImage.Image, fut: Future):
-        try:
-            projected = fut.result()
-        except Exception as exc:
-            self.log(f"Projection directe impossible : {exc}")
-            return
-        Clock.schedule_once(lambda dt, r=raw_img, p=projected: self.update_preview(r, p), 0)
 
     def _run_mode_text(self, mode: Optional[str] = None) -> str:
         mode = self.run_mode if mode is None else mode
@@ -2039,7 +2038,7 @@ class CamouflageApp(App):
                     valid = bool(getattr(outcome, "accepted", bool(outcome)))
                     scores = extract_backend_scores(candidate.ratios, candidate.metrics)
                     try:
-                        projection_img = await asyncio.to_thread(projection_preview_image, candidate.image, PROJECTION_CFG, self.projection_preview_scale)
+                        projection_img = await asyncio.to_thread(projection_preview_image, candidate.image)
                     except Exception as exc:
                         projection_img = candidate.image
                         self.log(f"Projection modèle indisponible : {exc}")
