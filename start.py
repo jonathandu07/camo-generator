@@ -19,6 +19,7 @@ import asyncio
 import ctypes
 import io
 import json
+import logging
 import os
 import platform
 import shutil
@@ -43,6 +44,9 @@ try:
     import psutil
 except Exception:
     psutil = None
+
+logging.getLogger("PIL").setLevel(logging.INFO)
+logging.getLogger("asyncio").setLevel(logging.INFO)
 
 os.environ.setdefault("KIVY_NO_ARGS", "1")
 sys.modules.setdefault("start", sys.modules[__name__])
@@ -255,7 +259,27 @@ def make_thumbnail(pil_img: PILImage.Image, size: Tuple[int, int]) -> PILImage.I
     return ImageOps.fit(img, size, method=PILImage.Resampling.LANCZOS, centering=(0.5, 0.5))
 
 
-DEFAULT_UI_MOTIF_SCALE = float(max(0.18, min(getattr(camo, "DEFAULT_MOTIF_SCALE", 0.55), 0.30)))
+def make_fill_image(**kwargs) -> Image:
+    try:
+        return Image(fit_mode="fill", **kwargs)
+    except TypeError:
+        img = Image(**kwargs)
+        if hasattr(img, "fit_mode"):
+            try:
+                img.fit_mode = "fill"
+                return img
+            except Exception:
+                pass
+        # Fallback ancien Kivy
+        try:
+            img.allow_stretch = True
+            img.keep_ratio = False
+        except Exception:
+            pass
+        return img
+
+
+DEFAULT_UI_MOTIF_SCALE = float(max(0.18, min(getattr(camo, "DEFAULT_MOTIF_SCALE", 0.55), 1.20)))
 DEFAULT_BACKEND_MACHINE_INTENSITY = float(getattr(camo, "DEFAULT_MACHINE_INTENSITY", 0.98))
 DEFAULT_PROJECTION_PREVIEW_SCALE = 0.40
 
@@ -300,8 +324,15 @@ def safe_metric(metrics: Dict[str, float], key: str, default: float = 0.0) -> fl
         return float(default)
 
 
-def extract_backend_scores(ratios: np.ndarray, metrics: Dict[str, float]) -> Dict[str, float]:
+def extract_backend_scores(ratios: np.ndarray, metrics: Dict[str, float], outcome: Optional[Any] = None) -> Dict[str, float]:
     abs_err = np.abs(ratios - camo.TARGET)
+    bestof_score = safe_metric(metrics, "bestof_score")
+    if outcome is not None and hasattr(outcome, "bestof_score"):
+        try:
+            bestof_score = float(getattr(outcome, "bestof_score", bestof_score))
+        except Exception:
+            pass
+
     return {
         "ratio_mae": float(np.mean(abs_err)),
         "ratio_max_abs": float(np.max(abs_err)),
@@ -314,7 +345,12 @@ def extract_backend_scores(ratios: np.ndarray, metrics: Dict[str, float]) -> Dic
         "overscan": safe_metric(metrics, "overscan"),
         "shift_strength": safe_metric(metrics, "shift_strength"),
         "px_per_cm": safe_metric(metrics, "px_per_cm"),
-        "bestof_score": safe_metric(metrics, "bestof_score"),
+        "bestof_score": float(bestof_score),
+        "seed_macros_total": safe_metric(metrics, "seed_macros_total"),
+        "growth_rounds": safe_metric(metrics, "growth_rounds"),
+        "safe_rebalanced_pixels": safe_metric(metrics, "safe_rebalanced_pixels"),
+        "orphan_pixels_fixed": safe_metric(metrics, "orphan_pixels_fixed"),
+        "repair_round": safe_metric(metrics, "repair_round"),
     }
 
 
@@ -394,6 +430,15 @@ def candidate_rank_key(record: CandidateRecord) -> Tuple[float, float, float, fl
 
 async def async_generate_candidate_from_seed(seed: int) -> camo.CandidateResult:
     return await asyncio.to_thread(camo.generate_candidate_from_seed, seed)
+
+
+async def async_generate_and_validate_from_seed(seed: int) -> Tuple[camo.CandidateResult, Any]:
+    combined = getattr(camo, "generate_and_validate_from_seed", None)
+    if callable(combined):
+        return await asyncio.to_thread(combined, seed)
+    candidate = await asyncio.to_thread(camo.generate_candidate_from_seed, seed)
+    outcome = await async_validate_candidate_result(candidate)
+    return candidate, outcome
 
 
 async def async_validate_candidate_result(candidate: camo.CandidateResult) -> Any:
@@ -1241,7 +1286,7 @@ class GalleryThumb(Button):
         self.container = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
         self.add_widget(self.container)
         self.stage = SoftPane(orientation="vertical", size_hint_y=1)
-        self.thumb = Image(allow_stretch=True, keep_ratio=False)
+        self.thumb = make_fill_image()
         self.stage.add_widget(self.thumb)
         self.caption = Label(text=image_path.name, size_hint_y=None, height=dp(22), font_size=sp(11), color=C["text_soft"], halign="center", valign="middle")
         self.caption.bind(size=lambda *a: setattr(self.caption, "text_size", self.caption.size))
@@ -1939,8 +1984,8 @@ class CamouflageApp(App):
             camo.set_canvas_geometry(
                 width=int(getattr(camo, "WIDTH", 7680)),
                 height=int(getattr(camo, "HEIGHT", 4320)),
-                physical_width_cm=float(getattr(camo, "PHYSICAL_WIDTH_CM", 240.0)),
-                physical_height_cm=float(getattr(camo, "PHYSICAL_HEIGHT_CM", 135.0)),
+                physical_width_cm=float(getattr(camo, "PHYSICAL_WIDTH_CM", 768.0)),
+                physical_height_cm=float(getattr(camo, "PHYSICAL_HEIGHT_CM", 432.0)),
                 motif_scale=scale,
             )
         return scale
@@ -2335,10 +2380,9 @@ class CamouflageApp(App):
                     self.total_attempts = total_attempts
                     seed = camo.build_seed(target_index, local_attempt, base_seed=camo.DEFAULT_BASE_SEED)
                     self.update_live_stage("génération backend", target_index, local_attempt, seed)
-                    candidate = await async_generate_candidate_from_seed(seed)
-                    outcome = await async_validate_candidate_result(candidate)
+                    candidate, outcome = await async_generate_and_validate_from_seed(seed)
                     valid = bool(getattr(outcome, "accepted", bool(outcome)))
-                    scores = extract_backend_scores(candidate.ratios, candidate.metrics)
+                    scores = extract_backend_scores(candidate.ratios, candidate.metrics, outcome)
                     try:
                         projection_img = await asyncio.to_thread(projection_preview_image, candidate.image, PROJECTION_CFG, self.projection_preview_scale)
                     except Exception as exc:
@@ -2348,9 +2392,10 @@ class CamouflageApp(App):
                     await self._register_live_diag(candidate, target_index, local_attempt, outcome)
 
                     metrics_text = (
+                        f"best {scores['bestof_score']:.4f} | "
                         f"bd {scores['boundary_density']:.4f} | "
                         f"miroir {scores['mirror_similarity']:.4f} | "
-                        f"bord {scores['edge_contact_ratio']:.4f}"
+                        f"rebalance {scores['safe_rebalanced_pixels']:.0f}"
                     )
 
                     if not valid:
@@ -2370,7 +2415,7 @@ class CamouflageApp(App):
                         )
                         self.log(
                             f"[img={target_index:03d} essai={local_attempt:04d}] rejeté | "
-                            f"MAE={scores['ratio_mae']:.6f} | bd={scores['boundary_density']:.4f}"
+                            f"MAE={scores['ratio_mae']:.6f} | best={scores['bestof_score']:.4f} | bd={scores['boundary_density']:.4f}"
                         )
                         review = PendingManualReview(
                             target_index=target_index,
@@ -2414,7 +2459,7 @@ class CamouflageApp(App):
                     self.log(
                         f"[img={target_index:03d}] accepté -> {saved_path.name} | "
                         f"mannequin -> {mannequin_saved_path.name} | "
-                        f"MAE={scores['ratio_mae']:.6f} | composant={scores['primary_component_ratio']:.4f}"
+                        f"MAE={scores['ratio_mae']:.6f} | best={scores['bestof_score']:.4f} | composant={scores['primary_component_ratio']:.4f}"
                     )
                     await self._adaptive_pause()
                     await asyncio.sleep(0)
@@ -2499,7 +2544,7 @@ class CamouflageApp(App):
                 f"MAE ratio {scores['ratio_mae']:.6f} | "
                 f"max abs {scores['ratio_max_abs']:.6f} | "
                 f"composant {scores['primary_component_ratio']:.4f} | "
-                f"miroir {scores['mirror_similarity']:.4f}"
+                f"best-of {scores['bestof_score']:.4f}"
             )
         if self.extra_text is not None:
             self.extra_text.text = (
@@ -2513,7 +2558,9 @@ class CamouflageApp(App):
                 f"overscan {safe_metric(metrics, 'overscan'):.4f} | "
                 f"shift {safe_metric(metrics, 'shift_strength'):.4f} | "
                 f"px/cm {safe_metric(metrics, 'px_per_cm'):.4f} | "
-                f"scale {safe_metric(metrics, 'motif_scale', self.motif_scale):.4f}"
+                f"scale {safe_metric(metrics, 'motif_scale', self.motif_scale):.4f} | "
+                f"macros {safe_metric(metrics, 'seed_macros_total'):.0f} | "
+                f"grow {safe_metric(metrics, 'growth_rounds'):.0f}"
             )
 
     async def _async_export_best_of(self, top_k: int) -> Path:
@@ -2539,11 +2586,16 @@ class CamouflageApp(App):
                 "ratio_mae": round(float(np.mean(np.abs(rec.ratios - camo.TARGET))), 8),
                 "ratio_max_abs": round(float(np.max(np.abs(rec.ratios - camo.TARGET))), 8),
                 "primary_component_ratio": round(safe_metric(rec.metrics, PRIMARY_COMPONENT_METRIC), 6),
+                "bestof_score": round(safe_metric(rec.metrics, "bestof_score"), 6),
                 "boundary_density": round(safe_metric(rec.metrics, "boundary_density"), 6),
                 "boundary_density_small": round(safe_metric(rec.metrics, "boundary_density_small"), 6),
                 "boundary_density_tiny": round(safe_metric(rec.metrics, "boundary_density_tiny"), 6),
                 "mirror_similarity": round(safe_metric(rec.metrics, "mirror_similarity"), 6),
                 "edge_contact_ratio": round(safe_metric(rec.metrics, "edge_contact_ratio"), 6),
+                "seed_macros_total": round(safe_metric(rec.metrics, "seed_macros_total"), 3),
+                "growth_rounds": round(safe_metric(rec.metrics, "growth_rounds"), 3),
+                "safe_rebalanced_pixels": round(safe_metric(rec.metrics, "safe_rebalanced_pixels"), 3),
+                "orphan_pixels_fixed": round(safe_metric(rec.metrics, "orphan_pixels_fixed"), 3),
                 "class_0_pct": round(float(rec.ratios[BACKEND_IDX_0] * 100), 4),
                 "class_1_pct": round(float(rec.ratios[BACKEND_IDX_1] * 100), 4),
                 "class_2_pct": round(float(rec.ratios[BACKEND_IDX_2] * 100), 4),
