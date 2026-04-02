@@ -184,6 +184,17 @@ class CandidateRecord:
     ratios: np.ndarray
 
 
+@dataclass
+class PendingManualReview:
+    target_index: int
+    local_attempt: int
+    global_attempt: int
+    candidate: camo.CandidateResult
+    outcome: Any
+    projection_img: PILImage.Image
+    metrics_text: str
+
+
 class AsyncioThreadRunner:
     def __init__(self):
         self.loop = asyncio.new_event_loop()
@@ -960,6 +971,62 @@ def compose_region(base_bgr: np.ndarray, region_mask: np.ndarray, camo_bgr: np.n
     return (np.clip(out, 0.0, 1.0) * 255.0).astype(np.uint8)
 
 
+def build_residual_uniform_mask(subject_bgr: np.ndarray, projected_bgr: np.ndarray, uniform_mask: np.ndarray, cfg: ProjectionConfig) -> np.ndarray:
+    if uniform_mask is None or not np.any(uniform_mask > 8):
+        return np.zeros(subject_bgr.shape[:2], dtype=np.uint8)
+
+    subj_hsv = cv2.cvtColor(subject_bgr, cv2.COLOR_BGR2HSV)
+    proj_hsv = cv2.cvtColor(projected_bgr, cv2.COLOR_BGR2HSV)
+
+    uniform_bin = (uniform_mask > 24).astype(np.uint8) * 255
+
+    original_green = cv2.inRange(
+        subj_hsv,
+        np.array([cfg.hue_min, max(0, cfg.sat_min - 10), max(0, cfg.val_min - 10)], dtype=np.uint8),
+        np.array([cfg.hue_max, 255, min(255, cfg.val_max + 35)], dtype=np.uint8),
+    )
+    original_dark = (((subj_hsv[:, :, 2] <= min(255, cfg.dark_val_max + 30)) & (subj_hsv[:, :, 1] <= min(255, cfg.dark_sat_max + 35)))).astype(np.uint8) * 255
+
+    still_green = cv2.inRange(
+        proj_hsv,
+        np.array([cfg.hue_min, max(0, cfg.sat_min - 15), 0], dtype=np.uint8),
+        np.array([cfg.hue_max, 255, 255], dtype=np.uint8),
+    )
+    still_dark = (((proj_hsv[:, :, 2] <= min(255, cfg.dark_val_max + 18)) & (proj_hsv[:, :, 1] <= min(255, cfg.dark_sat_max + 28)))).astype(np.uint8) * 255
+
+    color_diff = np.mean(np.abs(projected_bgr.astype(np.int16) - subject_bgr.astype(np.int16)), axis=2)
+    too_close = (color_diff < 26.0).astype(np.uint8) * 255
+
+    source_sensitive = cv2.bitwise_or(original_green, original_dark)
+    leaked = cv2.bitwise_or(still_green, still_dark)
+    residual = cv2.bitwise_and(uniform_bin, cv2.bitwise_or(leaked, cv2.bitwise_and(source_sensitive, too_close)))
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    residual = cv2.morphologyEx(residual, cv2.MORPH_CLOSE, kernel)
+    residual = cv2.morphologyEx(residual, cv2.MORPH_OPEN, kernel)
+    residual = cv2.GaussianBlur(residual, (0, 0), 1.2)
+    return residual
+
+
+def correct_projection_residuals(
+    subject_bgr: np.ndarray,
+    projected_bgr: np.ndarray,
+    uniform_mask: np.ndarray,
+    camo_bgr: np.ndarray,
+    base_scale: float,
+    cfg: ProjectionConfig,
+) -> np.ndarray:
+    out = projected_bgr.copy()
+    for round_idx in range(3):
+        residual = build_residual_uniform_mask(subject_bgr, out, uniform_mask, cfg)
+        residual_px = int(np.sum(residual > 24))
+        if residual_px <= 24:
+            break
+        local_scale = float(np.clip(base_scale * (0.90 - 0.08 * round_idx), cfg.min_region_scale, cfg.max_region_scale))
+        out = compose_region(out, residual, camo_bgr, local_scale, seed=211 + round_idx * 17, cfg=cfg)
+    return out
+
+
 def apply_camo_to_reference(
     subject_bgr: np.ndarray,
     camo_bgr: np.ndarray,
@@ -975,6 +1042,7 @@ def apply_camo_to_reference(
 
     out = subject_bgr.copy()
     out = compose_region(out, mask, camo_bgr, full_scale, seed=23, cfg=cfg)
+    out = correct_projection_residuals(subject_bgr, out, mask, camo_bgr, full_scale, cfg)
     return out, mask
 
 
@@ -1237,6 +1305,9 @@ class CamouflageApp(App):
         self.gallery_projection_pending: Dict[str, List["GalleryThumb"]] = {}
         self.preview_projection_cache: Dict[str, PILImage.Image] = {}
         self._current_preview_raw_img: Optional[PILImage.Image] = None
+        self.pending_manual_review: Optional[PendingManualReview] = None
+        self.manual_review_pending = False
+        self.manual_review_decision: Optional[str] = None
 
         self.status_label: Optional[Label] = None
         self.attempt_text: Optional[Label] = None
@@ -1250,6 +1321,9 @@ class CamouflageApp(App):
         self.motif_scale_label: Optional[Label] = None
         self.projection_scale_slider: Optional[Slider] = None
         self.projection_scale_label: Optional[Label] = None
+        self.manual_accept_btn: Optional[SoftButton] = None
+        self.manual_skip_btn: Optional[SoftButton] = None
+        self.manual_review_label: Optional[Label] = None
         self.resource_text: Optional[Label] = None
         self.tests_label: Optional[Label] = None
         self.run_mode_label: Optional[Label] = None
@@ -1352,6 +1426,16 @@ class CamouflageApp(App):
         projection_row.add_widget(self.projection_scale_slider)
         projection_row.add_widget(self.projection_scale_label)
         controls.add_widget(projection_row)
+
+        controls.add_widget(self._label("Validation manuelle d'un rejet"))
+        manual_row = BoxLayout(size_hint_y=None, height=dp(58), spacing=dp(10))
+        self.manual_accept_btn = self._button("Valider ce rejet", "launch", self.manual_accept_current_reject)
+        self.manual_skip_btn = self._button("Continuer", "neutral", self.manual_skip_current_reject)
+        manual_row.add_widget(self.manual_accept_btn)
+        manual_row.add_widget(self.manual_skip_btn)
+        controls.add_widget(manual_row)
+        self.manual_review_label = self._small_label("Aucun rejet en attente.")
+        controls.add_widget(self.manual_review_label)
 
         controls.add_widget(self._label("Monitoring"))
         self.resource_text = self._small_label("CPU -- | RAM -- | Disque -- | Processus -- | scale --")
@@ -1754,6 +1838,11 @@ class CamouflageApp(App):
             self.stop_btn.disabled = not (self.running or self.preflight_running or self.stopping)
         if self.open_btn is not None:
             self.open_btn.disabled = False
+        manual_enabled = bool(self.manual_review_pending and self.pending_manual_review is not None)
+        if self.manual_accept_btn is not None:
+            self.manual_accept_btn.disabled = not manual_enabled
+        if self.manual_skip_btn is not None:
+            self.manual_skip_btn.disabled = not manual_enabled
         self._refresh_run_mode_buttons()
 
     def _apply_backend_motif_scale(self) -> float:
@@ -1799,6 +1888,49 @@ class CamouflageApp(App):
             self.log(f"Projection live impossible : {exc}")
             return
         Clock.schedule_once(lambda _dt, r=raw_img, p=projected: self.update_preview(r, p), 0)
+
+    @mainthread
+    def _arm_manual_review(self, review: PendingManualReview):
+        self.pending_manual_review = review
+        self.manual_review_pending = True
+        self.manual_review_decision = None
+        if self.manual_review_label is not None:
+            rules = " | ".join(rejection_rules_for_candidate(review.candidate, review.outcome)[:4]) or "rejet backend"
+            self.manual_review_label.text = (
+                f"Rejet en attente : image {review.target_index:03d} | essai {review.local_attempt:04d} | "
+                f"seed {review.candidate.seed} | {rules}"
+            )
+        self.status("Rejet en attente de décision", ok=False)
+        self._refresh_controls_state()
+
+    @mainthread
+    def _clear_manual_review(self):
+        self.pending_manual_review = None
+        self.manual_review_pending = False
+        self.manual_review_decision = None
+        if self.manual_review_label is not None:
+            self.manual_review_label.text = "Aucun rejet en attente."
+        self._refresh_controls_state()
+
+    def manual_accept_current_reject(self, *_):
+        if not self.manual_review_pending or self.pending_manual_review is None:
+            return
+        self.manual_review_decision = "accept"
+        self.log("Validation manuelle demandée pour le rejet courant.")
+
+    def manual_skip_current_reject(self, *_):
+        if not self.manual_review_pending or self.pending_manual_review is None:
+            return
+        self.manual_review_decision = "skip"
+        self.log("Rejet courant ignoré, reprise de la génération.")
+
+    async def _await_manual_review_decision(self, review: PendingManualReview) -> bool:
+        self._arm_manual_review(review)
+        while self.manual_review_decision is None and not self.stop_flag:
+            await asyncio.sleep(0.05)
+        decision = self.manual_review_decision or "skip"
+        self._clear_manual_review()
+        return decision == "accept"
 
     def _run_mode_text(self, mode: Optional[str] = None) -> str:
         mode = self.run_mode if mode is None else mode
@@ -2118,48 +2250,64 @@ class CamouflageApp(App):
                             f"[img={target_index:03d} essai={local_attempt:04d}] rejeté | "
                             f"MAE={scores['ratio_mae']:.6f} | bd={scores['boundary_density']:.4f}"
                         )
+                        review = PendingManualReview(
+                            target_index=target_index,
+                            local_attempt=local_attempt,
+                            global_attempt=total_attempts,
+                            candidate=candidate,
+                            outcome=outcome,
+                            projection_img=projection_img,
+                            metrics_text=metrics_text,
+                        )
+                        manual_accept = await self._await_manual_review_decision(review)
+                        if manual_accept:
+                            self.update_live_stage("validation manuelle", target_index, local_attempt, seed, metrics_text=metrics_text, pil_img=projection_img)
+                            saved_path, mannequin_saved_path = await self._async_save_candidate_bundle(
+                                rows,
+                                target_index=target_index,
+                                local_attempt=local_attempt,
+                                global_attempt=total_attempts,
+                                candidate=candidate,
+                                outcome=outcome,
+                                projection_img=projection_img,
+                                manual_accept=True,
+                            )
+                            self.update_live_stage("accepté manuellement", target_index, local_attempt, seed, metrics_text=metrics_text, pil_img=projection_img)
+                            self._update_attempt_status(
+                                target_index,
+                                local_attempt,
+                                total_attempts,
+                                seed,
+                                target_count,
+                                self.accepted_count,
+                                self.diag_rejects,
+                                True,
+                                candidate.ratios,
+                                scores,
+                                candidate.metrics,
+                            )
+                            self.log(
+                                f"[img={target_index:03d}] validé manuellement -> {saved_path.name} | "
+                                f"mannequin -> {mannequin_saved_path.name}"
+                            )
+                            await self._adaptive_pause()
+                            await asyncio.sleep(0)
+                            break
                         await self._adaptive_pause()
                         await asyncio.sleep(0)
                         continue
 
-                    filename = build_backend_compatible_output_path(
-                        output_dir=self.current_output_dir,
-                        target_index=target_index,
-                        local_attempt=local_attempt,
-                        global_attempt=total_attempts,
-                        candidate=candidate,
-                    )
                     self.update_live_stage("export image", target_index, local_attempt, seed, metrics_text=metrics_text, pil_img=projection_img)
-                    saved_path = await async_save_candidate_image(candidate, filename)
-                    mannequin_saved_path = await async_save_mannequin_projection(
-                        projection_img,
-                        saved_path,
-                        self.current_output_dir,
-                    )
-                    record = CandidateRecord(
-                        index=target_index,
-                        seed=candidate.seed,
-                        local_attempt=local_attempt,
-                        global_attempt=total_attempts,
-                        image_path=saved_path,
-                        metrics={k: float(v) for k, v in candidate.metrics.items()},
-                        ratios=candidate.ratios.copy(),
-                    )
-                    self.best_records.append(record)
-                    self.best_records.sort(key=candidate_rank_key)
-                    row = build_candidate_row_compatible(
+                    saved_path, mannequin_saved_path = await self._async_save_candidate_bundle(
+                        rows,
                         target_index=target_index,
                         local_attempt=local_attempt,
                         global_attempt=total_attempts,
                         candidate=candidate,
                         outcome=outcome,
-                        saved_path=saved_path,
+                        projection_img=projection_img,
+                        manual_accept=False,
                     )
-                    row["mannequin_image_name"] = mannequin_saved_path.name
-                    row["mannequin_image_path"] = str(mannequin_saved_path)
-                    rows.append(row)
-                    self.accepted_count = len(rows)
-                    self.update_progress(len(rows), target_count)
                     self.update_live_stage("accepté", target_index, local_attempt, seed, metrics_text=metrics_text, pil_img=projection_img)
                     self._update_attempt_status(
                         target_index,
@@ -2179,7 +2327,6 @@ class CamouflageApp(App):
                         f"mannequin -> {mannequin_saved_path.name} | "
                         f"MAE={scores['ratio_mae']:.6f} | composant={scores['primary_component_ratio']:.4f}"
                     )
-                    self.reload_gallery()
                     await self._adaptive_pause()
                     await asyncio.sleep(0)
                     break
@@ -2189,6 +2336,59 @@ class CamouflageApp(App):
             raise
         except Exception as exc:
             await self._async_finish_error(str(exc))
+
+    async def _async_save_candidate_bundle(
+        self,
+        rows: List[dict],
+        *,
+        target_index: int,
+        local_attempt: int,
+        global_attempt: int,
+        candidate: camo.CandidateResult,
+        outcome: Any,
+        projection_img: PILImage.Image,
+        manual_accept: bool = False,
+    ) -> Tuple[Path, Path]:
+        filename = build_backend_compatible_output_path(
+            output_dir=self.current_output_dir,
+            target_index=target_index,
+            local_attempt=local_attempt,
+            global_attempt=global_attempt,
+            candidate=candidate,
+        )
+        saved_path = await async_save_candidate_image(candidate, filename)
+        mannequin_saved_path = await async_save_mannequin_projection(
+            projection_img,
+            saved_path,
+            self.current_output_dir,
+        )
+        record = CandidateRecord(
+            index=target_index,
+            seed=candidate.seed,
+            local_attempt=local_attempt,
+            global_attempt=global_attempt,
+            image_path=saved_path,
+            metrics={k: float(v) for k, v in candidate.metrics.items()},
+            ratios=candidate.ratios.copy(),
+        )
+        self.best_records.append(record)
+        self.best_records.sort(key=candidate_rank_key)
+        row = build_candidate_row_compatible(
+            target_index=target_index,
+            local_attempt=local_attempt,
+            global_attempt=global_attempt,
+            candidate=candidate,
+            outcome=outcome,
+            saved_path=saved_path,
+        )
+        row["mannequin_image_name"] = mannequin_saved_path.name
+        row["mannequin_image_path"] = str(mannequin_saved_path)
+        row["manual_accept"] = int(bool(manual_accept))
+        rows.append(row)
+        self.accepted_count = len(rows)
+        self.update_progress(len(rows), int((self.count_input.text if self.count_input is not None and self.count_input.text.strip().isdigit() else DEFAULT_TARGET_COUNT)))
+        self.reload_gallery()
+        return saved_path, mannequin_saved_path
 
     @mainthread
     def _update_attempt_status(self, target_index: int, attempt_idx: int, global_attempt: int, seed: int, target_total: int, accepted_count: int, rejected_count: int, accepted: bool, rs: np.ndarray, scores: Dict[str, float], metrics: Dict[str, float]):
@@ -2344,6 +2544,7 @@ class CamouflageApp(App):
     def on_stop(self):
         self.stop_flag = True
         self.stopping = True
+        self.manual_review_decision = "skip"
         prevent_sleep(False)
         self._emit_runtime("INFO", "start", "Arrêt de l'interface Kivy")
         self._unsubscribe_runtime_feed()
