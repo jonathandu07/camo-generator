@@ -65,6 +65,10 @@ IDX_0 = 0
 IDX_1 = 1
 IDX_2 = 2
 IDX_3 = 3
+IDX_COYOTE = IDX_0
+IDX_OLIVE = IDX_1
+IDX_TERRE = IDX_2
+IDX_GRIS = IDX_3
 N_CLASSES = 4
 
 CLASS_NAMES = [
@@ -111,6 +115,7 @@ MIN_BOUNDARY_DENSITY_TINY = 0.020
 MAX_BOUNDARY_DENSITY_TINY = 0.210
 MAX_MIRROR_SIMILARITY = 0.88
 MIN_LARGEST_COMPONENT_RATIO_CLASS_1 = 0.08
+MIN_LARGEST_OLIVE_COMPONENT_RATIO = MIN_LARGEST_COMPONENT_RATIO_CLASS_1
 MAX_EDGE_CONTACT_RATIO = 0.72
 
 # Nettoyage / fragmentation.
@@ -130,6 +135,8 @@ EVENTS_JSONL = "validation_events.jsonl"
 ACCEPTS_JSONL = "ml_accepts.jsonl"
 REJECTIONS_JSONL = "ml_rejections.jsonl"
 FULL_DATASET_JSONL = "ml_dataset_all_attempts.jsonl"
+
+MAX_REPAIR_ROUNDS = 3
 
 
 # ============================================================
@@ -163,6 +170,7 @@ class ValidationOutcome:
     reasons: List[str] = field(default_factory=list)
     fragmentation: Dict[str, Any] = field(default_factory=dict)
     subscores: Dict[str, float] = field(default_factory=dict)
+    repair_trace: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -173,7 +181,21 @@ class ValidationOutcome:
             "reasons": list(self.reasons),
             "fragmentation": self.fragmentation,
             "subscores": self.subscores,
+            "repair_trace": list(self.repair_trace),
         }
+
+
+@dataclass
+class RepairPlan:
+    seed: int
+    overscan: float
+    shift_strength: float
+    palette_bias: Tuple[float, float, float, float]
+    motif_scale: float
+    extra_cleanup_passes: int = 0
+    merge_micro: bool = False
+    rebalance_edges: bool = False
+    anti_mirror: bool = False
 
 
 @dataclass
@@ -1131,6 +1153,218 @@ def validate_with_reasons(candidate: CandidateResult) -> ValidationOutcome:
     )
 
 
+
+
+def validate_candidate_result(candidate: CandidateResult) -> bool:
+    return bool(validate_with_reasons(candidate).accepted)
+
+
+def _stable_reason_salt(reasons: Sequence[str]) -> int:
+    return int(sum(sum(ord(ch) for ch in str(r)) for r in reasons))
+
+
+def validation_rank(outcome: ValidationOutcome) -> Tuple[int, int, float, int]:
+    return (
+        1 if outcome.accepted else 0,
+        1 if outcome.passed_strict else 0,
+        float(outcome.bestof_score),
+        -len(outcome.reasons),
+    )
+
+
+def _clip_palette_bias(bias: Sequence[float]) -> Tuple[float, float, float, float]:
+    arr = np.asarray(list(bias), dtype=np.float32)
+    arr = np.clip(arr, -0.025, 0.025)
+    return tuple(float(x) for x in arr.tolist())
+
+
+def derive_repair_plan(
+    candidate: CandidateResult,
+    outcome: ValidationOutcome,
+    repair_round: int,
+) -> RepairPlan:
+    reasons = set(str(r) for r in outcome.reasons)
+    metrics = dict(candidate.metrics)
+
+    overscan = float(candidate.profile.overscan)
+    shift_strength = float(candidate.profile.shift_strength)
+    motif_scale = float(metrics.get("motif_scale", MOTIF_SCALE))
+    bias = np.asarray(candidate.profile.palette_bias, dtype=np.float32).copy()
+
+    extra_cleanup_passes = 0
+    merge_micro = False
+    rebalance_edges = False
+    anti_mirror = False
+
+    bd = float(metrics.get("boundary_density", 0.0))
+    bd_small = float(metrics.get("boundary_density_small", 0.0))
+    bd_tiny = float(metrics.get("boundary_density_tiny", 0.0))
+
+    if "boundary_density" in reasons:
+        if bd < MIN_BOUNDARY_DENSITY:
+            motif_scale *= 0.88
+            shift_strength += 0.08
+        elif bd > MAX_BOUNDARY_DENSITY:
+            motif_scale *= 1.12
+            shift_strength -= 0.08
+
+    if "boundary_density_small" in reasons or "boundary_density_tiny" in reasons:
+        if bd_small < MIN_BOUNDARY_DENSITY_SMALL or bd_tiny < MIN_BOUNDARY_DENSITY_TINY:
+            motif_scale *= 0.84
+            shift_strength += 0.10
+        if bd_small > MAX_BOUNDARY_DENSITY_SMALL or bd_tiny > MAX_BOUNDARY_DENSITY_TINY:
+            motif_scale *= 1.16
+            shift_strength -= 0.10
+
+    if "mirror_similarity" in reasons:
+        anti_mirror = True
+        overscan = _clip_float(overscan + 0.02, 1.08, 1.20)
+
+    if "edge_contact_ratio" in reasons:
+        rebalance_edges = True
+        overscan = _clip_float(overscan + 0.01, 1.08, 1.20)
+
+    if "largest_component_ratio_class_1" in reasons:
+        bias[IDX_1] += np.float32(0.0045)
+        shift_strength = _clip_float(shift_strength - 0.05, 0.50, 1.10)
+        motif_scale *= 1.05
+
+    if "orphan_pixels" in reasons or "micro_islands" in reasons:
+        extra_cleanup_passes += 2
+        merge_micro = True
+
+    if any(r.startswith("ratio_class_") for r in reasons) or "mean_abs_error" in reasons:
+        bias += ((TARGET - candidate.ratios) * 0.25).astype(np.float32)
+
+    reason_salt = _stable_reason_salt(sorted(reasons))
+    new_seed = int((candidate.seed ^ (reason_salt + repair_round * 104729)) & 0x7FFFFFFF)
+
+    return RepairPlan(
+        seed=new_seed,
+        overscan=_clip_float(overscan, 1.08, 1.20),
+        shift_strength=_clip_float(shift_strength, 0.50, 1.10),
+        palette_bias=_clip_palette_bias(bias),
+        motif_scale=_clip_float(motif_scale, MIN_MOTIF_SCALE, MAX_MOTIF_SCALE),
+        extra_cleanup_passes=int(extra_cleanup_passes),
+        merge_micro=bool(merge_micro),
+        rebalance_edges=bool(rebalance_edges),
+        anti_mirror=bool(anti_mirror),
+    )
+
+
+def majority_smoothing_pass(
+    label_map: np.ndarray,
+    *,
+    class_count: int,
+    same_threshold: int = 2,
+    winner_threshold: int = 5,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    same = same_neighbor_count(label_map)
+    winner, winner_count = dominant_neighbor_class(label_map, class_count=class_count)
+
+    mask = (
+        (same <= int(same_threshold))
+        & (winner != label_map)
+        & (winner_count >= int(winner_threshold))
+    )
+
+    out = label_map.copy()
+    changed = int(mask.sum())
+    if changed:
+        out[mask] = winner[mask]
+
+    return out, {
+        "majority_smoothed_pixels": int(changed),
+        "same_threshold": int(same_threshold),
+        "winner_threshold": int(winner_threshold),
+    }
+
+
+def rebalance_edge_pixels(
+    label_map: np.ndarray,
+    fields: np.ndarray,
+    *,
+    edge_margin: int = 10,
+    fraction: float = 0.12,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    labels = label_map.copy()
+    _, _ = labels.shape
+    m = max(1, int(edge_margin))
+
+    border = np.zeros_like(labels, dtype=bool)
+    border[:m, :] = True
+    border[-m:, :] = True
+    border[:, :m] = True
+    border[:, -m:] = True
+
+    edge_values = labels[border]
+    hist = np.bincount(edge_values.ravel(), minlength=N_CLASSES)
+    dominant_edge_class = int(np.argmax(hist))
+
+    mask = border & (labels == dominant_edge_class)
+    idx = np.flatnonzero(mask.ravel())
+    if idx.size == 0:
+        return labels, {
+            "edge_pixels_rebalanced": 0,
+            "dominant_edge_class": dominant_edge_class,
+        }
+
+    take = max(1, int(idx.size * float(fraction)))
+    flat_fields = fields.reshape(fields.shape[0], -1).astype(np.float32, copy=False)
+    flat_labels = labels.ravel()
+
+    scores = flat_fields[:, idx].copy()
+    current = flat_labels[idx]
+    scores[current, np.arange(idx.size)] = -1e9
+    alt = np.argmax(scores, axis=0).astype(np.uint8, copy=False)
+    gains = scores[alt, np.arange(idx.size)] - flat_fields[current, idx]
+    order = np.argsort(gains)[::-1]
+    chosen = idx[order[:take]]
+    chosen_alt = alt[order[:take]]
+
+    flat_labels[chosen] = chosen_alt
+    return flat_labels.reshape(labels.shape), {
+        "edge_pixels_rebalanced": int(chosen.size),
+        "dominant_edge_class": dominant_edge_class,
+    }
+
+
+def break_mirror_pattern(
+    label_map: np.ndarray,
+    fields: np.ndarray,
+    seed: int,
+    *,
+    fraction: float = 0.015,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    labels = label_map.copy()
+    _, w = labels.shape
+
+    half_mask = np.zeros_like(labels, dtype=bool)
+    half_mask[:, w // 2:] = True
+
+    candidate_mask = boundary_mask(labels) & half_mask
+    idx = np.flatnonzero(candidate_mask.ravel())
+    if idx.size == 0:
+        return labels, {"anti_mirror_pixels": 0}
+
+    rng = np.random.default_rng(int(seed) ^ 0x9E3779B1)
+    take = max(1, int(idx.size * float(fraction)))
+    chosen = rng.choice(idx, size=min(take, idx.size), replace=False)
+
+    flat_fields = fields.reshape(fields.shape[0], -1).astype(np.float32, copy=False)
+    flat_labels = labels.ravel()
+    current = flat_labels[chosen]
+
+    scores = flat_fields[:, chosen].copy()
+    scores[current, np.arange(chosen.size)] = -1e9
+    alt = np.argmax(scores, axis=0).astype(np.uint8, copy=False)
+
+    flat_labels[chosen] = alt
+    return flat_labels.reshape(labels.shape), {
+        "anti_mirror_pixels": int(chosen.size),
+    }
+
+
 # ============================================================
 # LOGS / DATASET ML-DL
 # ============================================================
@@ -1162,6 +1396,7 @@ def emit_validation_payload(
         "bestof_ok": bool(outcome.bestof_ok),
         "bestof_score": float(outcome.bestof_score),
         "reasons": list(outcome.reasons),
+        "repair_trace": list(outcome.repair_trace),
         "ratios": [float(x) for x in np.asarray(candidate.ratios, dtype=float)],
         "metrics": {str(k): float(v) for k, v in candidate.metrics.items()},
         "fragmentation": outcome.fragmentation,
@@ -1189,13 +1424,21 @@ def emit_validation_payload(
 # ============================================================
 
 
-def generate_one_variant(profile: VariantProfile) -> CandidateResult:
+def generate_one_variant(
+    profile: VariantProfile,
+    *,
+    motif_scale_override: Optional[float] = None,
+    extra_cleanup_passes: int = 0,
+    merge_micro: bool = False,
+    rebalance_edges: bool = False,
+    anti_mirror: bool = False,
+) -> CandidateResult:
     width = int(WIDTH)
     height = int(HEIGHT)
     physical_width_cm = float(PHYSICAL_WIDTH_CM)
     physical_height_cm = float(PHYSICAL_HEIGHT_CM)
     px_per_cm = float(PX_PER_CM)
-    motif_scale = float(MOTIF_SCALE)
+    motif_scale = float(motif_scale_override if motif_scale_override is not None else MOTIF_SCALE)
 
     work_width = max(width + 64, int(round(width * profile.overscan)))
     work_height = max(height + 64, int(round(height * profile.overscan)))
@@ -1219,7 +1462,41 @@ def generate_one_variant(profile: VariantProfile) -> CandidateResult:
     label_map, orphan_info = cleanup_orphan_pixels(
         label_map,
         class_count=N_CLASSES,
-        passes=STRAY_CLEANUP_PASSES,
+        passes=STRAY_CLEANUP_PASSES + int(extra_cleanup_passes),
+        orphan_max_same_neighbors=ORPHAN_MAX_SAME_NEIGHBORS,
+        orphan_min_winner_neighbors=ORPHAN_MIN_WINNER_NEIGHBORS,
+    )
+
+    smoothing_info = {"majority_smoothed_pixels": 0}
+    if merge_micro:
+        label_map, info_a = majority_smoothing_pass(
+            label_map,
+            class_count=N_CLASSES,
+            same_threshold=2,
+            winner_threshold=5,
+        )
+        label_map, info_b = majority_smoothing_pass(
+            label_map,
+            class_count=N_CLASSES,
+            same_threshold=3,
+            winner_threshold=5,
+        )
+        smoothing_info = {
+            "majority_smoothed_pixels": int(info_a["majority_smoothed_pixels"] + info_b["majority_smoothed_pixels"])
+        }
+
+    edge_info = {"edge_pixels_rebalanced": 0, "dominant_edge_class": -1}
+    if rebalance_edges:
+        label_map, edge_info = rebalance_edge_pixels(label_map, fields)
+
+    mirror_info = {"anti_mirror_pixels": 0}
+    if anti_mirror:
+        label_map, mirror_info = break_mirror_pattern(label_map, fields, profile.seed)
+
+    label_map, orphan_info_2 = cleanup_orphan_pixels(
+        label_map,
+        class_count=N_CLASSES,
+        passes=1,
         orphan_max_same_neighbors=ORPHAN_MAX_SAME_NEIGHBORS,
         orphan_min_winner_neighbors=ORPHAN_MIN_WINNER_NEIGHBORS,
     )
@@ -1231,8 +1508,11 @@ def generate_one_variant(profile: VariantProfile) -> CandidateResult:
     small = downsample_nearest(label_map, 4)
     tiny = downsample_nearest(label_map, 8)
 
+    largest_ratio = largest_component_ratio(label_map == IDX_1)
+
     metrics = {
-        "largest_component_ratio_class_1": largest_component_ratio(label_map == IDX_1),
+        "largest_component_ratio_class_1": largest_ratio,
+        "largest_olive_component_ratio": largest_ratio,
         "boundary_density": boundary_density(label_map),
         "boundary_density_small": boundary_density(small),
         "boundary_density_tiny": boundary_density(tiny),
@@ -1246,8 +1526,15 @@ def generate_one_variant(profile: VariantProfile) -> CandidateResult:
         "physical_height_cm": float(physical_height_cm),
         "px_per_cm": float(px_per_cm),
         "motif_scale": float(motif_scale),
-        "orphan_pixels_fixed": float(orphan_info["orphan_pixels_fixed"]),
-        "orphan_cleanup_passes": float(orphan_info["orphan_cleanup_passes"]),
+        "orphan_pixels_fixed": float(orphan_info["orphan_pixels_fixed"] + orphan_info_2["orphan_pixels_fixed"]),
+        "orphan_cleanup_passes": float(orphan_info["orphan_cleanup_passes"] + orphan_info_2["orphan_cleanup_passes"]),
+        "majority_smoothed_pixels": float(smoothing_info["majority_smoothed_pixels"]),
+        "edge_pixels_rebalanced": float(edge_info["edge_pixels_rebalanced"]),
+        "anti_mirror_pixels": float(mirror_info["anti_mirror_pixels"]),
+        "repair_merge_micro": float(1 if merge_micro else 0),
+        "repair_rebalance_edges": float(1 if rebalance_edges else 0),
+        "repair_anti_mirror": float(1 if anti_mirror else 0),
+        "repair_extra_cleanup_passes": float(extra_cleanup_passes),
     }
 
     return CandidateResult(
@@ -1265,10 +1552,74 @@ def generate_candidate_from_seed(seed: int) -> CandidateResult:
     return generate_one_variant(profile)
 
 
-def generate_and_validate_from_seed(seed: int) -> Tuple[CandidateResult, ValidationOutcome]:
+def generate_and_validate_from_seed(
+    seed: int,
+    max_repair_rounds: int = MAX_REPAIR_ROUNDS,
+) -> Tuple[CandidateResult, ValidationOutcome]:
     candidate = generate_candidate_from_seed(seed)
     outcome = validate_with_reasons(candidate)
-    return candidate, outcome
+
+    trace: List[Dict[str, Any]] = [{
+        "round": 0,
+        "seed": int(candidate.seed),
+        "accepted": bool(outcome.accepted),
+        "bestof_score": float(outcome.bestof_score),
+        "reasons": list(outcome.reasons),
+        "metrics": {k: float(v) for k, v in candidate.metrics.items()},
+    }]
+
+    best_candidate = candidate
+    best_outcome = outcome
+
+    for repair_round in range(1, max_repair_rounds + 1):
+        if best_outcome.accepted:
+            break
+
+        plan = derive_repair_plan(best_candidate, best_outcome, repair_round)
+
+        repaired_profile = VariantProfile(
+            seed=int(plan.seed),
+            overscan=float(plan.overscan),
+            shift_strength=float(plan.shift_strength),
+            palette_bias=tuple(plan.palette_bias),
+        )
+
+        repaired_candidate = generate_one_variant(
+            repaired_profile,
+            motif_scale_override=plan.motif_scale,
+            extra_cleanup_passes=plan.extra_cleanup_passes,
+            merge_micro=plan.merge_micro,
+            rebalance_edges=plan.rebalance_edges,
+            anti_mirror=plan.anti_mirror,
+        )
+        repaired_candidate.metrics["repair_round"] = float(repair_round)
+
+        repaired_outcome = validate_with_reasons(repaired_candidate)
+        trace.append({
+            "round": int(repair_round),
+            "seed": int(repaired_candidate.seed),
+            "accepted": bool(repaired_outcome.accepted),
+            "bestof_score": float(repaired_outcome.bestof_score),
+            "reasons": list(repaired_outcome.reasons),
+            "metrics": {k: float(v) for k, v in repaired_candidate.metrics.items()},
+            "applied_plan": {
+                "motif_scale": float(plan.motif_scale),
+                "overscan": float(plan.overscan),
+                "shift_strength": float(plan.shift_strength),
+                "palette_bias": [float(x) for x in plan.palette_bias],
+                "extra_cleanup_passes": int(plan.extra_cleanup_passes),
+                "merge_micro": bool(plan.merge_micro),
+                "rebalance_edges": bool(plan.rebalance_edges),
+                "anti_mirror": bool(plan.anti_mirror),
+            },
+        })
+
+        if validation_rank(repaired_outcome) > validation_rank(best_outcome):
+            best_candidate = repaired_candidate
+            best_outcome = repaired_outcome
+
+    best_outcome.repair_trace = trace
+    return best_candidate, best_outcome
 
 
 # ============================================================
@@ -1344,10 +1695,13 @@ def candidate_row(
     local_attempt: int,
     global_attempt: int,
     candidate: CandidateResult,
-    outcome: ValidationOutcome,
+    outcome: Optional[ValidationOutcome] = None,
     image_name: Optional[str] = None,
     image_path: Optional[str] = None,
 ) -> Dict[str, object]:
+    if outcome is None:
+        outcome = validate_with_reasons(candidate)
+
     rs = candidate.ratios
     metrics = candidate.metrics
     return {
@@ -1632,7 +1986,7 @@ def main() -> None:
                 base_seed=args.base_seed,
                 max_workers=args.max_workers,
                 attempt_batch_size=args.attempt_batch_size,
-                parallel_attempts=not args.disable_parallel_attemps if hasattr(args, 'disable_parallel_attemps') else not args.disable_parallel_attempts,
+                parallel_attempts=not args.disable_parallel_attempts,
                 machine_intensity=args.machine_intensity,
                 live_console=not args.no_live_console,
             )
