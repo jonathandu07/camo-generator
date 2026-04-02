@@ -5,5 +5,12 @@
     "source": "start",
     "message": "Interface Kivy démarrée",
     "payload": {}
+  },
+  {
+    "ts": 1775141031.502056,
+    "level": "INFO",
+    "source": "start",
+    "message": "Arrêt de l'interface Kivy",
+    "payload": {}
   }
 ]
