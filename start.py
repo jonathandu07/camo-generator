@@ -152,6 +152,7 @@ DEFAULT_TOP_K = 20
 REPORT_NAME = "rapport_textures.csv" if hasattr(camo, "validate_with_reasons") else "rapport_camouflages.csv"
 BEST_DIR_NAME = "best_of"
 MANNEQUIN_DIR_NAME = "mannequin_previews"
+OUTPUT_IMAGE_GLOB = "pattern_*.png" if hasattr(camo, "validate_with_reasons") else "camouflage_*.png"
 
 RUN_MODE_BLOCKING = "blocking"
 RUN_MODE_NON_BLOCKING = "non_blocking"
@@ -514,21 +515,21 @@ def build_candidate_row_compatible(
 @dataclass
 class ProjectionConfig:
     # Détection initiale large du vert.
-    hue_min: int = 35
-    hue_max: int = 95
-    sat_min: int = 20
-    val_min: int = 20
+    hue_min: int = 30
+    hue_max: int = 105
+    sat_min: int = 15
+    val_min: int = 15
     sat_max: int = 255
     val_max: int = 190
 
     # Protection des zones sombres non à repeindre.
-    dark_val_max: int = 70
-    dark_sat_max: int = 120
+    dark_val_max: int = 40
+    dark_sat_max: int = 60
 
     # Morphologie.
     open_kernel: int = 3
-    close_kernel: int = 7
-    blur_radius: int = 7
+    close_kernel: int = 11
+    blur_radius: int = 9
 
     # Répartition verticale du vêtement.
     hat_ratio: float = 0.13
@@ -539,23 +540,23 @@ class ProjectionConfig:
     uniform_visible_height_cm: float = 160.0
 
     # Adaptation physique quand la source est un camouflage plein format.
-    hat_scale_multiplier: float = 0.92
-    jacket_scale_multiplier: float = 1.00
-    pants_scale_multiplier: float = 1.08
+    hat_scale_multiplier: float = 0.48
+    jacket_scale_multiplier: float = 0.52
+    pants_scale_multiplier: float = 0.56
 
     # Fallback quand la source est un petit tile.
-    tile_hat_width_ratio: float = 0.32
-    tile_jacket_width_ratio: float = 0.25
-    tile_pants_width_ratio: float = 0.22
+    tile_hat_width_ratio: float = 0.14
+    tile_jacket_width_ratio: float = 0.12
+    tile_pants_width_ratio: float = 0.11
 
     # Bornes globales de scale.
-    min_region_scale: float = 0.16
-    max_region_scale: float = 1.55
+    min_region_scale: float = 0.06
+    max_region_scale: float = 0.95
 
     # Composition.
-    shadow_strength: float = 0.95
-    detail_strength: float = 0.42
-    edge_darkening: float = 0.25
+    shadow_strength: float = 0.62
+    detail_strength: float = 0.18
+    edge_darkening: float = 0.08
     alpha_gamma: float = 1.0
 
 
@@ -960,16 +961,13 @@ def compose_region(base_bgr: np.ndarray, region_mask: np.ndarray, camo_bgr: np.n
 def apply_camo_to_reference(subject_bgr: np.ndarray, camo_bgr: np.ndarray, cfg: ProjectionConfig = PROJECTION_CFG) -> Tuple[np.ndarray, np.ndarray]:
     analysis = get_projection_subject_analysis(cfg)
     mask = analysis.uniform_mask
-    regions = analysis.regions
 
-    hat_scale = adaptive_region_scale("hat", regions["hat"], camo_bgr, analysis, cfg)
-    jacket_scale = adaptive_region_scale("jacket", regions["jacket"], camo_bgr, analysis, cfg)
-    pants_scale = adaptive_region_scale("pants", regions["pants"], camo_bgr, analysis, cfg)
+    # Passe unique sur tout ce qui est vert : ainsi la veste, le pantalon et le chapeau
+    # reçoivent tous le camouflage partout où le masque détecte du vert.
+    full_scale = adaptive_region_scale("jacket", mask, camo_bgr, analysis, cfg)
 
     out = subject_bgr.copy()
-    out = compose_region(out, regions["hat"], camo_bgr, hat_scale, seed=11, cfg=cfg)
-    out = compose_region(out, regions["jacket"], camo_bgr, jacket_scale, seed=29, cfg=cfg)
-    out = compose_region(out, regions["pants"], camo_bgr, pants_scale, seed=47, cfg=cfg)
+    out = compose_region(out, mask, camo_bgr, full_scale, seed=23, cfg=cfg)
     return out, mask
 
 
@@ -1770,7 +1768,7 @@ class CamouflageApp(App):
         self.gallery_grid.clear_widgets()
         if not self.current_output_dir.exists():
             return
-        paths = sorted(self.current_output_dir.glob("camouflage_*.png"))
+        paths = sorted(self.current_output_dir.glob(OUTPUT_IMAGE_GLOB))
         if MAX_GALLERY_ITEMS > 0:
             paths = paths[-MAX_GALLERY_ITEMS:]
         for p in reversed(paths):
@@ -2154,7 +2152,7 @@ class CamouflageApp(App):
         rows: List[dict] = []
         for rank, rec in enumerate(self.best_records[:top_k], start=1):
             if rec.image_path.exists():
-                dst = best_dir / f"best_{rank:03d}_camouflage_{rec.index:03d}.png"
+                dst = best_dir / f"best_{rank:03d}_{("pattern" if hasattr(camo, "validate_with_reasons") else "camouflage")}_{rec.index:03d}.png"
                 await asyncio.to_thread(shutil.copy2, rec.image_path, dst)
             rows.append({
                 "rank": rank,

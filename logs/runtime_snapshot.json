@@ -1,28 +1,9 @@
 [
   {
-    "ts": 1775076814.798695,
+    "ts": 1775135370.260692,
     "level": "INFO",
     "source": "start",
     "message": "Interface Kivy démarrée",
     "payload": {}
-  },
-  {
-    "ts": 1775076835.1963134,
-    "level": "INFO",
-    "source": "main_preflight",
-    "message": "Préflight local validé",
-    "payload": {
-      "snapshot": {
-        "ts": 1775076835.19628,
-        "cpu_count": 4.0,
-        "process_cpu_percent": 0.0,
-        "system_cpu_percent": 0.0,
-        "process_rss_mb": 816.03515625,
-        "system_available_mb": 16601.05078125,
-        "system_total_mb": 32724.37890625,
-        "disk_free_mb": 167707.00390625,
-        "machine_intensity": 0.98
-      }
-    }
   }
 ]
