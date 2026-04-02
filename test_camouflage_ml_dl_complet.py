@@ -29,7 +29,7 @@ TEST_DIR = Path(__file__).resolve().parent
 if str(TEST_DIR) not in sys.path:
     sys.path.insert(0, str(TEST_DIR))
 
-MODULE_NAME = os.getenv("CAMO_MLDL_MODULE", "camouflage_ml_dl_guided")
+MODULE_NAME = os.getenv("CAMO_MLDL_MODULE", "camouflage_ml_dl")
 mut = importlib.import_module(MODULE_NAME)
 
 LOG_DIR = Path(os.getenv("LOG_OUTPUT_DIR", TEST_DIR / "logs")).resolve()
@@ -38,26 +38,64 @@ LOG_FILE = LOG_DIR / "test_camouflage_ml_dl_guided.log"
 
 
 def configure_logger() -> logging.Logger:
-    logger = logging.getLogger("test_camouflage_ml_dl_guided")
+    logger = logging.getLogger("test_camouflage_ml_dl_precise")
     logger.setLevel(logging.DEBUG)
     if logger.handlers:
         return logger
+
+    fmt = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(filename)s:%(lineno)d | %(funcName)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
     fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
     logger.addHandler(fh)
+
+    sh = logging.StreamHandler()
+    sh.setLevel(logging.INFO)
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+
     logger.propagate = False
     return logger
 
 
 LOGGER = configure_logger()
+LOGGER.info("Module ML/DL sous test: %s", getattr(mut, "__name__", type(mut).__name__))
+LOGGER.info("Fichier de log ML/DL: %s", LOG_FILE)
+
+
+class LoggedTestMixin:
+    def setUp(self) -> None:
+        super().setUp()
+        import time as _time
+        self._started_at = _time.perf_counter()
+        LOGGER.info("▶ START %s", self.id())
+
+    def tearDown(self) -> None:
+        import time as _time
+        elapsed = _time.perf_counter() - getattr(self, "_started_at", _time.perf_counter())
+        LOGGER.info("■ END   %s | %.3fs", self.id(), elapsed)
+        super().tearDown()
+
+    def log_state(self, message: str, **payload: Any) -> None:
+        if payload:
+            LOGGER.info("%s | %s", message, json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str))
+        else:
+            LOGGER.info("%s", message)
 
 
 class TempDirMixin:
     def setUp(self) -> None:
         super().setUp()
-        self._tmpdir_obj = tempfile.TemporaryDirectory(prefix="test_camouflage_ml_dl_guided_")
+        self._tmpdir_obj = tempfile.TemporaryDirectory(prefix="test_camouflage_ml_dl_precise_")
         self.tmpdir = Path(self._tmpdir_obj.name)
+        LOGGER.info("tmpdir ML/DL prêt: %s", self.tmpdir)
 
     def tearDown(self) -> None:
+        LOGGER.info("tmpdir ML/DL cleanup: %s", getattr(self, "tmpdir", "<absent>"))
         self._tmpdir_obj.cleanup()
         super().tearDown()
 
@@ -99,7 +137,22 @@ def make_invalid_candidate(seed: int = 1234) -> Any:
     return make_candidate(seed=seed, ratios=ratios, metrics=m)
 
 
-class TestHelpers(unittest.TestCase):
+def log_json_preview(path: Path) -> None:
+    if not path.exists():
+        LOGGER.info("json absent: %s", path)
+        return
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        LOGGER.info("json illisible: %s | %s", path, exc)
+        return
+    if isinstance(payload, dict):
+        LOGGER.info("json %s | keys=%s", path.name, sorted(payload.keys()))
+    else:
+        LOGGER.info("json %s | type=%s", path.name, type(payload).__name__)
+
+
+class TestHelpers(LoggedTestMixin, unittest.TestCase):
     def test_safe_float(self):
         self.assertEqual(mut._safe_float(1.2), 1.2)
         self.assertEqual(mut._safe_float("x", 3.4), 3.4)
@@ -134,7 +187,7 @@ class TestHelpers(unittest.TestCase):
         self.assertEqual(mut.propose_seed(10, {"mode": "xor", "mask": 5}), 15)
 
 
-class TestStandardizer(unittest.TestCase):
+class TestStandardizer(LoggedTestMixin, unittest.TestCase):
     def test_fit_transform_state(self):
         x = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
         s = mut.Standardizer(2)
@@ -146,7 +199,7 @@ class TestStandardizer(unittest.TestCase):
         np.testing.assert_allclose(out, s2.transform(x))
 
 
-class TestDeepSurrogate(TempDirMixin, unittest.TestCase):
+class TestDeepSurrogate(LoggedTestMixin, TempDirMixin, unittest.TestCase):
     def test_fit_predict_save_load(self):
         dim = len(mut.FEATURE_KEYS)
         x = np.random.default_rng(123).normal(size=(12, dim)).astype(np.float32)
@@ -167,7 +220,7 @@ class TestDeepSurrogate(TempDirMixin, unittest.TestCase):
         self.assertEqual(p2_valid.shape, (1,))
 
 
-class TestLinUCBBandit(unittest.TestCase):
+class TestLinUCBBandit(LoggedTestMixin, unittest.TestCase):
     def test_scores_select_update(self):
         bandit = mut.LinUCBBandit(n_actions=3, context_dim=5, alpha=1.0)
         ctx = np.ones((5,), dtype=np.float32)
@@ -177,7 +230,7 @@ class TestLinUCBBandit(unittest.TestCase):
         self.assertEqual(bandit.scores(ctx).shape, (3,))
 
 
-class TestExperienceBuffer(TempDirMixin, unittest.TestCase):
+class TestExperienceBuffer(LoggedTestMixin, TempDirMixin, unittest.TestCase):
     def test_add_as_arrays_save(self):
         buf = mut.ExperienceBuffer()
         reward = buf.add(make_candidate(), True)
@@ -191,7 +244,7 @@ class TestExperienceBuffer(TempDirMixin, unittest.TestCase):
         self.assertTrue(path.exists())
 
 
-class TestGenerator(TempDirMixin, unittest.TestCase):
+class TestGenerator(LoggedTestMixin, TempDirMixin, unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
         self.cfg = mut.MLDLConfig(
@@ -306,7 +359,7 @@ class TestGenerator(TempDirMixin, unittest.TestCase):
         self.assertTrue((self.tmpdir / "run_summary_ml_dl.json").exists())
 
 
-class TestCliAndPublicAPI(TempDirMixin, unittest.TestCase):
+class TestCliAndPublicAPI(LoggedTestMixin, TempDirMixin, unittest.TestCase):
     def test_parse_args(self):
         with patch.object(sys, "argv", [
             "prog",
@@ -376,6 +429,15 @@ class TestCliAndPublicAPI(TempDirMixin, unittest.TestCase):
         run_mock.assert_called_once_with(cfg)
 
 
+class TestLoggingArtifacts(LoggedTestMixin, TempDirMixin, unittest.TestCase):
+    def test_log_helpers_and_summary_preview(self):
+        payload = {"ok": True, "items": [1, 2, 3]}
+        path = self.tmpdir / "summary.json"
+        path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        log_json_preview(path)
+        self.assertTrue(path.exists())
+
+
 if __name__ == "__main__":
-    LOGGER.info("========== DÉBUT DES TESTS test_camouflage_ml_dl_guided.py ==========")
+    LOGGER.info("========== DÉBUT DES TESTS test_camouflage_ml_dl_precise.py ==========")
     unittest.main(verbosity=2)
