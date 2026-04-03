@@ -152,6 +152,15 @@ FULL_DATASET_JSONL = "ml_dataset_all_attempts.jsonl"
 
 MAX_REPAIR_ROUNDS = 3
 
+# Tolérance dynamique bornée.
+DEFAULT_DYNAMIC_TOLERANCE_ENABLED = True
+DEFAULT_REJECTION_RATE_WINDOW = 24
+DEFAULT_REJECTION_RATE_HIGH = 0.90
+DEFAULT_REJECTION_RATE_LOW = 0.55
+DEFAULT_TOLERANCE_MIN_ATTEMPTS = 24
+DEFAULT_TOLERANCE_RELAX_STEP = 0.08
+MAX_TOLERANCE_RELAX = 0.40
+
 
 # ============================================================
 # STRUCTURES
@@ -196,6 +205,44 @@ class ValidationOutcome:
             "fragmentation": self.fragmentation,
             "subscores": self.subscores,
             "repair_trace": list(self.repair_trace),
+        }
+
+
+@dataclass
+class ValidationToleranceProfile:
+    relax_level: float
+    max_abs_error_per_color: Tuple[float, float, float, float]
+    max_mean_abs_error: float
+    min_boundary_density: float
+    max_boundary_density: float
+    min_boundary_density_small: float
+    max_boundary_density_small: float
+    min_boundary_density_tiny: float
+    max_boundary_density_tiny: float
+    max_mirror_similarity: float
+    min_largest_component_ratio_class_1: float
+    max_edge_contact_ratio: float
+    bestof_min_score: float
+    max_orphan_ratio: float
+    max_micro_islands_per_mp: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "relax_level": float(self.relax_level),
+            "max_abs_error_per_color": [float(x) for x in self.max_abs_error_per_color],
+            "max_mean_abs_error": float(self.max_mean_abs_error),
+            "min_boundary_density": float(self.min_boundary_density),
+            "max_boundary_density": float(self.max_boundary_density),
+            "min_boundary_density_small": float(self.min_boundary_density_small),
+            "max_boundary_density_small": float(self.max_boundary_density_small),
+            "min_boundary_density_tiny": float(self.min_boundary_density_tiny),
+            "max_boundary_density_tiny": float(self.max_boundary_density_tiny),
+            "max_mirror_similarity": float(self.max_mirror_similarity),
+            "min_largest_component_ratio_class_1": float(self.min_largest_component_ratio_class_1),
+            "max_edge_contact_ratio": float(self.max_edge_contact_ratio),
+            "bestof_min_score": float(self.bestof_min_score),
+            "max_orphan_ratio": float(self.max_orphan_ratio),
+            "max_micro_islands_per_mp": float(self.max_micro_islands_per_mp),
         }
 
 
@@ -335,6 +382,100 @@ def ensure_output_dir(output_dir: Path) -> Path:
 
 def _clip_float(value: float, low: float, high: float) -> float:
     return max(float(low), min(float(high), float(value)))
+
+
+def build_validation_tolerance_profile(relax_level: float = 0.0) -> ValidationToleranceProfile:
+    relax = _clip_float(float(relax_level), 0.0, MAX_TOLERANCE_RELAX)
+
+    per_color = np.asarray(MAX_ABS_ERROR_PER_COLOR, dtype=np.float32) * np.float32(1.0 + 0.75 * relax)
+    mean_abs = float(MAX_MEAN_ABS_ERROR * (1.0 + 1.00 * relax))
+
+    min_bd = float(max(0.0, MIN_BOUNDARY_DENSITY * (1.0 - 0.35 * relax)))
+    max_bd = float(min(1.0, MAX_BOUNDARY_DENSITY * (1.0 + 0.20 * relax)))
+
+    min_bd_small = float(max(0.0, MIN_BOUNDARY_DENSITY_SMALL * (1.0 - 0.35 * relax)))
+    max_bd_small = float(min(1.0, MAX_BOUNDARY_DENSITY_SMALL * (1.0 + 0.20 * relax)))
+
+    min_bd_tiny = float(max(0.0, MIN_BOUNDARY_DENSITY_TINY * (1.0 - 0.35 * relax)))
+    max_bd_tiny = float(min(1.0, MAX_BOUNDARY_DENSITY_TINY * (1.0 + 0.20 * relax)))
+
+    max_mirror = float(min(0.98, MAX_MIRROR_SIMILARITY + 0.08 * relax))
+    min_largest = float(max(0.04, MIN_LARGEST_COMPONENT_RATIO_CLASS_1 * (1.0 - 0.30 * relax)))
+    max_edge = float(min(0.90, MAX_EDGE_CONTACT_RATIO + 0.10 * relax))
+    bestof_min = float(max(0.90, BESTOF_MIN_SCORE - 0.03 * (relax / max(1e-9, MAX_TOLERANCE_RELAX))))
+
+    # On garde volontairement les orphelins et micro-îlots stricts.
+    return ValidationToleranceProfile(
+        relax_level=relax,
+        max_abs_error_per_color=tuple(float(x) for x in per_color.tolist()),
+        max_mean_abs_error=mean_abs,
+        min_boundary_density=min_bd,
+        max_boundary_density=max_bd,
+        min_boundary_density_small=min_bd_small,
+        max_boundary_density_small=max_bd_small,
+        min_boundary_density_tiny=min_bd_tiny,
+        max_boundary_density_tiny=max_bd_tiny,
+        max_mirror_similarity=max_mirror,
+        min_largest_component_ratio_class_1=min_largest,
+        max_edge_contact_ratio=max_edge,
+        bestof_min_score=bestof_min,
+        max_orphan_ratio=float(MAX_ORPHAN_RATIO),
+        max_micro_islands_per_mp=float(MAX_MICRO_ISLANDS_PER_MP),
+    )
+
+
+def compute_recent_rejection_rate(outcomes: Sequence[bool], window: int) -> float:
+    window = max(1, int(window))
+    if not outcomes:
+        return 0.0
+    recent = list(outcomes[-window:])
+    accept_rate = float(sum(1 for x in recent if bool(x)) / max(1, len(recent)))
+    return float(1.0 - accept_rate)
+
+
+def adapt_tolerance_relax_level(
+    current_relax: float,
+    recent_outcomes: Sequence[bool],
+    *,
+    window: int = DEFAULT_REJECTION_RATE_WINDOW,
+    rejection_rate_high: float = DEFAULT_REJECTION_RATE_HIGH,
+    rejection_rate_low: float = DEFAULT_REJECTION_RATE_LOW,
+    min_attempts: int = DEFAULT_TOLERANCE_MIN_ATTEMPTS,
+    relax_step: float = DEFAULT_TOLERANCE_RELAX_STEP,
+    enabled: bool = DEFAULT_DYNAMIC_TOLERANCE_ENABLED,
+) -> Tuple[float, ValidationToleranceProfile, Dict[str, float]]:
+    if not enabled:
+        profile = build_validation_tolerance_profile(0.0)
+        return 0.0, profile, {
+            "rejection_rate": 0.0,
+            "window_count": 0.0,
+            "relax_before": 0.0,
+            "relax_after": 0.0,
+        }
+
+    window = max(1, int(window))
+    min_attempts = max(1, int(min_attempts))
+    relax_step = max(0.0, float(relax_step))
+    current_relax = _clip_float(float(current_relax), 0.0, MAX_TOLERANCE_RELAX)
+
+    recent_count = min(len(recent_outcomes), window)
+    rejection_rate = compute_recent_rejection_rate(recent_outcomes, window)
+    new_relax = current_relax
+
+    if len(recent_outcomes) >= min_attempts:
+        if rejection_rate >= float(rejection_rate_high):
+            new_relax = _clip_float(current_relax + relax_step, 0.0, MAX_TOLERANCE_RELAX)
+        elif rejection_rate <= float(rejection_rate_low):
+            new_relax = _clip_float(current_relax - (relax_step * 0.5), 0.0, MAX_TOLERANCE_RELAX)
+
+    profile = build_validation_tolerance_profile(new_relax)
+    info = {
+        "rejection_rate": float(rejection_rate),
+        "window_count": float(recent_count),
+        "relax_before": float(current_relax),
+        "relax_after": float(new_relax),
+    }
+    return new_relax, profile, info
 
 
 def set_canvas_geometry(
@@ -1282,13 +1423,19 @@ def compute_bestof_score(
     target: np.ndarray,
     metrics: Dict[str, float],
     fragmentation: Dict[str, Any],
+    tolerance_profile: Optional[ValidationToleranceProfile] = None,
 ) -> Tuple[float, Dict[str, float]]:
+    profile = tolerance_profile or build_validation_tolerance_profile(0.0)
     abs_err = np.abs(np.asarray(ratios, dtype=float) - np.asarray(target, dtype=float))
     mean_abs = float(np.mean(abs_err))
 
-    ratio_score = float(np.clip(1.0 - (mean_abs / max(1e-9, float(MAX_MEAN_ABS_ERROR))), 0.0, 1.0))
+    ratio_score = float(np.clip(1.0 - (mean_abs / max(1e-9, float(profile.max_mean_abs_error))), 0.0, 1.0))
     per_class_score = float(
-        np.clip(1.0 - float(np.mean(abs_err / np.maximum(MAX_ABS_ERROR_PER_COLOR, 1e-9))), 0.0, 1.0)
+        np.clip(
+            1.0 - float(np.mean(abs_err / np.maximum(np.asarray(profile.max_abs_error_per_color, dtype=float), 1e-9))),
+            0.0,
+            1.0,
+        )
     )
 
     orphan_ratio = float(fragmentation.get("orphan_ratio", 1.0))
@@ -1322,7 +1469,11 @@ def compute_bestof_score(
     return float(np.clip(score, 0.0, 1.0)), subscores
 
 
-def validate_with_reasons(candidate: CandidateResult) -> ValidationOutcome:
+def validate_with_reasons(
+    candidate: CandidateResult,
+    tolerance_profile: Optional[ValidationToleranceProfile] = None,
+) -> ValidationOutcome:
+    profile = tolerance_profile or build_validation_tolerance_profile(0.0)
     reasons: List[str] = []
     ratios = candidate.ratios
     metrics = candidate.metrics
@@ -1331,25 +1482,27 @@ def validate_with_reasons(candidate: CandidateResult) -> ValidationOutcome:
     abs_err = np.abs(ratios - TARGET)
     mean_abs = float(np.mean(abs_err))
 
+    max_abs_per_color = np.asarray(profile.max_abs_error_per_color, dtype=float)
+
     for i, err in enumerate(abs_err):
-        if float(err) > float(MAX_ABS_ERROR_PER_COLOR[i]):
+        if float(err) > float(max_abs_per_color[i]):
             reasons.append(f"ratio_class_{i}_abs_error")
 
-    if mean_abs > float(MAX_MEAN_ABS_ERROR):
+    if mean_abs > float(profile.max_mean_abs_error):
         reasons.append("mean_abs_error")
 
-    if not (MIN_BOUNDARY_DENSITY <= float(metrics["boundary_density"]) <= MAX_BOUNDARY_DENSITY):
+    if not (profile.min_boundary_density <= float(metrics["boundary_density"]) <= profile.max_boundary_density):
         reasons.append("boundary_density")
-    if not (MIN_BOUNDARY_DENSITY_SMALL <= float(metrics["boundary_density_small"]) <= MAX_BOUNDARY_DENSITY_SMALL):
+    if not (profile.min_boundary_density_small <= float(metrics["boundary_density_small"]) <= profile.max_boundary_density_small):
         reasons.append("boundary_density_small")
-    if not (MIN_BOUNDARY_DENSITY_TINY <= float(metrics["boundary_density_tiny"]) <= MAX_BOUNDARY_DENSITY_TINY):
+    if not (profile.min_boundary_density_tiny <= float(metrics["boundary_density_tiny"]) <= profile.max_boundary_density_tiny):
         reasons.append("boundary_density_tiny")
 
-    if float(metrics["mirror_similarity"]) > MAX_MIRROR_SIMILARITY:
+    if float(metrics["mirror_similarity"]) > profile.max_mirror_similarity:
         reasons.append("mirror_similarity")
-    if float(metrics["largest_component_ratio_class_1"]) < MIN_LARGEST_COMPONENT_RATIO_CLASS_1:
+    if float(metrics["largest_component_ratio_class_1"]) < profile.min_largest_component_ratio_class_1:
         reasons.append("largest_component_ratio_class_1")
-    if float(metrics["edge_contact_ratio"]) > MAX_EDGE_CONTACT_RATIO:
+    if float(metrics["edge_contact_ratio"]) > profile.max_edge_contact_ratio:
         reasons.append("edge_contact_ratio")
 
     frag = fragmentation_report(
@@ -1358,9 +1511,9 @@ def validate_with_reasons(candidate: CandidateResult) -> ValidationOutcome:
         min_component_pixels=MIN_COMPONENT_PIXELS,
     )
 
-    if float(frag["orphan_ratio"]) > MAX_ORPHAN_RATIO:
+    if float(frag["orphan_ratio"]) > float(profile.max_orphan_ratio):
         reasons.append("orphan_pixels")
-    if float(frag["micro_components_per_mp"]) > MAX_MICRO_ISLANDS_PER_MP:
+    if float(frag["micro_components_per_mp"]) > float(profile.max_micro_islands_per_mp):
         reasons.append("micro_islands")
 
     strict_ok = len(reasons) == 0
@@ -1370,8 +1523,9 @@ def validate_with_reasons(candidate: CandidateResult) -> ValidationOutcome:
         target=TARGET,
         metrics=metrics,
         fragmentation=frag,
+        tolerance_profile=profile,
     )
-    bestof_ok = bool(bestof_score >= BESTOF_MIN_SCORE and strict_ok)
+    bestof_ok = bool(bestof_score >= float(profile.bestof_min_score) and strict_ok)
 
     if BESTOF_REQUIRED and not bestof_ok:
         reasons.append("not_bestof")
@@ -1389,8 +1543,11 @@ def validate_with_reasons(candidate: CandidateResult) -> ValidationOutcome:
     )
 
 
-def validate_candidate_result(candidate: CandidateResult) -> bool:
-    return bool(validate_with_reasons(candidate).accepted)
+def validate_candidate_result(
+    candidate: CandidateResult,
+    tolerance_profile: Optional[ValidationToleranceProfile] = None,
+) -> bool:
+    return bool(validate_with_reasons(candidate, tolerance_profile=tolerance_profile).accepted)
 
 
 def _stable_reason_salt(reasons: Sequence[str]) -> int:
@@ -1624,6 +1781,8 @@ def emit_validation_payload(
     global_attempt: int,
     candidate: CandidateResult,
     outcome: ValidationOutcome,
+    tolerance_profile: Optional[ValidationToleranceProfile] = None,
+    tolerance_runtime: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     payload = {
         "ts": time.time(),
@@ -1647,6 +1806,8 @@ def emit_validation_payload(
             "shift_strength": float(candidate.profile.shift_strength),
             "palette_bias": [float(x) for x in candidate.profile.palette_bias],
         },
+        "tolerance_profile": (tolerance_profile.to_dict() if tolerance_profile is not None else None),
+        "tolerance_runtime": ({str(k): float(v) for k, v in tolerance_runtime.items()} if tolerance_runtime is not None else None),
     }
 
     out = Path(output_dir)
@@ -1818,9 +1979,10 @@ def generate_candidate_from_seed(seed: int) -> CandidateResult:
 def generate_and_validate_from_seed(
     seed: int,
     max_repair_rounds: int = MAX_REPAIR_ROUNDS,
+    tolerance_profile: Optional[ValidationToleranceProfile] = None,
 ) -> Tuple[CandidateResult, ValidationOutcome]:
     candidate = generate_candidate_from_seed(seed)
-    outcome = validate_with_reasons(candidate)
+    outcome = validate_with_reasons(candidate, tolerance_profile=tolerance_profile)
 
     trace: List[Dict[str, Any]] = [{
         "round": 0,
@@ -1857,7 +2019,7 @@ def generate_and_validate_from_seed(
         )
         repaired_candidate.metrics["repair_round"] = float(repair_round)
 
-        repaired_outcome = validate_with_reasons(repaired_candidate)
+        repaired_outcome = validate_with_reasons(repaired_candidate, tolerance_profile=tolerance_profile)
         trace.append({
             "round": int(repair_round),
             "seed": int(repaired_candidate.seed),
@@ -1961,9 +2123,10 @@ def candidate_row(
     outcome: Optional[ValidationOutcome] = None,
     image_name: Optional[str] = None,
     image_path: Optional[str] = None,
+    tolerance_profile: Optional[ValidationToleranceProfile] = None,
 ) -> Dict[str, object]:
     if outcome is None:
-        outcome = validate_with_reasons(candidate)
+        outcome = validate_with_reasons(candidate, tolerance_profile=tolerance_profile)
 
     rs = candidate.ratios
     metrics = candidate.metrics
@@ -1993,6 +2156,7 @@ def candidate_row(
         "bestof_score": round(float(outcome.bestof_score), 6),
         "accepted": int(outcome.accepted),
         "reasons": "|".join(outcome.reasons),
+        "tolerance_relax_level": round(float((tolerance_profile.relax_level if tolerance_profile is not None else 0.0)), 6),
         "image_name": image_name or "",
         "image_path": image_path or "",
     }
@@ -2049,6 +2213,12 @@ async def async_generate_all(
     machine_intensity: float = DEFAULT_MACHINE_INTENSITY,
     resource_sample_every_batches: int = DEFAULT_RESOURCE_SAMPLE_EVERY_BATCHES,
     live_console: bool = True,
+    dynamic_tolerance_enabled: bool = DEFAULT_DYNAMIC_TOLERANCE_ENABLED,
+    rejection_rate_window: int = DEFAULT_REJECTION_RATE_WINDOW,
+    rejection_rate_high: float = DEFAULT_REJECTION_RATE_HIGH,
+    rejection_rate_low: float = DEFAULT_REJECTION_RATE_LOW,
+    tolerance_min_attempts: int = DEFAULT_TOLERANCE_MIN_ATTEMPTS,
+    tolerance_relax_step: float = DEFAULT_TOLERANCE_RELAX_STEP,
 ) -> List[Dict[str, object]]:
     output_dir = ensure_output_dir(output_dir)
     validate_generation_request(
@@ -2074,6 +2244,16 @@ async def async_generate_all(
     batch_counter = 0
     loop = asyncio.get_running_loop()
 
+    tolerance_outcomes: List[bool] = []
+    tolerance_relax_level = 0.0
+    tolerance_profile = build_validation_tolerance_profile(tolerance_relax_level)
+    tolerance_runtime = {
+        "rejection_rate": 0.0,
+        "window_count": 0.0,
+        "relax_before": 0.0,
+        "relax_after": 0.0,
+    }
+
     for target_index in range(1, target_count + 1):
         local_attempt = 1
 
@@ -2094,6 +2274,17 @@ async def async_generate_all(
                         reason="memory_pressure",
                     ).normalized()
 
+            tolerance_relax_level, tolerance_profile, tolerance_runtime = adapt_tolerance_relax_level(
+                tolerance_relax_level,
+                tolerance_outcomes,
+                window=rejection_rate_window,
+                rejection_rate_high=rejection_rate_high,
+                rejection_rate_low=rejection_rate_low,
+                min_attempts=tolerance_min_attempts,
+                relax_step=tolerance_relax_step,
+                enabled=dynamic_tolerance_enabled,
+            )
+
             batch = build_batch(target_index, local_attempt, tuning.attempt_batch_size, base_seed)
             use_parallel = bool(tuning.parallel_attempts and tuning.max_workers > 1 and len(batch) > 1)
 
@@ -2101,11 +2292,11 @@ async def async_generate_all(
             if use_parallel:
                 pool = get_process_pool(tuning.max_workers)
                 for attempt_no, seed in batch:
-                    fut = loop.run_in_executor(pool, generate_and_validate_from_seed, seed)
+                    fut = loop.run_in_executor(pool, generate_and_validate_from_seed, seed, MAX_REPAIR_ROUNDS, tolerance_profile)
                     tasks.append(asyncio.create_task(_await_attempt(fut, attempt_no, seed)))
             else:
                 attempt_no, seed = batch[0]
-                fut = loop.run_in_executor(None, generate_and_validate_from_seed, seed)
+                fut = loop.run_in_executor(None, generate_and_validate_from_seed, seed, MAX_REPAIR_ROUNDS, tolerance_profile)
                 tasks.append(asyncio.create_task(_await_attempt(fut, attempt_no, seed)))
 
             counters.in_flight = len(tasks)
@@ -2126,12 +2317,16 @@ async def async_generate_all(
                     global_attempt=counters.attempts,
                     candidate=candidate,
                     outcome=outcome,
+                    tolerance_profile=tolerance_profile,
+                    tolerance_runtime=tolerance_runtime,
                 )
 
                 if outcome.accepted:
                     counters.passed_validation += 1
+                    tolerance_outcomes.append(True)
                 else:
                     counters.rejected += 1
+                    tolerance_outcomes.append(False)
 
                 ordered_results.append((attempt_no, candidate, outcome))
 
@@ -2165,6 +2360,7 @@ async def async_generate_all(
                 accepted_outcome,
                 image_name=saved_path.name,
                 image_path=str(saved_path),
+                tolerance_profile=tolerance_profile,
             ))
             counters.accepted += 1
 
@@ -2194,6 +2390,10 @@ async def async_generate_all(
         "motif_scale": float(MOTIF_SCALE),
         "bestof_required": bool(BESTOF_REQUIRED),
         "bestof_min_score": float(BESTOF_MIN_SCORE),
+        "dynamic_tolerance_enabled": bool(dynamic_tolerance_enabled),
+        "tolerance_relax_level_final": float(tolerance_relax_level),
+        "tolerance_profile_final": tolerance_profile.to_dict(),
+        "tolerance_runtime_final": {str(k): float(v) for k, v in tolerance_runtime.items()},
     }
     (Path(output_dir) / "run_summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2),
@@ -2223,6 +2423,12 @@ def parse_cli_args() -> argparse.Namespace:
     parser.add_argument("--attempt-batch-size", type=int, default=None)
     parser.add_argument("--machine-intensity", type=float, default=DEFAULT_MACHINE_INTENSITY)
     parser.add_argument("--disable-parallel-attempts", action="store_true")
+    parser.add_argument("--disable-dynamic-tolerance", action="store_true")
+    parser.add_argument("--rejection-rate-window", type=int, default=DEFAULT_REJECTION_RATE_WINDOW)
+    parser.add_argument("--rejection-rate-high", type=float, default=DEFAULT_REJECTION_RATE_HIGH)
+    parser.add_argument("--rejection-rate-low", type=float, default=DEFAULT_REJECTION_RATE_LOW)
+    parser.add_argument("--tolerance-min-attempts", type=int, default=DEFAULT_TOLERANCE_MIN_ATTEMPTS)
+    parser.add_argument("--tolerance-relax-step", type=float, default=DEFAULT_TOLERANCE_RELAX_STEP)
     parser.add_argument("--no-live-console", action="store_true")
     parser.add_argument("--random-seed", type=int, default=12345)
     return parser.parse_args()
@@ -2252,6 +2458,12 @@ def main() -> None:
                 parallel_attempts=not args.disable_parallel_attempts,
                 machine_intensity=args.machine_intensity,
                 live_console=not args.no_live_console,
+                dynamic_tolerance_enabled=not args.disable_dynamic_tolerance,
+                rejection_rate_window=args.rejection_rate_window,
+                rejection_rate_high=args.rejection_rate_high,
+                rejection_rate_low=args.rejection_rate_low,
+                tolerance_min_attempts=args.tolerance_min_attempts,
+                tolerance_relax_step=args.tolerance_relax_step,
             )
         )
         csv_path = Path(args.output_dir) / "rapport_textures.csv"
