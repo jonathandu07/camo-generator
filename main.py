@@ -969,10 +969,10 @@ def sequential_assign(
     remaining = np.ones((height, width), dtype=bool)
 
     guide_flat = macro_guide.ravel() if macro_guide is not None else None
-    prior_flat = macro_prior.reshape(macro_prior.shape[0], -1).astype(np.float32, copy=False) if macro_prior is not None else None
-    prior_flat = macro_prior.reshape(macro_prior.shape[0], -1).astype(np.float32, copy=False) if macro_prior is not None else None
-    prior_flat = macro_prior.reshape(macro_prior.shape[0], -1).astype(np.float32, copy=False) if macro_prior is not None else None
-    prior_flat = macro_prior.reshape(macro_prior.shape[0], -1) if macro_prior is not None else None
+    prior_flat = (
+        macro_prior.reshape(macro_prior.shape[0], -1).astype(np.float32, copy=False)
+        if macro_prior is not None else None
+    )
 
     for c in (IDX_1, IDX_2, IDX_3):
         count = int(target_counts[c])
@@ -1012,6 +1012,10 @@ def exactify_proportions(
 
     flat_fields = fields.reshape(n_classes, -1).astype(np.float32, copy=False)
     guide_flat = macro_guide.ravel() if macro_guide is not None else None
+    prior_flat = (
+        macro_prior.reshape(macro_prior.shape[0], -1).astype(np.float32, copy=False)
+        if macro_prior is not None else None
+    )
 
     for _ in range(24):
         counts = np.bincount(labels.ravel(), minlength=n_classes)
@@ -1085,6 +1089,10 @@ def force_exact_target_counts_relaxed(
     flat_fields = fields.reshape(fields.shape[0], -1).astype(np.float32, copy=False)
     shape = labels.shape
     guide_flat = macro_guide.ravel() if macro_guide is not None else None
+    prior_flat = (
+        macro_prior.reshape(macro_prior.shape[0], -1).astype(np.float32, copy=False)
+        if macro_prior is not None else None
+    )
 
     for _ in range(16):
         counts = np.bincount(flat_labels, minlength=fields.shape[0]).astype(int)
@@ -1161,6 +1169,10 @@ def force_exact_target_counts(
     flat_fields = fields.reshape(fields.shape[0], -1).astype(np.float32, copy=False)
     shape = labels.shape
     guide_flat = macro_guide.ravel() if macro_guide is not None else None
+    prior_flat = (
+        macro_prior.reshape(macro_prior.shape[0], -1).astype(np.float32, copy=False)
+        if macro_prior is not None else None
+    )
 
     for _ in range(16):
         counts = np.bincount(flat_labels, minlength=fields.shape[0]).astype(int)
