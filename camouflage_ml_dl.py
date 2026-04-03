@@ -36,14 +36,18 @@ import numpy as np
 try:
     import torch
     from torch import nn
-    from torch.utils.data import DataLoader, TensorDataset
+    from torch.utils.data import DataLoader, TensorDataset, random_split
     TORCH_AVAILABLE = True
-except Exception:  # pragma: no cover
+except Exception as exc:  # pragma: no cover
     torch = None
     nn = None
     DataLoader = None
     TensorDataset = None
+    random_split = None
     TORCH_AVAILABLE = False
+    TORCH_IMPORT_ERROR = exc
+else:
+    TORCH_IMPORT_ERROR = None
 
 def _resolve_camo_module():
     """
@@ -82,6 +86,13 @@ FEATURE_KEYS: tuple[str, ...] = (
     "edge_contact_ratio",
     "overscan",
     "shift_strength",
+    "weak_ratio",
+    "micro_components_per_mp",
+    "orphan_ratio",
+    "mode_filtered_ratio",
+    "macro_prior_agreement",
+    "macro_guide_agreement",
+    "anti_pixel_enabled",
 )
 
 FAILURE_KEYS: tuple[str, ...] = (
@@ -99,6 +110,9 @@ FAILURE_KEYS: tuple[str, ...] = (
     "mirror_similarity_high",
     "largest_olive_component_ratio_low",
     "edge_contact_ratio_high",
+    "weak_ratio_high",
+    "micro_components_high",
+    "orphan_ratio_high",
 )
 
 # Chaque action représente une politique déterministe de dérivation de seed.
@@ -136,6 +150,9 @@ class MLDLConfig:
     alpha_ucb: float = 1.25
     min_train_size: int = 32
     retrain_every: int = 24
+    val_split: float = 0.15
+    early_stopping_patience: int = 6
+    early_stopping_min_delta: float = 1e-4
     random_seed: int = 12345
 
 
@@ -179,6 +196,8 @@ def candidate_to_feature_dict(candidate: camo.CandidateResult) -> Dict[str, floa
     rs = np.asarray(candidate.ratios, dtype=float)
     abs_err = np.abs(rs - camo.TARGET)
     m = dict(candidate.metrics)
+    pixel_count = max(1, int(candidate.label_map.size))
+    mode_filtered_pixels = _safe_float(m.get("mode_filtered_pixels", 0.0))
     return {
         "ratio_coyote": float(rs[camo.IDX_0]),
         "ratio_olive": float(rs[camo.IDX_1]),
@@ -197,6 +216,13 @@ def candidate_to_feature_dict(candidate: camo.CandidateResult) -> Dict[str, floa
         "edge_contact_ratio": _safe_float(m.get("edge_contact_ratio", 0.0)),
         "overscan": _safe_float(m.get("overscan", 0.0)),
         "shift_strength": _safe_float(m.get("shift_strength", 0.0)),
+        "weak_ratio": _safe_float(m.get("weak_ratio", 0.0)),
+        "micro_components_per_mp": _safe_float(m.get("micro_components_per_mp", 0.0)),
+        "orphan_ratio": _safe_float(m.get("orphan_ratio", 0.0)),
+        "mode_filtered_ratio": float(mode_filtered_pixels / pixel_count),
+        "macro_prior_agreement": _safe_float(m.get("macro_prior_agreement", 0.0)),
+        "macro_guide_agreement": _safe_float(m.get("macro_guide_agreement", 0.0)),
+        "anti_pixel_enabled": _safe_float(m.get("anti_pixel_enabled", 0.0)),
     }
 
 
@@ -237,6 +263,12 @@ def analyze_rejection(candidate: camo.CandidateResult, target_index: int, local_
         failures.append("largest_olive_component_ratio_low")
     if feat["edge_contact_ratio"] > float(camo.MAX_EDGE_CONTACT_RATIO):
         failures.append("edge_contact_ratio_high")
+    if feat["weak_ratio"] > 0.010:
+        failures.append("weak_ratio_high")
+    if feat["micro_components_per_mp"] > float(getattr(camo, "MAX_MICRO_ISLANDS_PER_MP", 0.0)):
+        failures.append("micro_components_high")
+    if feat["orphan_ratio"] > float(getattr(camo, "MAX_ORPHAN_RATIO", 0.0)):
+        failures.append("orphan_ratio_high")
 
     severity = 0.0
     severity += 100.0 * feat["mean_abs_error"]
@@ -245,6 +277,9 @@ def analyze_rejection(candidate: camo.CandidateResult, target_index: int, local_
     severity += max(0.0, feat["mirror_similarity"] - float(camo.MAX_MIRROR_SIMILARITY)) * 5.0
     severity += max(0.0, float(camo.MIN_LARGEST_COMPONENT_RATIO_CLASS_1) - feat["largest_component_ratio_class_1"]) * 10.0
     severity += max(0.0, feat["edge_contact_ratio"] - float(camo.MAX_EDGE_CONTACT_RATIO)) * 10.0
+    severity += feat["weak_ratio"] * 40.0
+    severity += feat["micro_components_per_mp"] * 0.30
+    severity += feat["orphan_ratio"] * 1000.0
 
     if not failures:
         notes.append("Validation négative sans règle identifiée ; vérifier les données.")
@@ -295,6 +330,12 @@ def candidate_reward(candidate: camo.CandidateResult, accepted: bool) -> float:
     score += 0.45 * feat["largest_component_ratio_class_1"]
     score += 0.20 * (1.0 - min(1.0, feat["mirror_similarity"]))
     score += 0.15 * (1.0 - min(1.0, feat["edge_contact_ratio"]))
+    score += 0.20 * feat["macro_prior_agreement"]
+    score += 0.15 * feat["macro_guide_agreement"]
+    score -= 8.0 * feat["weak_ratio"]
+    score -= 0.25 * feat["micro_components_per_mp"]
+    score -= 25.0 * feat["orphan_ratio"]
+    score -= 12.0 * feat["mode_filtered_ratio"]
     return float(score)
 
 
@@ -368,54 +409,98 @@ if TORCH_AVAILABLE:
 
 class DeepSurrogate:
     def __init__(self, input_dim: int, hidden_dim: int = 128, lr: float = 1e-3, device: str = "cpu") -> None:
+        if not TORCH_AVAILABLE:
+            raise RuntimeError(
+                "PyTorch est requis pour ce script : le deep learning doit être réellement entraîné, "
+                f"or l'import de torch a échoué: {TORCH_IMPORT_ERROR!r}"
+            )
+
         self.input_dim = int(input_dim)
         self.scaler = Standardizer(input_dim)
         self.reward_mean = 0.0
         self.reward_std = 1.0
         self.trained = False
-        self.torch_enabled = TORCH_AVAILABLE
-        self.device = device if device != "auto" else ("cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu")
+        self.torch_enabled = True
+        self.device = device if device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
 
-        if self.torch_enabled:
-            self._torch_device = torch.device(self.device)
-            self.model = SurrogateNet(input_dim=input_dim, hidden_dim=hidden_dim).to(self._torch_device)
-            self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-4)
-            self.loss_bce = nn.BCEWithLogitsLoss()
-            self.loss_mse = nn.MSELoss()
-        else:
-            self.model = None
+        self._torch_device = torch.device(self.device)
+        self.model = SurrogateNet(input_dim=input_dim, hidden_dim=hidden_dim).to(self._torch_device)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-4)
+        self.loss_bce = nn.BCEWithLogitsLoss()
+        self.loss_mse = nn.MSELoss()
 
-    def fit(self, features: np.ndarray, valid: np.ndarray, rewards: np.ndarray, epochs: int = 20, batch_size: int = 32) -> Dict[str, float]:
+    def fit(
+        self,
+        features: np.ndarray,
+        valid: np.ndarray,
+        rewards: np.ndarray,
+        epochs: int = 20,
+        batch_size: int = 32,
+        val_split: float = 0.15,
+        patience: int = 6,
+        min_delta: float = 1e-4,
+        random_seed: int = 12345,
+    ) -> Dict[str, float]:
         x = np.asarray(features, dtype=np.float32)
         y_valid = np.asarray(valid, dtype=np.float32)
         y_reward = np.asarray(rewards, dtype=np.float32)
+
+        if len(x) < 2:
+            raise ValueError("Le deep learning nécessite au moins 2 échantillons.")
+
         self.scaler.fit(x)
         self.reward_mean = float(np.mean(y_reward)) if len(y_reward) else 0.0
         self.reward_std = float(np.std(y_reward)) if len(y_reward) else 1.0
         if self.reward_std < 1e-6:
             self.reward_std = 1.0
 
-        if not self.torch_enabled:
-            self.trained = True
-            return {"loss": 0.0, "loss_valid": 0.0, "loss_reward": 0.0}
-
         x_norm = self.scaler.transform(x)
         y_reward_norm = (y_reward - self.reward_mean) / self.reward_std
+
         ds = TensorDataset(
             torch.from_numpy(x_norm),
             torch.from_numpy(y_valid),
             torch.from_numpy(y_reward_norm.astype(np.float32)),
         )
-        dl = DataLoader(ds, batch_size=min(batch_size, len(ds)), shuffle=True)
 
-        self.model.train()
-        last = {"loss": 0.0, "loss_valid": 0.0, "loss_reward": 0.0}
-        for _ in range(max(1, int(epochs))):
-            agg_loss = 0.0
-            agg_bce = 0.0
-            agg_mse = 0.0
-            agg_count = 0
-            for xb, yb_valid, yb_reward in dl:
+        n_total = len(ds)
+        n_val = max(1, int(round(n_total * max(0.0, min(0.40, float(val_split))))))
+        n_train = max(1, n_total - n_val)
+        if n_train + n_val > n_total:
+            n_val = n_total - n_train
+        if n_val <= 0:
+            n_val = 1
+            n_train = max(1, n_total - 1)
+
+        generator = torch.Generator().manual_seed(int(random_seed))
+        train_ds, val_ds = random_split(ds, [n_train, n_val], generator=generator)
+
+        train_dl = DataLoader(train_ds, batch_size=min(batch_size, len(train_ds)), shuffle=True)
+        val_dl = DataLoader(val_ds, batch_size=min(batch_size, len(val_ds)), shuffle=False)
+
+        best_state = None
+        best_val_loss = float("inf")
+        best_epoch = 0
+        no_improve = 0
+        last = {
+            "epoch": 0.0,
+            "train_loss": 0.0,
+            "train_loss_valid": 0.0,
+            "train_loss_reward": 0.0,
+            "val_loss": 0.0,
+            "val_loss_valid": 0.0,
+            "val_loss_reward": 0.0,
+            "best_epoch": 0.0,
+        }
+
+        for epoch in range(1, max(1, int(epochs)) + 1):
+            self.model.train()
+            agg_train_loss = 0.0
+            agg_train_bce = 0.0
+            agg_train_mse = 0.0
+            agg_train_count = 0
+
+            for xb, yb_valid, yb_reward in train_dl:
                 xb = xb.to(self._torch_device)
                 yb_valid = yb_valid.to(self._torch_device)
                 yb_reward = yb_reward.to(self._torch_device)
@@ -429,39 +514,81 @@ class DeepSurrogate:
                 self.optimizer.step()
 
                 bs = int(xb.shape[0])
-                agg_count += bs
-                agg_loss += float(loss.item()) * bs
-                agg_bce += float(loss_valid.item()) * bs
-                agg_mse += float(loss_reward.item()) * bs
+                agg_train_count += bs
+                agg_train_loss += float(loss.item()) * bs
+                agg_train_bce += float(loss_valid.item()) * bs
+                agg_train_mse += float(loss_reward.item()) * bs
+
+            self.model.eval()
+            agg_val_loss = 0.0
+            agg_val_bce = 0.0
+            agg_val_mse = 0.0
+            agg_val_count = 0
+
+            with torch.no_grad():
+                for xb, yb_valid, yb_reward in val_dl:
+                    xb = xb.to(self._torch_device)
+                    yb_valid = yb_valid.to(self._torch_device)
+                    yb_reward = yb_reward.to(self._torch_device)
+
+                    logit_valid, pred_reward = self.model(xb)
+                    loss_valid = self.loss_bce(logit_valid, yb_valid)
+                    loss_reward = self.loss_mse(pred_reward, yb_reward)
+                    loss = loss_valid + 0.7 * loss_reward
+
+                    bs = int(xb.shape[0])
+                    agg_val_count += bs
+                    agg_val_loss += float(loss.item()) * bs
+                    agg_val_bce += float(loss_valid.item()) * bs
+                    agg_val_mse += float(loss_reward.item()) * bs
+
+            train_loss = agg_train_loss / max(1, agg_train_count)
+            train_bce = agg_train_bce / max(1, agg_train_count)
+            train_mse = agg_train_mse / max(1, agg_train_count)
+            val_loss = agg_val_loss / max(1, agg_val_count)
+            val_bce = agg_val_bce / max(1, agg_val_count)
+            val_mse = agg_val_mse / max(1, agg_val_count)
+
             last = {
-                "loss": agg_loss / max(1, agg_count),
-                "loss_valid": agg_bce / max(1, agg_count),
-                "loss_reward": agg_mse / max(1, agg_count),
+                "epoch": float(epoch),
+                "train_loss": float(train_loss),
+                "train_loss_valid": float(train_bce),
+                "train_loss_reward": float(train_mse),
+                "val_loss": float(val_loss),
+                "val_loss_valid": float(val_bce),
+                "val_loss_reward": float(val_mse),
+                "best_epoch": float(best_epoch),
             }
+
+            if val_loss + float(min_delta) < best_val_loss:
+                best_val_loss = float(val_loss)
+                best_epoch = int(epoch)
+                best_state = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
+                no_improve = 0
+            else:
+                no_improve += 1
+
+            if no_improve >= max(1, int(patience)):
+                break
+
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
+
         self.trained = True
+        last["best_epoch"] = float(best_epoch)
+        last["best_val_loss"] = float(best_val_loss if best_val_loss < float("inf") else last["val_loss"])
         return last
 
     def predict(self, features: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        if not self.trained:
+            raise RuntimeError("Le surrogate DL n'est pas encore entraîné.")
+
         x = np.asarray(features, dtype=np.float32)
         one = False
         if x.ndim == 1:
             x = x[None, :]
             one = True
         x_norm = self.scaler.transform(x)
-
-        if not self.torch_enabled or self.model is None:
-            # Fallback déterministe sans torch : heuristique sur les features.
-            prob_valid = np.clip(1.0 - x[:, FEATURE_KEYS.index("mean_abs_error")] * 200.0, 0.0, 1.0).astype(np.float32)
-            reward = (
-                1.0
-                - 100.0 * x[:, FEATURE_KEYS.index("mean_abs_error")]
-                + 0.5 * x[:, FEATURE_KEYS.index("largest_component_ratio_class_1")]
-                - 0.3 * x[:, FEATURE_KEYS.index("mirror_similarity")]
-                - 0.2 * x[:, FEATURE_KEYS.index("edge_contact_ratio")]
-            ).astype(np.float32)
-            if one:
-                return prob_valid[:1], reward[:1]
-            return prob_valid, reward
 
         with torch.no_grad():
             xt = torch.from_numpy(x_norm).to(self._torch_device)
@@ -483,20 +610,14 @@ class DeepSurrogate:
         }
         if self.torch_enabled and self.model is not None:
             payload["model"] = self.model.state_dict()
-        if TORCH_AVAILABLE:
-            torch.save(payload, path)
-        else:  # pragma: no cover
-            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        torch.save(payload, path)
 
     def load(self, path: Path) -> None:
         if not path.exists():
             return
-        if self.torch_enabled and TORCH_AVAILABLE:
-            payload = torch.load(path, map_location=self._torch_device)
-            if "model" in payload and self.model is not None:
-                self.model.load_state_dict(payload["model"])
-        else:  # pragma: no cover
-            payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = torch.load(path, map_location=self._torch_device)
+        if "model" in payload and self.model is not None:
+            self.model.load_state_dict(payload["model"])
         self.scaler.load_state_dict(payload["scaler"])
         self.reward_mean = float(payload.get("reward_mean", 0.0))
         self.reward_std = float(payload.get("reward_std", 1.0))
@@ -622,6 +743,30 @@ class CamouflageMLDLGenerator:
         self.training_log: List[Dict[str, Any]] = []
         self.last_rejected_candidate: Optional[camo.CandidateResult] = None
         self.last_analysis: Optional[RejectionAnalysis] = None
+        self._maybe_load_existing_state()
+
+    def _maybe_load_existing_state(self) -> None:
+        checkpoint = self.output_dir / self.cfg.checkpoint_name
+        dataset = self.output_dir / self.cfg.dataset_name
+
+        if dataset.exists():
+            try:
+                data = np.load(dataset)
+                x = np.asarray(data["x"], dtype=np.float32)
+                y_valid = np.asarray(data["y_valid"], dtype=np.float32)
+                y_reward = np.asarray(data["y_reward"], dtype=np.float32)
+                if len(x):
+                    self.buffer.features = [row.astype(np.float32) for row in x]
+                    self.buffer.valid = [float(v) for v in y_valid.tolist()]
+                    self.buffer.rewards = [float(v) for v in y_reward.tolist()]
+            except Exception:
+                pass
+
+        if checkpoint.exists():
+            try:
+                self.surrogate.load(checkpoint)
+            except Exception:
+                pass
 
     @staticmethod
     def _resolve_device(device: str) -> str:
@@ -651,6 +796,10 @@ class CamouflageMLDLGenerator:
             y_reward,
             epochs=self.cfg.train_epochs,
             batch_size=self.cfg.batch_size,
+            val_split=self.cfg.val_split,
+            patience=self.cfg.early_stopping_patience,
+            min_delta=self.cfg.early_stopping_min_delta,
+            random_seed=self.cfg.random_seed,
         )
         self.training_log.append({
             "n_samples": int(len(x)),
@@ -685,8 +834,8 @@ class CamouflageMLDLGenerator:
                 pred_valid_f = float(prob_valid[0])
                 pred_reward_f = float(pred_reward[0])
             else:
-                pred_valid_f = max(0.0, min(1.0, 1.0 - candidate_to_feature_dict(candidate)["mean_abs_error"] * 200.0))
-                pred_reward_f = candidate_reward(candidate, accepted=False)
+                pred_valid_f = 0.5
+                pred_reward_f = 0.0
             proposals.append(Proposal(
                 seed=seed,
                 action_idx=action_idx,
@@ -831,6 +980,9 @@ def parse_args() -> MLDLConfig:
     parser.add_argument("--alpha-ucb", type=float, default=1.25)
     parser.add_argument("--min-train-size", type=int, default=32)
     parser.add_argument("--retrain-every", type=int, default=24)
+    parser.add_argument("--val-split", type=float, default=0.15)
+    parser.add_argument("--early-stopping-patience", type=int, default=6)
+    parser.add_argument("--early-stopping-min-delta", type=float, default=1e-4)
     parser.add_argument("--random-seed", type=int, default=12345)
     args = parser.parse_args()
     return MLDLConfig(
@@ -849,6 +1001,9 @@ def parse_args() -> MLDLConfig:
         alpha_ucb=args.alpha_ucb,
         min_train_size=args.min_train_size,
         retrain_every=args.retrain_every,
+        val_split=args.val_split,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_min_delta=args.early_stopping_min_delta,
         random_seed=args.random_seed,
     )
 
@@ -870,6 +1025,9 @@ def build_config_from_main_args(args: Any) -> MLDLConfig:
         alpha_ucb=float(getattr(args, "mldl_alpha_ucb", 1.25)),
         min_train_size=int(getattr(args, "mldl_min_train_size", 32)),
         retrain_every=int(getattr(args, "mldl_retrain_every", 24)),
+        val_split=float(getattr(args, "mldl_val_split", 0.15)),
+        early_stopping_patience=int(getattr(args, "mldl_early_stopping_patience", 6)),
+        early_stopping_min_delta=float(getattr(args, "mldl_early_stopping_min_delta", 1e-4)),
         random_seed=int(getattr(args, "random_seed", 12345)),
     )
 
