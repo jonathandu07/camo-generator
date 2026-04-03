@@ -167,7 +167,7 @@ THUMB_SIZE = (320, 320)
 GALLERY_COLUMNS = 3
 MAX_GALLERY_ITEMS = 24
 SCRIPT_DIR = Path(__file__).resolve().parent
-SOLDIER_MODEL_BASENAMES = ("soldat_modele_vert.png", "1774949910078.png", "soldat_modele.png")
+SOLDIER_MODEL_BASENAMES = ("soldat_modele_vert.png", "file_000000001604724685750b386a71249d.png", "soldat_modele.png")
 
 ES_CONTINUOUS = 0x80000000
 ES_SYSTEM_REQUIRED = 0x00000001
