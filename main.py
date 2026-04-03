@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 
 try:
     import psutil  # type: ignore
@@ -160,6 +160,11 @@ DEFAULT_REJECTION_RATE_LOW = 0.55
 DEFAULT_TOLERANCE_MIN_ATTEMPTS = 24
 DEFAULT_TOLERANCE_RELAX_STEP = 0.08
 MAX_TOLERANCE_RELAX = 0.40
+
+# Anti-pixellisation.
+DEFAULT_ENABLE_ANTI_PIXEL = True
+ANTI_PIXEL_MODE_FILTER_SIZE = 3
+ANTI_PIXEL_PASSES = 1
 
 
 # ============================================================
@@ -771,6 +776,13 @@ def resize_nearest_2d(arr: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
     return arr[np.ix_(y_idx, x_idx)]
 
 
+def resize_linear_2d(arr: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+    arr_u8 = np.clip(np.asarray(arr, dtype=np.float32) * 255.0, 0.0, 255.0).astype(np.uint8)
+    img = Image.fromarray(arr_u8, mode="L")
+    out = img.resize((int(out_w), int(out_h)), resample=Image.Resampling.BICUBIC)
+    return np.asarray(out, dtype=np.float32) / 255.0
+
+
 # ============================================================
 # GÉNÉRATEUR
 # ============================================================
@@ -950,12 +962,17 @@ def sequential_assign(
     fields: np.ndarray,
     target_counts: np.ndarray,
     macro_guide: Optional[np.ndarray] = None,
+    macro_prior: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     _, height, width = fields.shape
     labels = np.zeros((height, width), dtype=np.uint8)
     remaining = np.ones((height, width), dtype=bool)
 
     guide_flat = macro_guide.ravel() if macro_guide is not None else None
+    prior_flat = macro_prior.reshape(macro_prior.shape[0], -1).astype(np.float32, copy=False) if macro_prior is not None else None
+    prior_flat = macro_prior.reshape(macro_prior.shape[0], -1).astype(np.float32, copy=False) if macro_prior is not None else None
+    prior_flat = macro_prior.reshape(macro_prior.shape[0], -1).astype(np.float32, copy=False) if macro_prior is not None else None
+    prior_flat = macro_prior.reshape(macro_prior.shape[0], -1) if macro_prior is not None else None
 
     for c in (IDX_1, IDX_2, IDX_3):
         count = int(target_counts[c])
@@ -969,9 +986,11 @@ def sequential_assign(
             g = guide_flat[remaining_flat]
             score = score + np.where(
                 g == c,
-                np.float32(MACRO_GUIDE_BONUS),
-                np.float32(-MACRO_GUIDE_PENALTY),
+                np.float32(MACRO_GUIDE_BONUS * 0.35),
+                np.float32(-MACRO_GUIDE_PENALTY * 0.25),
             )
+        if prior_flat is not None:
+            score = score + np.float32(MACRO_GUIDE_BONUS) * prior_flat[c, remaining_flat].astype(np.float32)
 
         best_local = np.argpartition(score, -count)[-count:]
         selected_flat = remaining_flat[best_local]
@@ -986,6 +1005,7 @@ def exactify_proportions(
     fields: np.ndarray,
     target_counts: np.ndarray,
     macro_guide: Optional[np.ndarray] = None,
+    macro_prior: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     n_classes, height, width = fields.shape
     labels = labels.copy()
@@ -1032,8 +1052,11 @@ def exactify_proportions(
             gain -= COHERENCE_GAIN_WEIGHT * np.maximum(0.0, same[idx] - 4.0)
 
             if guide_flat is not None:
-                gain += np.where(guide_flat[idx] == u, MACRO_GUIDE_BONUS, 0.0).astype(np.float32)
-                gain -= np.where(guide_flat[idx] == current, MACRO_GUIDE_PENALTY, 0.0).astype(np.float32)
+                gain += np.where(guide_flat[idx] == u, MACRO_GUIDE_BONUS * 0.35, 0.0).astype(np.float32)
+                gain -= np.where(guide_flat[idx] == current, MACRO_GUIDE_PENALTY * 0.25, 0.0).astype(np.float32)
+            if prior_flat is not None:
+                gain += MACRO_GUIDE_BONUS * prior_flat[u, idx]
+                gain -= MACRO_GUIDE_PENALTY * prior_flat[current, idx]
 
             order = np.argsort(gain)[::-1]
             selected = idx[order[:need]]
@@ -1055,6 +1078,7 @@ def force_exact_target_counts_relaxed(
     fields: np.ndarray,
     target_counts: np.ndarray,
     macro_guide: Optional[np.ndarray] = None,
+    macro_prior: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     labels = labels.copy()
     flat_labels = labels.ravel()
@@ -1099,8 +1123,11 @@ def force_exact_target_counts_relaxed(
 
                 gain = flat_fields[dst, idx_pool] - flat_fields[src, idx_pool]
                 if guide_flat is not None:
-                    gain += np.where(guide_flat[idx_pool] == dst, MACRO_GUIDE_BONUS * 0.5, 0.0).astype(np.float32)
-                    gain -= np.where(guide_flat[idx_pool] == src, MACRO_GUIDE_PENALTY * 0.5, 0.0).astype(np.float32)
+                    gain += np.where(guide_flat[idx_pool] == dst, MACRO_GUIDE_BONUS * 0.20, 0.0).astype(np.float32)
+                    gain -= np.where(guide_flat[idx_pool] == src, MACRO_GUIDE_PENALTY * 0.15, 0.0).astype(np.float32)
+                if prior_flat is not None:
+                    gain += (MACRO_GUIDE_BONUS * 0.5) * prior_flat[dst, idx_pool]
+                    gain -= (MACRO_GUIDE_PENALTY * 0.5) * prior_flat[src, idx_pool]
 
                 order = np.argsort(gain)[::-1]
                 picked = idx_pool[order[:take]]
@@ -1127,6 +1154,7 @@ def force_exact_target_counts(
     fields: np.ndarray,
     target_counts: np.ndarray,
     macro_guide: Optional[np.ndarray] = None,
+    macro_prior: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     labels = labels.copy()
     flat_labels = labels.ravel()
@@ -1186,8 +1214,11 @@ def force_exact_target_counts(
                 gain -= COHERENCE_GAIN_WEIGHT * np.maximum(0.0, same[idx_pool] - 4.0)
 
                 if guide_flat is not None:
-                    gain += np.where(guide_flat[idx_pool] == dst, MACRO_GUIDE_BONUS, 0.0).astype(np.float32)
-                    gain -= np.where(guide_flat[idx_pool] == src, MACRO_GUIDE_PENALTY, 0.0).astype(np.float32)
+                    gain += np.where(guide_flat[idx_pool] == dst, MACRO_GUIDE_BONUS * 0.35, 0.0).astype(np.float32)
+                    gain -= np.where(guide_flat[idx_pool] == src, MACRO_GUIDE_PENALTY * 0.25, 0.0).astype(np.float32)
+                if prior_flat is not None:
+                    gain += MACRO_GUIDE_BONUS * prior_flat[dst, idx_pool]
+                    gain -= MACRO_GUIDE_PENALTY * prior_flat[src, idx_pool]
 
                 order = np.argsort(gain)[::-1]
                 picked = idx_pool[order[:take]]
@@ -1210,7 +1241,7 @@ def force_exact_target_counts(
 
     counts = np.bincount(labels.ravel(), minlength=fields.shape[0]).astype(int)
     if not np.all(counts == target_counts.astype(int)):
-        labels = force_exact_target_counts_relaxed(labels, fields, target_counts, macro_guide=macro_guide)
+        labels = force_exact_target_counts_relaxed(labels, fields, target_counts, macro_guide=macro_guide, macro_prior=macro_prior)
 
     return labels.astype(np.uint8)
 
@@ -1370,7 +1401,21 @@ def majority_smoothing_pass(
     }
 
 
-def build_macro_guide(fields: np.ndarray) -> np.ndarray:
+def mode_filter_smoothing_pass(
+    label_map: np.ndarray,
+    *,
+    filter_size: int = ANTI_PIXEL_MODE_FILTER_SIZE,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    img = Image.fromarray(label_map.astype(np.uint8), mode="L")
+    out = np.asarray(img.filter(ImageFilter.ModeFilter(size=max(3, int(filter_size)))), dtype=np.uint8)
+    changed = int(np.sum(out != label_map))
+    return out, {
+        "mode_filtered_pixels": int(changed),
+        "mode_filter_size": int(max(3, int(filter_size))),
+    }
+
+
+def build_macro_prior(fields: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     _, height, width = fields.shape
 
     guide_w = int(np.clip(round(width / 48), MACRO_GUIDE_MIN_SIDE, MACRO_GUIDE_MAX_SIDE))
@@ -1384,9 +1429,9 @@ def build_macro_guide(fields: np.ndarray) -> np.ndarray:
     target_counts_small = np.rint(TARGET * (guide_h * guide_w)).astype(int)
     target_counts_small[-1] = (guide_h * guide_w) - int(target_counts_small[:-1].sum())
 
-    guide = sequential_assign(coarse_fields, target_counts_small, macro_guide=None)
-    guide = exactify_proportions(guide, coarse_fields, target_counts_small, macro_guide=None)
-    guide = force_exact_target_counts(guide, coarse_fields, target_counts_small, macro_guide=None)
+    guide = sequential_assign(coarse_fields, target_counts_small, macro_guide=None, macro_prior=None)
+    guide = exactify_proportions(guide, coarse_fields, target_counts_small, macro_guide=None, macro_prior=None)
+    guide = force_exact_target_counts(guide, coarse_fields, target_counts_small, macro_guide=None, macro_prior=None)
 
     guide, _ = cleanup_orphan_pixels(
         guide,
@@ -1409,7 +1454,14 @@ def build_macro_guide(fields: np.ndarray) -> np.ndarray:
         orphan_min_winner_neighbors=5,
     )
 
-    return resize_nearest_2d(guide, height, width).astype(np.uint8, copy=False)
+    soft_prior = np.stack(
+        [resize_linear_2d((guide == cls).astype(np.float32), height, width) for cls in range(N_CLASSES)],
+        axis=0,
+    )
+    denom = np.maximum(np.sum(soft_prior, axis=0, keepdims=True), 1e-6)
+    soft_prior = soft_prior / denom
+    hard_guide = np.argmax(soft_prior, axis=0).astype(np.uint8, copy=False)
+    return hard_guide, soft_prior
 
 
 # ============================================================
@@ -1833,6 +1885,7 @@ def generate_one_variant(
     merge_micro: bool = False,
     rebalance_edges: bool = False,
     anti_mirror: bool = False,
+    anti_pixel: bool = DEFAULT_ENABLE_ANTI_PIXEL,
 ) -> CandidateResult:
     width = int(WIDTH)
     height = int(HEIGHT)
@@ -1853,14 +1906,14 @@ def generate_one_variant(
         motif_scale=motif_scale,
     )
 
-    macro_guide = build_macro_guide(fields)
+    macro_guide, macro_prior = build_macro_prior(fields)
 
     target_counts = np.rint(TARGET * (width * height)).astype(int)
     target_counts[-1] = (width * height) - int(target_counts[:-1].sum())
 
-    label_map = sequential_assign(fields, target_counts, macro_guide=macro_guide)
-    label_map = exactify_proportions(label_map, fields, target_counts, macro_guide=macro_guide)
-    label_map = force_exact_target_counts(label_map, fields, target_counts, macro_guide=macro_guide)
+    label_map = sequential_assign(fields, target_counts, macro_guide=macro_guide, macro_prior=macro_prior)
+    label_map = exactify_proportions(label_map, fields, target_counts, macro_guide=macro_guide, macro_prior=macro_prior)
+    label_map = force_exact_target_counts(label_map, fields, target_counts, macro_guide=macro_guide, macro_prior=macro_prior)
 
     label_map, orphan_info = cleanup_orphan_pixels(
         label_map,
@@ -1906,8 +1959,8 @@ def generate_one_variant(
         orphan_min_winner_neighbors=ORPHAN_MIN_WINNER_NEIGHBORS,
     )
 
-    label_map = exactify_proportions(label_map, fields, target_counts, macro_guide=macro_guide)
-    label_map = force_exact_target_counts(label_map, fields, target_counts, macro_guide=macro_guide)
+    label_map = exactify_proportions(label_map, fields, target_counts, macro_guide=macro_guide, macro_prior=macro_prior)
+    label_map = force_exact_target_counts(label_map, fields, target_counts, macro_guide=macro_guide, macro_prior=macro_prior)
 
     # Sécurité finale : éviter qu'une exactification terminale ne recrée des orphelins.
     label_map, orphan_info_3 = cleanup_orphan_pixels(
@@ -1917,7 +1970,30 @@ def generate_one_variant(
         orphan_max_same_neighbors=ORPHAN_MAX_SAME_NEIGHBORS,
         orphan_min_winner_neighbors=ORPHAN_MIN_WINNER_NEIGHBORS,
     )
-    label_map = force_exact_target_counts(label_map, fields, target_counts, macro_guide=macro_guide)
+    label_map = force_exact_target_counts(label_map, fields, target_counts, macro_guide=macro_guide, macro_prior=macro_prior)
+
+    anti_pixel_info = {"mode_filtered_pixels": 0, "mode_filter_size": 0}
+    if anti_pixel:
+        for _ in range(max(1, int(ANTI_PIXEL_PASSES))):
+            label_map, anti_pixel_info = mode_filter_smoothing_pass(
+                label_map,
+                filter_size=ANTI_PIXEL_MODE_FILTER_SIZE,
+            )
+            label_map = exactify_proportions(label_map, fields, target_counts, macro_guide=macro_guide, macro_prior=macro_prior)
+            label_map = force_exact_target_counts(label_map, fields, target_counts, macro_guide=macro_guide, macro_prior=macro_prior)
+            label_map, _ = cleanup_orphan_pixels(
+                label_map,
+                class_count=N_CLASSES,
+                passes=1,
+                orphan_max_same_neighbors=ORPHAN_MAX_SAME_NEIGHBORS,
+                orphan_min_winner_neighbors=ORPHAN_MIN_WINNER_NEIGHBORS,
+            )
+
+    frag_metrics = fragmentation_report(
+        label_map,
+        class_count=N_CLASSES,
+        min_component_pixels=MIN_COMPONENT_PIXELS,
+    )
 
     ratios = compute_ratios(label_map)
     small = downsample_nearest(label_map, 4)
@@ -1941,6 +2017,11 @@ def generate_one_variant(
         "physical_height_cm": float(physical_height_cm),
         "px_per_cm": float(px_per_cm),
         "motif_scale": float(motif_scale),
+        "orphan_ratio": float(frag_metrics["orphan_ratio"]),
+        "weak_ratio": float(frag_metrics["weak_ratio"]),
+        "micro_components_per_mp": float(frag_metrics["micro_components_per_mp"]),
+        "mode_filtered_pixels": float(anti_pixel_info["mode_filtered_pixels"]),
+        "macro_prior_agreement": float(np.mean(label_map == macro_guide)),
         "orphan_pixels_fixed": float(
             orphan_info["orphan_pixels_fixed"]
             + orphan_info_2["orphan_pixels_fixed"]
@@ -1959,6 +2040,7 @@ def generate_one_variant(
         "repair_anti_mirror": float(1 if anti_mirror else 0),
         "repair_extra_cleanup_passes": float(extra_cleanup_passes),
         "macro_guide_agreement": float(np.mean(label_map == macro_guide)),
+        "anti_pixel_enabled": float(1 if anti_pixel else 0),
     }
 
     return CandidateResult(
@@ -1971,17 +2053,18 @@ def generate_one_variant(
     )
 
 
-def generate_candidate_from_seed(seed: int) -> CandidateResult:
+def generate_candidate_from_seed(seed: int, anti_pixel: bool = DEFAULT_ENABLE_ANTI_PIXEL) -> CandidateResult:
     profile = make_profile(seed)
-    return generate_one_variant(profile)
+    return generate_one_variant(profile, anti_pixel=anti_pixel)
 
 
 def generate_and_validate_from_seed(
     seed: int,
     max_repair_rounds: int = MAX_REPAIR_ROUNDS,
     tolerance_profile: Optional[ValidationToleranceProfile] = None,
+    anti_pixel: bool = DEFAULT_ENABLE_ANTI_PIXEL,
 ) -> Tuple[CandidateResult, ValidationOutcome]:
-    candidate = generate_candidate_from_seed(seed)
+    candidate = generate_candidate_from_seed(seed, anti_pixel=anti_pixel)
     outcome = validate_with_reasons(candidate, tolerance_profile=tolerance_profile)
 
     trace: List[Dict[str, Any]] = [{
@@ -2016,6 +2099,7 @@ def generate_and_validate_from_seed(
             merge_micro=plan.merge_micro,
             rebalance_edges=plan.rebalance_edges,
             anti_mirror=plan.anti_mirror,
+            anti_pixel=anti_pixel,
         )
         repaired_candidate.metrics["repair_round"] = float(repair_round)
 
@@ -2219,6 +2303,7 @@ async def async_generate_all(
     rejection_rate_low: float = DEFAULT_REJECTION_RATE_LOW,
     tolerance_min_attempts: int = DEFAULT_TOLERANCE_MIN_ATTEMPTS,
     tolerance_relax_step: float = DEFAULT_TOLERANCE_RELAX_STEP,
+    anti_pixel: bool = DEFAULT_ENABLE_ANTI_PIXEL,
 ) -> List[Dict[str, object]]:
     output_dir = ensure_output_dir(output_dir)
     validate_generation_request(
@@ -2292,11 +2377,11 @@ async def async_generate_all(
             if use_parallel:
                 pool = get_process_pool(tuning.max_workers)
                 for attempt_no, seed in batch:
-                    fut = loop.run_in_executor(pool, generate_and_validate_from_seed, seed, MAX_REPAIR_ROUNDS, tolerance_profile)
+                    fut = loop.run_in_executor(pool, generate_and_validate_from_seed, seed, MAX_REPAIR_ROUNDS, tolerance_profile, anti_pixel)
                     tasks.append(asyncio.create_task(_await_attempt(fut, attempt_no, seed)))
             else:
                 attempt_no, seed = batch[0]
-                fut = loop.run_in_executor(None, generate_and_validate_from_seed, seed, MAX_REPAIR_ROUNDS, tolerance_profile)
+                fut = loop.run_in_executor(None, generate_and_validate_from_seed, seed, MAX_REPAIR_ROUNDS, tolerance_profile, anti_pixel)
                 tasks.append(asyncio.create_task(_await_attempt(fut, attempt_no, seed)))
 
             counters.in_flight = len(tasks)
@@ -2394,6 +2479,7 @@ async def async_generate_all(
         "tolerance_relax_level_final": float(tolerance_relax_level),
         "tolerance_profile_final": tolerance_profile.to_dict(),
         "tolerance_runtime_final": {str(k): float(v) for k, v in tolerance_runtime.items()},
+        "anti_pixel_enabled": bool(DEFAULT_ENABLE_ANTI_PIXEL),
     }
     (Path(output_dir) / "run_summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2),
@@ -2424,6 +2510,7 @@ def parse_cli_args() -> argparse.Namespace:
     parser.add_argument("--machine-intensity", type=float, default=DEFAULT_MACHINE_INTENSITY)
     parser.add_argument("--disable-parallel-attempts", action="store_true")
     parser.add_argument("--disable-dynamic-tolerance", action="store_true")
+    parser.add_argument("--disable-anti-pixel", action="store_true")
     parser.add_argument("--rejection-rate-window", type=int, default=DEFAULT_REJECTION_RATE_WINDOW)
     parser.add_argument("--rejection-rate-high", type=float, default=DEFAULT_REJECTION_RATE_HIGH)
     parser.add_argument("--rejection-rate-low", type=float, default=DEFAULT_REJECTION_RATE_LOW)
@@ -2464,6 +2551,7 @@ def main() -> None:
                 rejection_rate_low=args.rejection_rate_low,
                 tolerance_min_attempts=args.tolerance_min_attempts,
                 tolerance_relax_step=args.tolerance_relax_step,
+                anti_pixel=not args.disable_anti_pixel,
             )
         )
         csv_path = Path(args.output_dir) / "rapport_textures.csv"
