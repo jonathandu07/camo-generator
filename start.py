@@ -2323,9 +2323,10 @@ class CamouflageApp(App):
         try:
             fut.result()
         except Exception as exc:
-            Clock.schedule_once(lambda dt: self._finish_error(str(exc)), 0)
+            err = str(exc)
+            Clock.schedule_once(lambda dt, e=err: self._finish_error(e), 0)
         finally:
-            Clock.schedule_once(lambda dt: self._clear_future(fut), 0)
+            Clock.schedule_once(lambda dt, f=fut: self._clear_future(f), 0)
 
     @mainthread
     def _clear_future(self, fut: Future):
