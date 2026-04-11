@@ -432,10 +432,26 @@ async def async_generate_candidate_from_seed(seed: int) -> camo.CandidateResult:
     return await asyncio.to_thread(camo.generate_candidate_from_seed, seed)
 
 
-async def async_generate_and_validate_from_seed(seed: int) -> Tuple[camo.CandidateResult, Any]:
+async def async_generate_and_validate_from_seed(
+    seed: int,
+    *,
+    tolerance_profile: Optional[Any] = None,
+    max_repair_rounds: Optional[int] = None,
+    anti_pixel: Optional[bool] = None,
+) -> Tuple[camo.CandidateResult, Any]:
     combined = getattr(camo, "generate_and_validate_from_seed", None)
     if callable(combined):
-        return await asyncio.to_thread(combined, seed)
+        kwargs: Dict[str, Any] = {}
+        if tolerance_profile is not None:
+            kwargs["tolerance_profile"] = tolerance_profile
+        if max_repair_rounds is not None:
+            kwargs["max_repair_rounds"] = int(max_repair_rounds)
+        if anti_pixel is not None:
+            kwargs["anti_pixel"] = bool(anti_pixel)
+        try:
+            return await asyncio.to_thread(combined, seed, **kwargs)
+        except TypeError:
+            return await asyncio.to_thread(combined, seed)
     candidate = await asyncio.to_thread(camo.generate_candidate_from_seed, seed)
     outcome = await async_validate_candidate_result(candidate)
     return candidate, outcome
@@ -1364,6 +1380,26 @@ class CamouflageApp(App):
         self.diag_rejects = 0
         self.diag_rule_counter: Counter[str] = Counter()
         self.diag_last_rules: List[str] = []
+
+        self.dynamic_tolerance_enabled = bool(getattr(camo, "DEFAULT_DYNAMIC_TOLERANCE_ENABLED", True))
+        self.rejection_rate_window = int(getattr(camo, "DEFAULT_REJECTION_RATE_WINDOW", 24))
+        self.rejection_rate_high = float(getattr(camo, "DEFAULT_REJECTION_RATE_HIGH", 0.90))
+        self.rejection_rate_low = float(getattr(camo, "DEFAULT_REJECTION_RATE_LOW", 0.55))
+        self.tolerance_min_attempts = int(getattr(camo, "DEFAULT_TOLERANCE_MIN_ATTEMPTS", 24))
+        self.tolerance_relax_step = float(getattr(camo, "DEFAULT_TOLERANCE_RELAX_STEP", 0.08))
+        self.max_tolerance_relax = float(getattr(camo, "MAX_TOLERANCE_RELAX", 0.40))
+        self.max_repair_rounds = int(getattr(camo, "MAX_REPAIR_ROUNDS", 3))
+        self.anti_pixel = bool(getattr(camo, "DEFAULT_ENABLE_ANTI_PIXEL", True))
+        self.tolerance_relax_level = 0.0
+        self.tolerance_profile: Optional[Any] = None
+        self.tolerance_runtime: Dict[str, float] = {
+            "rejection_rate": 0.0,
+            "window_count": 0.0,
+            "relax_before": 0.0,
+            "relax_after": 0.0,
+        }
+        self.tolerance_outcomes: List[bool] = []
+
         self._runtime_subscription_active = False
         self._runtime_subscriber_callback = None
         self.gallery_projection_cache: Dict[str, PILImage.Image] = {}
@@ -2125,19 +2161,98 @@ class CamouflageApp(App):
         if self.run_mode_label is not None:
             self.run_mode_label.text = f"Mode actuel : {self._run_mode_text()}"
 
+    def _reset_dynamic_tolerance_state(self):
+        self.tolerance_relax_level = 0.0
+        builder = getattr(camo, "build_validation_tolerance_profile", None)
+        if callable(builder):
+            try:
+                self.tolerance_profile = builder(0.0)
+            except Exception:
+                self.tolerance_profile = None
+        else:
+            self.tolerance_profile = None
+        self.tolerance_runtime = {
+            "rejection_rate": 0.0,
+            "window_count": 0.0,
+            "relax_before": 0.0,
+            "relax_after": 0.0,
+        }
+        self.tolerance_outcomes = []
+
+    def _update_dynamic_tolerance_profile(self):
+        adapter = getattr(camo, "adapt_tolerance_relax_level", None)
+        builder = getattr(camo, "build_validation_tolerance_profile", None)
+
+        if callable(adapter):
+            try:
+                relax, profile, runtime = adapter(
+                    self.tolerance_relax_level,
+                    self.tolerance_outcomes,
+                    window=self.rejection_rate_window,
+                    rejection_rate_high=self.rejection_rate_high,
+                    rejection_rate_low=self.rejection_rate_low,
+                    min_attempts=self.tolerance_min_attempts,
+                    relax_step=self.tolerance_relax_step,
+                    enabled=self.dynamic_tolerance_enabled,
+                )
+                self.tolerance_relax_level = float(relax)
+                self.tolerance_profile = profile
+                self.tolerance_runtime = {
+                    "rejection_rate": float(runtime.get("rejection_rate", 0.0)),
+                    "window_count": float(runtime.get("window_count", 0.0)),
+                    "relax_before": float(runtime.get("relax_before", 0.0)),
+                    "relax_after": float(runtime.get("relax_after", 0.0)),
+                }
+                return
+            except Exception:
+                pass
+
+        if callable(builder):
+            try:
+                self.tolerance_profile = builder(self.tolerance_relax_level)
+            except Exception:
+                self.tolerance_profile = None
+
+    def _remember_tolerance_outcome(self, accepted: bool):
+        self.tolerance_outcomes.append(bool(accepted))
+        keep = max(self.rejection_rate_window * 8, self.tolerance_min_attempts * 4, 64)
+        if len(self.tolerance_outcomes) > keep:
+            self.tolerance_outcomes = self.tolerance_outcomes[-keep:]
+
+    def _tolerance_debug_text(self) -> str:
+        rejection_rate = float(self.tolerance_runtime.get("rejection_rate", 0.0))
+        window_count = int(round(float(self.tolerance_runtime.get("window_count", 0.0))))
+        bestof_min = None
+        if self.tolerance_profile is not None:
+            try:
+                bestof_min = float(getattr(self.tolerance_profile, "bestof_min_score"))
+            except Exception:
+                bestof_min = None
+        txt = (
+            f"tol relax {self.tolerance_relax_level:.2f}/{self.max_tolerance_relax:.2f} | "
+            f"rej-fen {rejection_rate:.0%} | fen {window_count}"
+        )
+        if bestof_min is not None:
+            txt += f" | best-min {bestof_min:.4f}"
+        return txt
+
     @mainthread
     def _refresh_diag_labels(self):
         rate = (self.diag_accepts / self.diag_total) if self.diag_total else 0.0
-        summary_text = f"Tentatives {self.diag_total} | acceptés {self.diag_accepts} | rejetés {self.diag_rejects} | taux {rate:.2%}"
+        tol_text = self._tolerance_debug_text()
+        summary_text = (
+            f"Tentatives {self.diag_total} | acceptés {self.diag_accepts} | rejetés {self.diag_rejects} | "
+            f"taux {rate:.2%} | {tol_text}"
+        )
         if self.diag_summary_label is not None:
             self.diag_summary_label.text = summary_text
         if self.diag_summary_mini_label is not None:
             self.diag_summary_mini_label.text = summary_text
         if self.diag_rule_counter:
             top = " | ".join(f"{n}:{c}" for n, c in self.diag_rule_counter.most_common(3))
-            top_text = f"Top règles : {top}"
+            top_text = f"Top règles : {top} | {tol_text}"
         else:
-            top_text = "Top règles : --"
+            top_text = f"Top règles : -- | {tol_text}"
         if self.diag_top_rules_label is not None:
             self.diag_top_rules_label.text = top_text
         if self.diag_top_rules_mini_label is not None:
@@ -2309,6 +2424,7 @@ class CamouflageApp(App):
         self.diag_total = self.diag_accepts = self.diag_rejects = 0
         self.diag_rule_counter = Counter()
         self.diag_last_rules = []
+        self._reset_dynamic_tolerance_state()
         self.update_progress(0, count)
         self._refresh_diag_labels()
         prevent_sleep(True)
@@ -2380,9 +2496,17 @@ class CamouflageApp(App):
                     local_attempt += 1
                     self.total_attempts = total_attempts
                     seed = camo.build_seed(target_index, local_attempt, base_seed=camo.DEFAULT_BASE_SEED)
-                    self.update_live_stage("génération backend", target_index, local_attempt, seed)
-                    candidate, outcome = await async_generate_and_validate_from_seed(seed)
+                    self._update_dynamic_tolerance_profile()
+                    pre_metrics_text = self._tolerance_debug_text()
+                    self.update_live_stage("génération backend", target_index, local_attempt, seed, metrics_text=pre_metrics_text)
+                    candidate, outcome = await async_generate_and_validate_from_seed(
+                        seed,
+                        tolerance_profile=self.tolerance_profile,
+                        max_repair_rounds=self.max_repair_rounds,
+                        anti_pixel=self.anti_pixel,
+                    )
                     valid = bool(getattr(outcome, "accepted", bool(outcome)))
+                    self._remember_tolerance_outcome(valid)
                     scores = extract_backend_scores(candidate.ratios, candidate.metrics, outcome)
                     try:
                         projection_img = await asyncio.to_thread(projection_preview_image, candidate.image, PROJECTION_CFG, self.projection_preview_scale)
@@ -2396,7 +2520,8 @@ class CamouflageApp(App):
                         f"best {scores['bestof_score']:.4f} | "
                         f"bd {scores['boundary_density']:.4f} | "
                         f"miroir {scores['mirror_similarity']:.4f} | "
-                        f"rebalance {scores['safe_rebalanced_pixels']:.0f}"
+                        f"rebalance {scores['safe_rebalanced_pixels']:.0f} | "
+                        f"{self._tolerance_debug_text()}"
                     )
 
                     if not valid:
@@ -2519,6 +2644,14 @@ class CamouflageApp(App):
         row["mannequin_image_name"] = mannequin_saved_path.name
         row["mannequin_image_path"] = str(mannequin_saved_path)
         row["manual_accept"] = int(bool(manual_accept))
+        row["tolerance_relax_level"] = float(self.tolerance_relax_level)
+        row["tolerance_rejection_rate"] = float(self.tolerance_runtime.get("rejection_rate", 0.0))
+        row["tolerance_window_count"] = int(round(float(self.tolerance_runtime.get("window_count", 0.0))))
+        if self.tolerance_profile is not None:
+            try:
+                row["tolerance_bestof_min_score"] = float(getattr(self.tolerance_profile, "bestof_min_score"))
+            except Exception:
+                pass
         rows.append(row)
         self.accepted_count = len(rows)
         self.update_progress(len(rows), int((self.count_input.text if self.count_input is not None and self.count_input.text.strip().isdigit() else DEFAULT_TARGET_COUNT)))
@@ -2561,7 +2694,8 @@ class CamouflageApp(App):
                 f"px/cm {safe_metric(metrics, 'px_per_cm'):.4f} | "
                 f"scale {safe_metric(metrics, 'motif_scale', self.motif_scale):.4f} | "
                 f"macros {safe_metric(metrics, 'seed_macros_total'):.0f} | "
-                f"grow {safe_metric(metrics, 'growth_rounds'):.0f}"
+                f"grow {safe_metric(metrics, 'growth_rounds'):.0f} | "
+                f"{self._tolerance_debug_text()}"
             )
 
     async def _async_export_best_of(self, top_k: int) -> Path:
