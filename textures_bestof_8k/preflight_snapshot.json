@@ -1,11 +1,11 @@
 {
-  "ts": 1776008136.80671,
+  "ts": 1776008984.526307,
   "cpu_count": 4.0,
   "process_cpu_percent": 0.0,
   "system_cpu_percent": 0.0,
-  "process_rss_mb": 188.578125,
-  "system_available_mb": 17384.46875,
+  "process_rss_mb": 199.28515625,
+  "system_available_mb": 18136.8046875,
   "system_total_mb": 32724.37890625,
-  "disk_free_mb": 167883.30078125,
+  "disk_free_mb": 167882.765625,
   "machine_intensity": 1.0
 }

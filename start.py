@@ -28,7 +28,7 @@ import sys
 import threading
 import time
 from collections import Counter
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
@@ -199,6 +199,18 @@ class PendingManualReview:
     projection_img: PILImage.Image
     metrics_text: str
     manually_saved: bool = False
+
+
+@dataclass
+class GenerationConfigSnapshot:
+    target_count: int
+    motif_scale: float
+    projection_scale: float
+    machine_intensity: float
+    output_dir: Path
+    max_workers: int
+    attempt_batch_size: int
+    parallel_attempts: bool
 
 
 class AsyncioThreadRunner:
@@ -418,14 +430,15 @@ def rejection_rules_for_candidate(candidate: camo.CandidateResult, outcome: Opti
     return rules
 
 
-def candidate_rank_key(record: CandidateRecord) -> Tuple[float, float, float, float]:
+def candidate_rank_key(record: CandidateRecord) -> Tuple[float, float, float, float, float]:
     ratios = record.ratios
     metrics = record.metrics
     ratio_mae = float(np.mean(np.abs(ratios - camo.TARGET)))
     ratio_max = float(np.max(np.abs(ratios - camo.TARGET)))
     mirror = safe_metric(metrics, "mirror_similarity")
     edge = safe_metric(metrics, "edge_contact_ratio")
-    return (ratio_mae, ratio_max, mirror, edge)
+    bestof = safe_metric(metrics, "bestof_score")
+    return (-bestof, ratio_mae, ratio_max, mirror, edge)
 
 
 async def async_generate_candidate_from_seed(seed: int) -> camo.CandidateResult:
@@ -476,6 +489,11 @@ async def async_save_candidate_image(candidate: camo.CandidateResult, path: Path
 
 async def async_write_report(rows: List[dict], output_dir: Path, filename: str = REPORT_NAME) -> Path:
     return await asyncio.to_thread(camo.write_report, rows, output_dir, filename)
+
+
+async def async_wait_generation_future(fut: asyncio.Future, attempt_no: int, seed: int) -> Tuple[int, int, camo.CandidateResult, Any]:
+    candidate, outcome = await fut
+    return attempt_no, seed, candidate, outcome
 
 
 def save_mannequin_projection_sync(projection_img: PILImage.Image, saved_camo_path: Path, output_dir: Path) -> Path:
@@ -530,11 +548,12 @@ def build_candidate_row_compatible(
     candidate: camo.CandidateResult,
     outcome: Optional[Any],
     saved_path: Path,
+    manual_accept: bool = False,
 ) -> Dict[str, Any]:
     row_builder = getattr(camo, "candidate_row", None)
     if callable(row_builder):
         try:
-            return row_builder(
+            row = row_builder(
                 target_index,
                 local_attempt,
                 global_attempt,
@@ -545,7 +564,7 @@ def build_candidate_row_compatible(
             )
         except TypeError:
             try:
-                return row_builder(
+                row = row_builder(
                     target_index,
                     local_attempt,
                     global_attempt,
@@ -555,29 +574,39 @@ def build_candidate_row_compatible(
                 )
             except TypeError:
                 row = row_builder(target_index, local_attempt, global_attempt, candidate)
-                if isinstance(row, dict):
-                    row["image_name"] = saved_path.name
-                    row["image_path"] = str(saved_path)
-                    if outcome is not None and hasattr(outcome, "bestof_score"):
-                        row.setdefault("bestof_score", float(getattr(outcome, "bestof_score", 0.0)))
-                    if outcome is not None and hasattr(outcome, "reasons"):
-                        row.setdefault("reasons", "|".join(getattr(outcome, "reasons", []) or []))
-                    if outcome is not None and hasattr(outcome, "accepted"):
-                        row.setdefault("accepted", int(bool(getattr(outcome, "accepted"))))
-                    return row
-    return {
-        "index": target_index,
-        "seed": int(candidate.seed),
-        "attempts_for_this_image": local_attempt,
-        "global_attempt": global_attempt,
-        "image_name": saved_path.name,
-        "image_path": str(saved_path),
-        "bestof_score": float(getattr(outcome, "bestof_score", 0.0)) if outcome is not None else 0.0,
-        "accepted": int(bool(getattr(outcome, "accepted", False))) if outcome is not None else 0,
-        "reasons": "|".join(getattr(outcome, "reasons", []) or []) if outcome is not None else "",
-    }
+        if not isinstance(row, dict):
+            row = {}
+    else:
+        row = {}
+
+    if not row:
+        row = {
+            "index": target_index,
+            "seed": int(candidate.seed),
+            "attempts_for_this_image": local_attempt,
+            "global_attempt": global_attempt,
+            "image_name": saved_path.name,
+            "image_path": str(saved_path),
+            "bestof_score": float(getattr(outcome, "bestof_score", 0.0)) if outcome is not None else 0.0,
+            "accepted": int(bool(getattr(outcome, "accepted", False))) if outcome is not None else 0,
+            "reasons": "|".join(getattr(outcome, "reasons", []) or []) if outcome is not None else "",
+        }
+
+    backend_accepted = int(bool(getattr(outcome, "accepted", False))) if outcome is not None else 0
+    manual_accepted = int(bool(manual_accept))
+    final_accepted = 1 if manual_accepted else backend_accepted
+    row["image_name"] = saved_path.name
+    row["image_path"] = str(saved_path)
+    row["accepted"] = final_accepted
+    row["backend_accepted"] = backend_accepted
+    row["manual_accepted"] = manual_accepted
+    row["accepted_source"] = "manual" if manual_accepted else "backend"
+    row["review_status"] = "accepted_manual" if manual_accepted else "accepted_backend"
+    return row
 
 
+# ============================================================
+# PROJECTION SUR SOLDAT MODÈLE (aperçu uniquement)
 # ============================================================
 # PROJECTION SUR SOLDAT MODÈLE (aperçu uniquement)
 # ============================================================
@@ -912,24 +941,30 @@ def bbox_from_mask(mask: np.ndarray) -> Tuple[int, int, int, int]:
     return (x1, y1, x2 - x1 + 1, y2 - y1 + 1)
 
 
-def build_projection_subject_analysis(cfg: ProjectionConfig = PROJECTION_CFG) -> ProjectionSubjectAnalysis:
-    model_path = resolve_soldier_model_path()
-    subject_bgr = get_projection_subject_bgr()
+def build_projection_analysis_from_bgr(
+    subject_bgr: np.ndarray,
+    cfg: ProjectionConfig = PROJECTION_CFG,
+    model_path: Optional[Path] = None,
+) -> ProjectionSubjectAnalysis:
     uniform_mask = green_uniform_mask(subject_bgr, cfg)
     bbox = bbox_from_mask(uniform_mask)
     regions = split_uniform_regions(uniform_mask, cfg)
-
     _, _, _, bbox_h = bbox
     mannequin_px_per_cm = (bbox_h / max(1.0, cfg.uniform_visible_height_cm)) if bbox_h > 0 else 1.0
-
     return ProjectionSubjectAnalysis(
-        model_path=model_path,
+        model_path=model_path or Path("."),
         subject_bgr=subject_bgr,
         uniform_mask=uniform_mask,
         bbox=bbox,
         regions=regions,
         mannequin_px_per_cm=float(max(0.01, mannequin_px_per_cm)),
     )
+
+
+def build_projection_subject_analysis(cfg: ProjectionConfig = PROJECTION_CFG) -> ProjectionSubjectAnalysis:
+    model_path = resolve_soldier_model_path()
+    subject_bgr = get_projection_subject_bgr()
+    return build_projection_analysis_from_bgr(subject_bgr, cfg=cfg, model_path=model_path)
 
 
 def get_projection_subject_analysis(cfg: ProjectionConfig = PROJECTION_CFG) -> ProjectionSubjectAnalysis:
@@ -958,13 +993,10 @@ def is_full_camo_canvas(camo_bgr: np.ndarray) -> bool:
 
 def estimate_camo_px_per_cm(camo_bgr: np.ndarray) -> float:
     h, w = camo_bgr.shape[:2]
-
     physical_w = float(getattr(camo, "PHYSICAL_WIDTH_CM", max(1, w)))
     physical_h = float(getattr(camo, "PHYSICAL_HEIGHT_CM", max(1, h)))
-
     ppcm_x = w / max(1.0, physical_w)
     ppcm_y = h / max(1.0, physical_h)
-
     fallback = float(getattr(camo, "PX_PER_CM", max(1.0, min(ppcm_x, ppcm_y))))
     ppcm = min(ppcm_x, ppcm_y)
     return float(ppcm if ppcm > 0 else fallback)
@@ -985,21 +1017,17 @@ def adaptive_region_scale(
     if is_full_camo_canvas(camo_bgr):
         mannequin_ppcm = float(analysis.mannequin_px_per_cm)
         camo_ppcm = float(max(1e-6, estimate_camo_px_per_cm(camo_bgr)))
-
         base_scale = mannequin_ppcm / camo_ppcm
-
         if region_name == "hat":
             scale = base_scale * cfg.hat_scale_multiplier
         elif region_name == "pants":
             scale = base_scale * cfg.pants_scale_multiplier
         else:
             scale = base_scale * cfg.jacket_scale_multiplier
-
         _ux, _uy, uniform_w, _uh = analysis.bbox
         if uniform_w > 0:
             width_ratio = rw / max(1.0, uniform_w)
             scale *= np.clip(0.85 + width_ratio * 0.75, 0.80, 1.18)
-
         return float(np.clip(scale * max(0.10, float(user_scale)), cfg.min_region_scale, cfg.max_region_scale))
 
     _camo_h, camo_w = camo_bgr.shape[:2]
@@ -1009,7 +1037,6 @@ def adaptive_region_scale(
         target_w = rw * cfg.tile_pants_width_ratio
     else:
         target_w = rw * cfg.tile_jacket_width_ratio
-
     scale = target_w / max(1.0, float(camo_w))
     return float(np.clip(scale * max(0.10, float(user_scale)), cfg.min_region_scale, cfg.max_region_scale))
 
@@ -1017,18 +1044,14 @@ def adaptive_region_scale(
 def tile_camo(camo_bgr: np.ndarray, shape_hw: Tuple[int, int], scale: float, seed: int) -> np.ndarray:
     h, w = shape_hw
     ch, cw = camo_bgr.shape[:2]
-
     scale = max(0.05, float(scale))
     nw = max(32, int(round(cw * scale)))
     nh = max(32, int(round(ch * scale)))
-
     interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
     camo_resized = cv2.resize(camo_bgr, (nw, nh), interpolation=interp)
-
     rep_x = int(np.ceil(w / nw)) + 2
     rep_y = int(np.ceil(h / nh)) + 2
     tiled = np.tile(camo_resized, (rep_y, rep_x, 1))
-
     ox = (seed * 37 + w * 3) % nw
     oy = (seed * 53 + h * 5) % nh
     return tiled[oy:oy + h, ox:ox + w]
@@ -1037,14 +1060,11 @@ def tile_camo(camo_bgr: np.ndarray, shape_hw: Tuple[int, int], scale: float, see
 def shading_detail_edges(subject_bgr: np.ndarray, alpha_mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     gray = cv2.cvtColor(subject_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
     alpha = alpha_mask.astype(np.float32) / 255.0
-
     soft = cv2.GaussianBlur(gray, (0, 0), sigmaX=23, sigmaY=23)
     soft = np.clip(soft, 1e-4, 1.0)
     shading = np.clip(gray / soft, 0.55, 1.50)
-
     detail = gray - cv2.GaussianBlur(gray, (0, 0), sigmaX=4, sigmaY=4)
     detail = np.clip(detail, -0.25, 0.25)
-
     edges = cv2.Canny((gray * 255).astype(np.uint8), 40, 110).astype(np.float32) / 255.0
     edges = cv2.GaussianBlur(edges, (0, 0), sigmaX=2, sigmaY=2)
     edges *= alpha
@@ -1054,16 +1074,13 @@ def shading_detail_edges(subject_bgr: np.ndarray, alpha_mask: np.ndarray) -> Tup
 def compose_region(base_bgr: np.ndarray, region_mask: np.ndarray, camo_bgr: np.ndarray, scale: float, seed: int, cfg: ProjectionConfig) -> np.ndarray:
     alpha = (region_mask.astype(np.float32) / 255.0) ** max(0.2, cfg.alpha_gamma)
     alpha = alpha[..., None]
-
     tiled = tile_camo(camo_bgr, base_bgr.shape[:2], scale=scale, seed=seed).astype(np.float32) / 255.0
     shading, detail, edges = shading_detail_edges(base_bgr, region_mask)
-
     camo_layer = tiled.copy()
     camo_layer *= (1.0 + (shading[..., None] - 1.0) * cfg.shadow_strength)
     camo_layer += detail[..., None] * cfg.detail_strength
     camo_layer *= (1.0 - edges[..., None] * cfg.edge_darkening)
     camo_layer = np.clip(camo_layer, 0.0, 1.0)
-
     base = base_bgr.astype(np.float32) / 255.0
     out = base * (1.0 - alpha) + camo_layer * alpha
     return (np.clip(out, 0.0, 1.0) * 255.0).astype(np.uint8)
@@ -1078,12 +1095,9 @@ def build_residual_uniform_mask(
 ) -> np.ndarray:
     if uniform_mask is None or not np.any(uniform_mask > 8):
         return np.zeros(subject_bgr.shape[:2], dtype=np.uint8)
-
     subj_hsv = cv2.cvtColor(subject_bgr, cv2.COLOR_BGR2HSV)
     proj_hsv = cv2.cvtColor(projected_bgr, cv2.COLOR_BGR2HSV)
-
     uniform_bin = (uniform_mask > 24).astype(np.uint8) * 255
-
     original_green = cv2.inRange(
         subj_hsv,
         np.array([cfg.hue_min, max(0, cfg.sat_min - 12), 0], dtype=np.uint8),
@@ -1094,13 +1108,10 @@ def build_residual_uniform_mask(
         np.array([cfg.hue_min, max(0, cfg.sat_min - 18), 0], dtype=np.uint8),
         np.array([cfg.hue_max, 255, 255], dtype=np.uint8),
     )
-
     color_diff = np.mean(np.abs(projected_bgr.astype(np.int16) - subject_bgr.astype(np.int16)), axis=2)
     too_close = (color_diff < 24.0).astype(np.uint8) * 255
-
     residual = cv2.bitwise_and(uniform_bin, cv2.bitwise_or(still_green, cv2.bitwise_and(original_green, too_close)))
     residual = cv2.bitwise_and(residual, 255 - protect_mask)
-
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     residual = cv2.morphologyEx(residual, cv2.MORPH_CLOSE, kernel)
     residual = cv2.GaussianBlur(residual, (0, 0), 1.2)
@@ -1115,9 +1126,11 @@ def correct_projection_residuals(
     camo_bgr: np.ndarray,
     base_scale: float,
     cfg: ProjectionConfig,
+    rounds: Optional[int] = None,
 ) -> np.ndarray:
     out = projected_bgr.copy()
-    for round_idx in range(cfg.residual_rounds):
+    total_rounds = cfg.residual_rounds if rounds is None else max(0, int(rounds))
+    for round_idx in range(total_rounds):
         residual = build_residual_uniform_mask(subject_bgr, out, uniform_mask, protect_mask, cfg)
         residual_px = int(np.sum(residual > cfg.residual_threshold))
         if residual_px <= 32:
@@ -1132,19 +1145,42 @@ def apply_camo_to_reference(
     camo_bgr: np.ndarray,
     cfg: ProjectionConfig = PROJECTION_CFG,
     user_scale: float = 1.0,
+    analysis: Optional[ProjectionSubjectAnalysis] = None,
+    fast_preview: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    analysis = get_projection_subject_analysis(cfg)
-    mask = analysis.uniform_mask
+    analysis = analysis or build_projection_analysis_from_bgr(subject_bgr, cfg=cfg)
+    full_mask = analysis.uniform_mask.copy()
     person_mask = person_mask_from_foreground(subject_bgr, cfg)
     protect_mask = build_protection_mask(subject_bgr, person_mask, cfg)
-    mask = cv2.bitwise_and(mask, 255 - protect_mask)
+    full_mask = cv2.bitwise_and(full_mask, 255 - protect_mask)
 
-    full_scale = adaptive_region_scale("jacket", mask, camo_bgr, analysis, cfg, user_scale=user_scale)
+    hat_mask = cv2.bitwise_and(analysis.regions.get("hat", np.zeros_like(full_mask)), full_mask)
+    jacket_mask = cv2.bitwise_and(analysis.regions.get("jacket", np.zeros_like(full_mask)), full_mask)
+    pants_mask = cv2.bitwise_and(analysis.regions.get("pants", np.zeros_like(full_mask)), full_mask)
 
     out = subject_bgr.copy()
-    out = compose_region(out, mask, camo_bgr, full_scale, seed=23, cfg=cfg)
-    out = correct_projection_residuals(subject_bgr, out, mask, protect_mask, camo_bgr, full_scale, cfg)
-    return out, mask
+    for region_name, region_mask, region_seed in (
+        ("hat", hat_mask, 23),
+        ("jacket", jacket_mask, 31),
+        ("pants", pants_mask, 47),
+    ):
+        if int(np.sum(region_mask > 8)) <= 8:
+            continue
+        scale = adaptive_region_scale(region_name, region_mask, camo_bgr, analysis, cfg, user_scale=user_scale)
+        out = compose_region(out, region_mask, camo_bgr, scale, seed=region_seed, cfg=cfg)
+
+    jacket_scale = adaptive_region_scale("jacket", full_mask, camo_bgr, analysis, cfg, user_scale=user_scale)
+    out = correct_projection_residuals(
+        subject_bgr,
+        out,
+        full_mask,
+        protect_mask,
+        camo_bgr,
+        jacket_scale,
+        cfg,
+        rounds=1 if fast_preview else None,
+    )
+    return out, full_mask
 
 
 def crop_person_display_16_9(
@@ -1159,26 +1195,21 @@ def crop_person_display_16_9(
     x, y, bw, bh = bbox_from_mask(person)
     if bw <= 0 or bh <= 0:
         return projected_bgr
-
     cx = x + bw / 2.0
     cy = y + bh / 2.0
     crop_w = bw * (1.0 + 2.0 * margin_ratio)
     crop_h = bh * (1.0 + 2.0 * margin_ratio)
-
     if crop_w / max(1e-6, crop_h) < target_ratio:
         crop_w = crop_h * target_ratio
     else:
         crop_h = crop_w / target_ratio
-
     scale = min(w / max(1e-6, crop_w), h / max(1e-6, crop_h), 1.0)
     crop_w *= scale
     crop_h *= scale
-
     x0 = int(round(cx - crop_w / 2.0))
     y0 = int(round(cy - crop_h / 2.0))
     x1 = int(round(cx + crop_w / 2.0))
     y1 = int(round(cy + crop_h / 2.0))
-
     if x0 < 0:
         x1 -= x0
         x0 = 0
@@ -1191,33 +1222,53 @@ def crop_person_display_16_9(
     if y1 > h:
         y0 -= (y1 - h)
         y1 = h
-
     x0 = max(0, x0)
     y0 = max(0, y0)
     x1 = min(w, x1)
     y1 = min(h, y1)
     if x1 <= x0 or y1 <= y0:
         return projected_bgr
-
     cropped = projected_bgr[y0:y1, x0:x1]
     if cropped.size == 0:
         return projected_bgr
     return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_CUBIC)
 
 
+def resize_long_side(img_bgr: np.ndarray, max_side: int) -> np.ndarray:
+    h, w = img_bgr.shape[:2]
+    cur = max(h, w)
+    if cur <= max_side:
+        return img_bgr
+    scale = max_side / float(cur)
+    nw = max(1, int(round(w * scale)))
+    nh = max(1, int(round(h * scale)))
+    return cv2.resize(img_bgr, (nw, nh), interpolation=cv2.INTER_AREA)
+
+
 def projection_preview_image(
     camo_img: PILImage.Image,
     cfg: ProjectionConfig = PROJECTION_CFG,
     user_scale: float = 1.0,
+    preview_mode: str = "quality",
 ) -> PILImage.Image:
     analysis = get_projection_subject_analysis(cfg)
     subject_bgr = analysis.subject_bgr.copy()
     camo_bgr = pil_rgb_to_bgr(camo_img)
-    projected_bgr, _mask = apply_camo_to_reference(subject_bgr, camo_bgr, cfg=cfg, user_scale=user_scale)
+    if preview_mode == "fast":
+        subject_small = resize_long_side(subject_bgr, 960)
+        camo_small = resize_long_side(camo_bgr, 960)
+        fast_analysis = build_projection_analysis_from_bgr(subject_small, cfg=cfg, model_path=analysis.model_path)
+        projected_bgr, _mask = apply_camo_to_reference(subject_small, camo_small, cfg=cfg, user_scale=user_scale, analysis=fast_analysis, fast_preview=True)
+        projected_bgr = crop_person_display_16_9(projected_bgr, subject_small, cfg=cfg)
+        return bgr_to_pil_rgb(projected_bgr)
+
+    projected_bgr, _mask = apply_camo_to_reference(subject_bgr, camo_bgr, cfg=cfg, user_scale=user_scale, analysis=analysis, fast_preview=False)
     projected_bgr = crop_person_display_16_9(projected_bgr, subject_bgr, cfg=cfg)
     return bgr_to_pil_rgb(projected_bgr)
 
 
+# ============================================================
+# WIDGETS UI
 # ============================================================
 # WIDGETS UI
 # ============================================================
@@ -1491,6 +1542,9 @@ class CamouflageApp(App):
         self.gallery_projection_cache: Dict[str, PILImage.Image] = {}
         self.gallery_projection_pending: Dict[str, List["GalleryThumb"]] = {}
         self.preview_projection_cache: Dict[str, PILImage.Image] = {}
+        self.gallery_projection_semaphore = asyncio.Semaphore(2)
+        self.preview_projection_semaphore = asyncio.Semaphore(1)
+        self.requested_target_count = DEFAULT_TARGET_COUNT
         self._current_preview_raw_img: Optional[PILImage.Image] = None
         self.pending_manual_review: Optional[PendingManualReview] = None
         self.generated_rows: List[dict] = []
@@ -1542,25 +1596,25 @@ class CamouflageApp(App):
         root = BoxLayout(orientation="vertical", spacing=dp(12), padding=dp(12))
 
         # =====================
-        # HEADER / HERO
+        # HEADER
         # =====================
-        header = GlassCard(orientation="horizontal", size_hint_y=None, height=dp(112), spacing=dp(14))
+        header = GlassCard(orientation="horizontal", size_hint_y=None, height=dp(104), spacing=dp(14))
 
-        hero_left = BoxLayout(orientation="vertical", spacing=dp(4))
+        hero_left = BoxLayout(orientation="vertical", spacing=dp(2))
         self.attempt_text = self._small_label("Image 000 | essai 0000 | total 000000 | seed --", color=C["text_muted"])
         title = self._label(APP_TITLE, font_size=sp(22), height=dp(30))
         title.bold = True
         subtitle = self._small_label(
             "Pilotage temps réel, validation stricte, galerie, mannequin et revue manuelle des rejets.",
             color=C["text_soft"],
-            height=dp(24),
+            height=dp(22),
         )
         hero_left.add_widget(self.attempt_text)
         hero_left.add_widget(title)
         hero_left.add_widget(subtitle)
 
-        hero_right = BoxLayout(orientation="vertical", spacing=dp(6), size_hint_x=0.28)
-        self.status_label = self._label("Prêt", halign="right", font_size=sp(18), height=dp(30))
+        hero_right = BoxLayout(orientation="vertical", spacing=dp(4), size_hint_x=0.26)
+        self.status_label = self._label("Prêt", halign="right", font_size=sp(18), height=dp(28))
         self.status_label.bold = True
         hero_hint = self._small_label("Sortie : textures + mannequins", halign="right", color=C["text_muted"])
         hero_right.add_widget(self.status_label)
@@ -1570,23 +1624,26 @@ class CamouflageApp(App):
         header.add_widget(hero_right)
         root.add_widget(header)
 
+        # =====================
+        # BODY
+        # =====================
         body = BoxLayout(spacing=dp(12))
-        left = BoxLayout(orientation="vertical", spacing=dp(12), size_hint_x=0.33)
-        right = BoxLayout(orientation="vertical", spacing=dp(12), size_hint_x=0.67)
+        left = BoxLayout(orientation="vertical", spacing=dp(12), size_hint_x=0.31)
+        right = BoxLayout(orientation="vertical", spacing=dp(12), size_hint_x=0.69)
 
-        # =====================
-        # COLONNE GAUCHE
-        # =====================
+        # ---------------------
+        # LEFT SIDEBAR
+        # ---------------------
         control_scroll = ScrollView(do_scroll_x=False, bar_width=dp(8))
         control_content = BoxLayout(orientation="vertical", spacing=dp(12), size_hint_y=None)
         control_content.bind(minimum_height=control_content.setter("height"))
 
         actions_card = GlassCard(orientation="vertical", size_hint_y=None, spacing=dp(10))
         actions_card.bind(minimum_height=actions_card.setter("height"))
-        actions_card.add_widget(self._section_title("Commandes", "Tout le pilotage principal au même endroit."))
+        actions_card.add_widget(self._section_title("Commandes", "Pilotage principal et sortie."))
         self.count_input = SoftTextInput(text=str(DEFAULT_TARGET_COUNT), multiline=False, input_filter="int", size_hint_y=None, height=dp(52))
         actions_card.add_widget(self.count_input)
-        btn_row = BoxLayout(size_hint_y=None, height=dp(58), spacing=dp(10))
+        btn_row = BoxLayout(size_hint_y=None, height=dp(56), spacing=dp(10))
         self.start_btn = self._button("Commencer", "launch", self.start_generation)
         self.stop_btn = self._button("Arrêter", "stop", self.stop_generation)
         btn_row.add_widget(self.start_btn)
@@ -1598,7 +1655,7 @@ class CamouflageApp(App):
 
         runtime_card = GlassCard(orientation="vertical", size_hint_y=None, spacing=dp(10))
         runtime_card.bind(minimum_height=runtime_card.setter("height"))
-        runtime_card.add_widget(self._section_title("Exécution", "Préflight, mode de lancement et validation manuelle."))
+        runtime_card.add_widget(self._section_title("Exécution", "Préflight, mode de lancement et revue manuelle."))
         self.tests_label = self._small_label(self.tests_summary)
         runtime_card.add_widget(self.tests_label)
 
@@ -1613,8 +1670,8 @@ class CamouflageApp(App):
         self.run_mode_label = self._small_label("Mode actuel : tests bloquants", color=C["text_muted"])
         runtime_card.add_widget(self.run_mode_label)
 
-        runtime_card.add_widget(self._section_title("Dernier rejet mémorisé", "Tu peux le sauver sans interrompre la génération."))
-        manual_row = BoxLayout(size_hint_y=None, height=dp(58), spacing=dp(10))
+        runtime_card.add_widget(self._section_title("Dernier rejet mémorisé", "Enregistrement manuel sans stopper la génération."))
+        manual_row = BoxLayout(size_hint_y=None, height=dp(56), spacing=dp(10))
         self.manual_accept_btn = self._button("Valider ce rejet", "launch", self.manual_accept_current_reject)
         self.manual_skip_btn = self._button("Oublier ce rejet", "neutral", self.manual_skip_current_reject)
         manual_row.add_widget(self.manual_accept_btn)
@@ -1626,7 +1683,7 @@ class CamouflageApp(App):
 
         tuning_card = GlassCard(orientation="vertical", size_hint_y=None, spacing=dp(10))
         tuning_card.bind(minimum_height=tuning_card.setter("height"))
-        tuning_card.add_widget(self._section_title("Réglages", "Deux curseurs simples pour le motif et sa projection mannequin."))
+        tuning_card.add_widget(self._section_title("Réglages", "Motif et projection mannequin."))
 
         tuning_card.add_widget(self._small_label("Scale des motifs", color=C["text_muted"]))
         motif_row = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(8))
@@ -1647,18 +1704,18 @@ class CamouflageApp(App):
         tuning_card.add_widget(projection_row)
         control_content.add_widget(tuning_card)
 
-        health_card = GlassCard(orientation="vertical", size_hint_y=None, spacing=dp(10))
+        health_card = GlassCard(orientation="vertical", size_hint_y=None, spacing=dp(8))
         health_card.bind(minimum_height=health_card.setter("height"))
-        health_card.add_widget(self._section_title("Santé & qualité", "Lisibilité immédiate de l’état machine et des métriques backend."))
-        self.resource_text = self._small_label("Machine : CPU -- | RAM -- | Disque -- | Processus --", height=dp(44))
-        self.score_text = self._small_label("Qualité : MAE -- | max abs -- | composant -- | best-of --", height=dp(32))
-        self.color_text = self._small_label("Couleurs : C -- | O -- | T -- | G --", height=dp(32))
-        self.extra_text = self._small_label("Contours : bd -- | bd/4 -- | bd/8 -- | bord --", height=dp(32))
-        self.struct_text = self._small_label("Tolérance dynamique : --", height=dp(54))
-        self.runtime_last_label = self._small_label("Preuve dataset/runtime : --", height=dp(54))
-        self.diag_summary_label = self._small_label("Résumé essais : tentatives 0 | acceptés 0 | rejetés 0", height=dp(54))
-        self.diag_top_rules_label = self._small_label("Pourquoi ça rejette : --", height=dp(54))
-        self.diag_last_fail_label = self._small_label("ML / DL : --", height=dp(54))
+        health_card.add_widget(self._section_title("Santé & qualité", "Résumé compact de l’état backend."))
+        self.resource_text = self._small_label("Machine : CPU -- | RAM -- | Disque -- | Processus --", height=dp(40))
+        self.score_text = self._small_label("Qualité : MAE -- | max abs -- | composant -- | best-of --", height=dp(30))
+        self.color_text = self._small_label("Couleurs : C -- | O -- | T -- | G --", height=dp(30))
+        self.extra_text = self._small_label("Contours : bd -- | bd/4 -- | bd/8 -- | bord --", height=dp(30))
+        self.struct_text = self._small_label("Tolérance dynamique : --", height=dp(46))
+        self.runtime_last_label = self._small_label("Preuve dataset/runtime : --", height=dp(46))
+        self.diag_summary_label = self._small_label("Résumé essais : tentatives 0 | acceptés 0 | rejetés 0", height=dp(46))
+        self.diag_top_rules_label = self._small_label("Pourquoi ça rejette : --", height=dp(46))
+        self.diag_last_fail_label = self._small_label("ML / DL : --", height=dp(46))
         for widget in [
             self.resource_text,
             self.score_text,
@@ -1673,8 +1730,8 @@ class CamouflageApp(App):
             health_card.add_widget(widget)
         control_content.add_widget(health_card)
 
-        gallery_card = GlassCard(orientation="vertical", size_hint_y=None, height=dp(430), spacing=dp(10))
-        gallery_card.add_widget(self._section_title("Galerie récente", "Clique une vignette pour la charger immédiatement dans les aperçus."))
+        gallery_card = GlassCard(orientation="vertical", size_hint_y=None, height=dp(360), spacing=dp(10))
+        gallery_card.add_widget(self._section_title("Galerie récente", "Clique une vignette pour charger immédiatement l’aperçu."))
         gallery_scroll = ScrollView(do_scroll_x=False, bar_width=dp(8))
         self.gallery_grid = GridLayout(cols=GALLERY_COLUMNS, spacing=dp(10), padding=dp(2), size_hint_y=None)
         self.gallery_grid.bind(minimum_height=self.gallery_grid.setter("height"))
@@ -1685,10 +1742,17 @@ class CamouflageApp(App):
         control_scroll.add_widget(control_content)
         left.add_widget(control_scroll)
 
-        # =====================
-        # COLONNE DROITE
-        # =====================
-        top_strip = GridLayout(cols=3, spacing=dp(12), size_hint_y=None, height=dp(118))
+        # ---------------------
+        # RIGHT CONTENT
+        # ---------------------
+        preview_row = GridLayout(cols=2, spacing=dp(12), size_hint_y=None, height=dp(340))
+        self.preview_img = Image()
+        self.preview_silhouette = Image()
+        preview_row.add_widget(self._carded_view("Camouflage courant", self.preview_img))
+        preview_row.add_widget(self._carded_view("Projection sur soldat modèle", self.preview_silhouette))
+        right.add_widget(preview_row)
+
+        info_row = GridLayout(cols=3, spacing=dp(12), size_hint_y=None, height=dp(136))
 
         progress_card = GlassCard(orientation="vertical", spacing=dp(8))
         progress_card.add_widget(self._section_title("Progression", "Suivi du lot courant."))
@@ -1696,7 +1760,7 @@ class CamouflageApp(App):
         self.progress_text = self._small_label("0 / 0 validé(s) | tentatives 0 | rejetés 0")
         progress_card.add_widget(self.progress_bar)
         progress_card.add_widget(self.progress_text)
-        top_strip.add_widget(progress_card)
+        info_row.add_widget(progress_card)
 
         backend_card = GlassCard(orientation="vertical", spacing=dp(8))
         backend_card.add_widget(self._section_title("Validation stricte", "Synthèse instantanée du backend."))
@@ -1704,25 +1768,16 @@ class CamouflageApp(App):
         self.diag_top_rules_mini_label = self._small_label("Top règles : --")
         backend_card.add_widget(self.diag_summary_mini_label)
         backend_card.add_widget(self.diag_top_rules_mini_label)
-        top_strip.add_widget(backend_card)
+        info_row.add_widget(backend_card)
 
         manual_card = GlassCard(orientation="vertical", spacing=dp(8))
         manual_card.add_widget(self._section_title("Revue manuelle", "Dernier rejet disponible à l’enregistrement."))
         self.manual_review_mini_label = self._small_label("Aucun rejet en attente.")
         manual_card.add_widget(self.manual_review_mini_label)
-        top_strip.add_widget(manual_card)
-        right.add_widget(top_strip)
+        info_row.add_widget(manual_card)
+        right.add_widget(info_row)
 
-        previews = BoxLayout(orientation="vertical", spacing=dp(12), size_hint_y=0.56)
-        previews_top = GridLayout(cols=2, spacing=dp(12), size_hint_y=0.62)
-        self.preview_img = Image()
-        self.preview_silhouette = Image()
-        previews_top.add_widget(self._carded_view("Camouflage courant", self.preview_img))
-        previews_top.add_widget(self._carded_view("Projection sur soldat modèle", self.preview_silhouette))
-        previews.add_widget(previews_top)
-
-        self.live_preview_img = Image()
-        live_card = GlassCard(orientation="vertical", size_hint_y=0.38, spacing=dp(8))
+        live_card = GlassCard(orientation="vertical", size_hint_y=None, height=dp(238), spacing=dp(8))
         live_card.add_widget(self._section_title("Suivi direct de construction", "Ce que le pipeline est en train de faire maintenant."))
         self.live_stage_label = self._small_label("Étape : attente")
         self.live_counts_label = self._small_label("État backend strict")
@@ -1730,13 +1785,13 @@ class CamouflageApp(App):
         live_card.add_widget(self.live_stage_label)
         live_card.add_widget(self.live_counts_label)
         live_card.add_widget(self.live_meta_label)
+        self.live_preview_img = Image()
         live_pane = SoftPane(orientation="vertical")
         live_pane.add_widget(self.live_preview_img)
         live_card.add_widget(live_pane)
-        previews.add_widget(live_card)
-        right.add_widget(previews)
+        right.add_widget(live_card)
 
-        bottom = GridLayout(cols=2, spacing=dp(12), size_hint_y=0.44)
+        bottom = GridLayout(cols=2, spacing=dp(12))
         log_card = GlassCard(orientation="vertical", spacing=dp(10))
         log_card.add_widget(self._section_title("Journal opérationnel", "Événements généraux, export et états du front."))
         self.log_view = LogView()
@@ -1845,10 +1900,17 @@ class CamouflageApp(App):
         fut.add_done_callback(lambda f, k=key: self._on_gallery_projection_done(k, f))
 
     async def _async_build_gallery_projection(self, image_path: Path) -> PILImage.Image:
-        pil_img = await asyncio.to_thread(read_pil_rgb, image_path)
-        await asyncio.to_thread(get_projection_subject_analysis, PROJECTION_CFG)
-        projected = await asyncio.to_thread(projection_preview_image, pil_img, PROJECTION_CFG, self.projection_preview_scale)
-        return await asyncio.to_thread(make_thumbnail, projected, THUMB_SIZE)
+        async with self.gallery_projection_semaphore:
+            pil_img = await asyncio.to_thread(read_pil_rgb, image_path)
+            await asyncio.to_thread(get_projection_subject_analysis, PROJECTION_CFG)
+            projected = await asyncio.to_thread(
+                projection_preview_image,
+                pil_img,
+                PROJECTION_CFG,
+                self.projection_preview_scale,
+                "fast",
+            )
+            return await asyncio.to_thread(make_thumbnail, projected, THUMB_SIZE)
 
     def _on_gallery_projection_done(self, key: str, fut: Future):
         try:
@@ -1880,9 +1942,16 @@ class CamouflageApp(App):
         fut.add_done_callback(lambda f, k=key, img=raw_img.copy(): self._on_preview_projection_done(k, img, f))
 
     async def _async_build_preview_projection(self, image_path: Path) -> PILImage.Image:
-        pil_img = await asyncio.to_thread(read_pil_rgb, image_path)
-        await asyncio.to_thread(get_projection_subject_analysis, PROJECTION_CFG)
-        return await asyncio.to_thread(projection_preview_image, pil_img, PROJECTION_CFG, self.projection_preview_scale)
+        async with self.preview_projection_semaphore:
+            pil_img = await asyncio.to_thread(read_pil_rgb, image_path)
+            await asyncio.to_thread(get_projection_subject_analysis, PROJECTION_CFG)
+            return await asyncio.to_thread(
+                projection_preview_image,
+                pil_img,
+                PROJECTION_CFG,
+                self.projection_preview_scale,
+                "quality",
+            )
 
     def _on_preview_projection_done(self, key: str, raw_img: PILImage.Image, fut: Future):
         try:
@@ -2399,40 +2468,15 @@ class CamouflageApp(App):
 
     def _ml_dl_status_text(self) -> str:
         out = Path(self.current_output_dir)
-        events = self._count_file_lines(out / getattr(camo, "EVENTS_JSONL", "validation_events.jsonl"))
-        accepts = self._count_file_lines(out / getattr(camo, "ACCEPTS_JSONL", "ml_accepts.jsonl"))
-        rejects = self._count_file_lines(out / getattr(camo, "REJECTIONS_JSONL", "ml_rejections.jsonl"))
-        dataset = self._count_file_lines(out / getattr(camo, "FULL_DATASET_JSONL", "ml_dataset_all_attempts.jsonl"))
         checkpoint = out / "surrogate_camouflage.pt"
-        summary = out / "run_summary_ml_dl.json"
-        if summary.exists() or checkpoint.exists():
-            mode = "mode guidé ML/DL détecté"
-        else:
-            mode = "mode guidé ML/DL non branché à cette interface Kivy"
-        return (
-            f"{mode} | preuves dataset: events={events} dataset={dataset} accepts={accepts} rejects={rejects} | "
-            f"checkpoint={'oui' if checkpoint.exists() else 'non'}"
-        )
+        if checkpoint.exists():
+            return "ML/DL : artefacts détectés, mais non synchronisé finement avec le front"
+        return "ML/DL : non synchronisé / indisponible côté front"
 
     def _tolerance_proof_text(self) -> str:
-        initial = self._profile_snapshot(self.tolerance_initial_profile)
-        current = self._profile_snapshot(self.tolerance_profile)
-        rejection_rate = float(self.tolerance_runtime.get("rejection_rate", 0.0))
-        window_count = int(round(float(self.tolerance_runtime.get("window_count", 0.0))))
-        if not current:
-            return "Tolérance dynamique : profil indisponible"
-        return (
-            f"actif={'oui' if self.dynamic_tolerance_enabled else 'non'} | changements {self.tolerance_change_count} | "
-            f"dernier changement essai {self.tolerance_last_change_attempt or '--'} | "
-            f"relax {current.get('relax_level', 0.0):.2f}/{self.max_tolerance_relax:.2f} | "
-            f"rej-fen {rejection_rate:.0%} ({window_count}) | "
-            f"best-of min {initial.get('bestof_min_score', 0.0):.4f}->{current.get('bestof_min_score', 0.0):.4f} | "
-            f"MAE max {initial.get('mean_abs_error', 0.0):.6f}->{current.get('mean_abs_error', 0.0):.6f} | "
-            f"miroir max {initial.get('mirror_max', 0.0):.4f}->{current.get('mirror_max', 0.0):.4f} | "
-            f"composant min {initial.get('largest_min', 0.0):.4f}->{current.get('largest_min', 0.0):.4f} | "
-            f"orphelins {initial.get('orphan_max', 0.0):.4f}->{current.get('orphan_max', 0.0):.4f} verrouillé | "
-            f"micro {initial.get('micro_max', 0.0):.4f}->{current.get('micro_max', 0.0):.4f} verrouillé"
-        )
+        if self.last_validation_payload:
+            return "Tolérance dynamique : pilotée par le backend (état partiel reçu)"
+        return "Tolérance dynamique : non synchronisé côté front"
 
     def _human_rejection_text(self) -> str:
         rules = [name for name, _count in self.diag_rule_counter.most_common(3)]
@@ -2493,7 +2537,7 @@ class CamouflageApp(App):
     async def _async_run_preflight(self) -> Tuple[bool, str]:
         try:
             try:
-                count = int((self.count_input.text if self.count_input is not None else str(DEFAULT_TARGET_COUNT)).strip())
+                count = int(self.requested_target_count)
             except Exception:
                 count = DEFAULT_TARGET_COUNT
 
@@ -2621,6 +2665,7 @@ class CamouflageApp(App):
             self.log("Nombre de camouflages invalide.")
             return
 
+        self.requested_target_count = count
         self._apply_backend_motif_scale()
         self.current_output_dir = DEFAULT_OUTPUT_DIR
         self.current_output_dir.mkdir(parents=True, exist_ok=True)
@@ -2756,107 +2801,162 @@ class CamouflageApp(App):
 
     async def _async_worker_generate(self, target_count: int):
         rows: List[dict] = []
+        total_attempts = 0
+        max_workers, attempt_batch_size, parallel_attempts, machine_intensity = self._max_resource_plan()
+        self.log(
+            f"Plan ressources GUI : workers={max_workers} | batch={attempt_batch_size} | "
+            f"parallel={parallel_attempts} | intensity={machine_intensity:.2f}"
+        )
+        # Choix assumé : ThreadPoolExecutor plutôt que le ProcessPool du backend.
+        # Motif : sous Windows/Kivy, l'utilisation d'un ProcessPool depuis le script GUI
+        # peut provoquer des sous-processus qui réimportent la couche Kivy et ouvrent
+        # des fenêtres noires parasites. Ce plan est moins agressif qu'un vrai pool de
+        # processus, mais beaucoup plus fiable pour un front Kivy.
+        loop = asyncio.get_running_loop()
+        executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="camo-ui")
         try:
-            max_workers, attempt_batch_size, parallel_attempts, machine_intensity = self._max_resource_plan()
-            self.log(
-                f"Plan ressources max : workers={max_workers} | batch={attempt_batch_size} | "
-                f"parallel={parallel_attempts} | intensity={machine_intensity:.2f}"
-            )
+            for target_index in range(1, target_count + 1):
+                local_attempt = 1
+                while True:
+                    if await self._async_should_stop():
+                        await self._async_finish_stopped(rows)
+                        return
 
-            async def progress_callback(
-                target_index: int,
-                local_attempt: int,
-                global_attempt: int,
-                target_total: int,
-                candidate: camo.CandidateResult,
-                outcome: Any,
-            ) -> None:
-                self.total_attempts = int(global_attempt)
-                valid = bool(getattr(outcome, "accepted", bool(outcome)))
-                scores = extract_backend_scores(candidate.ratios, candidate.metrics, outcome)
-                seed = int(getattr(candidate, "seed", 0))
-                tuning_text = (
-                    f"workers {max_workers} | batch {attempt_batch_size} | "
-                    f"best {scores['bestof_score']:.4f} | bd {scores['boundary_density']:.4f} | "
-                    f"miroir {scores['mirror_similarity']:.4f}"
-                )
-                self.update_live_stage(
-                    "génération parallèle max ressources",
-                    target_index,
-                    local_attempt,
-                    seed,
-                    metrics_text=tuning_text,
-                )
-                try:
-                    projection_img = await asyncio.to_thread(
-                        projection_preview_image,
-                        candidate.image,
-                        PROJECTION_CFG,
-                        self.projection_preview_scale,
-                    )
-                except Exception as exc:
-                    projection_img = candidate.image
-                    self.log(f"Projection modèle indisponible : {exc}")
+                    self._update_dynamic_tolerance_profile()
+                    batch = camo.build_batch(target_index, local_attempt, attempt_batch_size, camo.DEFAULT_BASE_SEED)
+                    if not parallel_attempts:
+                        batch = batch[:1]
 
-                self.update_preview(candidate.image, projection_img)
-                await self._register_live_diag(candidate, target_index, local_attempt, outcome)
-                self._update_attempt_status(
-                    target_index,
-                    local_attempt,
-                    global_attempt,
-                    seed,
-                    target_total,
-                    self.accepted_count,
-                    self.diag_rejects,
-                    valid,
-                    candidate.ratios,
-                    scores,
-                    candidate.metrics,
-                )
-                if not valid:
-                    review = PendingManualReview(
+                    tasks = []
+                    for attempt_no, seed in batch:
+                        fut = loop.run_in_executor(
+                            executor,
+                            camo.generate_and_validate_from_seed,
+                            seed,
+                            self.max_repair_rounds,
+                            self.tolerance_profile,
+                            self.anti_pixel,
+                        )
+                        tasks.append(asyncio.create_task(async_wait_generation_future(fut, attempt_no, seed)))
+
+                    ordered_results: List[Tuple[int, camo.CandidateResult, Any, PILImage.Image, Dict[str, float]]] = []
+                    for idx, done in enumerate(asyncio.as_completed(tasks), start=1):
+                        attempt_no, seed, candidate, outcome = await done
+                        total_attempts += 1
+                        self.total_attempts = total_attempts
+                        valid = bool(getattr(outcome, "accepted", bool(outcome)))
+                        self._remember_tolerance_outcome(valid)
+                        self._remember_tolerance_change(total_attempts)
+                        scores = extract_backend_scores(candidate.ratios, candidate.metrics, outcome)
+
+                        if hasattr(camo, "emit_validation_payload"):
+                            try:
+                                payload = await asyncio.to_thread(
+                                    camo.emit_validation_payload,
+                                    output_dir=self.current_output_dir,
+                                    target_index=target_index,
+                                    local_attempt=attempt_no,
+                                    global_attempt=total_attempts,
+                                    candidate=candidate,
+                                    outcome=outcome,
+                                    tolerance_profile=self.tolerance_profile,
+                                    tolerance_runtime=self.tolerance_runtime,
+                                )
+                                self.last_validation_payload = payload
+                                self.validation_event_count += 1
+                            except Exception as exc:
+                                self.log(f"Export validation_payload impossible : {exc}")
+
+                        try:
+                            projection_img = await asyncio.to_thread(
+                                projection_preview_image,
+                                candidate.image,
+                                PROJECTION_CFG,
+                                self.projection_preview_scale,
+                                "quality",
+                            )
+                        except Exception as exc:
+                            projection_img = candidate.image
+                            self.log(f"Projection modèle indisponible : {exc}")
+
+                        ordered_results.append((attempt_no, candidate, outcome, projection_img, scores))
+                        self.update_preview(candidate.image, projection_img)
+                        await self._register_live_diag(candidate, target_index, attempt_no, outcome)
+
+                        metrics_text = (
+                            f"best {scores['bestof_score']:.4f} | bd {scores['boundary_density']:.4f} | "
+                            f"miroir {scores['mirror_similarity']:.4f} | {self._tolerance_proof_text()}"
+                        )
+                        self._update_attempt_status(
+                            target_index,
+                            attempt_no,
+                            total_attempts,
+                            seed,
+                            target_count,
+                            self.accepted_count,
+                            self.diag_rejects,
+                            valid,
+                            candidate.ratios,
+                            scores,
+                            candidate.metrics,
+                        )
+                        if not valid:
+                            review = PendingManualReview(
+                                target_index=target_index,
+                                local_attempt=attempt_no,
+                                global_attempt=total_attempts,
+                                candidate=candidate,
+                                outcome=outcome,
+                                projection_img=projection_img,
+                                metrics_text=metrics_text,
+                            )
+                            self._arm_manual_review(review)
+                            self.update_live_stage("rejeté", target_index, attempt_no, seed, metrics_text=metrics_text, pil_img=projection_img)
+                        else:
+                            self.update_live_stage("accepté potentiel", target_index, attempt_no, seed, metrics_text=metrics_text, pil_img=projection_img)
+                        await asyncio.sleep(0)
+
+                    ordered_results.sort(key=lambda x: x[0])
+                    accepted_item = next(((a, c, o, p, s) for a, c, o, p, s in ordered_results if bool(getattr(o, "accepted", False))), None)
+                    if accepted_item is None:
+                        local_attempt += max(1, len(batch))
+                        await self._adaptive_pause()
+                        continue
+
+                    accepted_attempt, accepted_candidate, accepted_outcome, projection_img, scores = accepted_item
+                    saved_path, mannequin_saved_path = await self._async_save_candidate_bundle(
+                        rows,
                         target_index=target_index,
-                        local_attempt=local_attempt,
-                        global_attempt=global_attempt,
-                        candidate=candidate,
-                        outcome=outcome,
+                        local_attempt=accepted_attempt,
+                        global_attempt=total_attempts,
+                        candidate=accepted_candidate,
+                        outcome=accepted_outcome,
                         projection_img=projection_img,
-                        metrics_text=tuning_text,
+                        manual_accept=False,
                     )
-                    self._arm_manual_review(review)
-                await asyncio.sleep(0)
+                    self.update_live_stage(
+                        "accepté backend",
+                        target_index,
+                        accepted_attempt,
+                        accepted_candidate.seed,
+                        metrics_text=f"best {scores['bestof_score']:.4f} | export {saved_path.name}",
+                        pil_img=projection_img,
+                    )
+                    self.log(
+                        f"[img={target_index:03d}] accepté -> {saved_path.name} | mannequin -> {mannequin_saved_path.name} | "
+                        f"best={scores['bestof_score']:.4f}"
+                    )
+                    await self._adaptive_pause()
+                    break
 
-            rows = await camo.async_generate_all(
-                target_count=target_count,
-                output_dir=self.current_output_dir,
-                base_seed=camo.DEFAULT_BASE_SEED,
-                progress_callback=progress_callback,
-                stop_requested=self._async_should_stop,
-                max_workers=max_workers,
-                attempt_batch_size=attempt_batch_size,
-                parallel_attempts=parallel_attempts,
-                machine_intensity=machine_intensity,
-                resource_sample_every_batches=1,
-                live_console=False,
-                dynamic_tolerance_enabled=self.dynamic_tolerance_enabled,
-                rejection_rate_window=self.rejection_rate_window,
-                rejection_rate_high=self.rejection_rate_high,
-                rejection_rate_low=self.rejection_rate_low,
-                tolerance_min_attempts=self.tolerance_min_attempts,
-                tolerance_relax_step=self.tolerance_relax_step,
-                anti_pixel=self.anti_pixel,
-            )
-
-            self.generated_rows = list(rows)
-            self.accepted_count = len(rows)
-            await self._async_generate_missing_mannequins(rows)
-            self._rebuild_best_records_from_rows(rows)
             await self._async_finish_success(rows)
         except asyncio.CancelledError:
             await self._async_finish_stopped(rows)
             raise
         except Exception as exc:
             await self._async_finish_error(str(exc))
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     async def _async_save_candidate_bundle(
         self,
@@ -2901,6 +3001,7 @@ class CamouflageApp(App):
             candidate=candidate,
             outcome=outcome,
             saved_path=saved_path,
+            manual_accept=manual_accept,
         )
         row["mannequin_image_name"] = mannequin_saved_path.name
         row["mannequin_image_path"] = str(mannequin_saved_path)
@@ -2915,7 +3016,7 @@ class CamouflageApp(App):
                 pass
         rows.append(row)
         self.accepted_count = len(rows)
-        self.update_progress(len(rows), int((self.count_input.text if self.count_input is not None and self.count_input.text.strip().isdigit() else DEFAULT_TARGET_COUNT)))
+        self.update_progress(len(rows), int(self.requested_target_count))
         self.reload_gallery()
         return saved_path, mannequin_saved_path
 
