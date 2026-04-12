@@ -1392,6 +1392,11 @@ class CamouflageApp(App):
         self.anti_pixel = bool(getattr(camo, "DEFAULT_ENABLE_ANTI_PIXEL", True))
         self.tolerance_relax_level = 0.0
         self.tolerance_profile: Optional[Any] = None
+        self.tolerance_initial_profile: Optional[Any] = None
+        self.tolerance_last_snapshot: Optional[Dict[str, float]] = None
+        self.tolerance_change_count = 0
+        self.tolerance_last_change_attempt = 0
+        self.tolerance_history: List[Dict[str, Any]] = []
         self.tolerance_runtime: Dict[str, float] = {
             "rejection_rate": 0.0,
             "window_count": 0.0,
@@ -1399,6 +1404,8 @@ class CamouflageApp(App):
             "relax_after": 0.0,
         }
         self.tolerance_outcomes: List[bool] = []
+        self.validation_event_count = 0
+        self.last_validation_payload: Optional[Dict[str, Any]] = None
 
         self._runtime_subscription_active = False
         self._runtime_subscriber_callback = None
@@ -1564,15 +1571,15 @@ class CamouflageApp(App):
         health_card = GlassCard(orientation="vertical", size_hint_y=None, spacing=dp(10))
         health_card.bind(minimum_height=health_card.setter("height"))
         health_card.add_widget(self._section_title("Santé & qualité", "Lisibilité immédiate de l’état machine et des métriques backend."))
-        self.resource_text = self._small_label("CPU -- | RAM -- | Disque -- | Processus -- | scale --")
-        self.score_text = self._small_label("MAE ratio -- | max abs -- | olive comp. -- | miroir --")
-        self.color_text = self._small_label("C -- | O -- | T -- | G --")
-        self.extra_text = self._small_label("bd -- | bd/4 -- | bd/8 -- | bord --")
-        self.struct_text = self._small_label("overscan -- | shift -- | px/cm --")
-        self.runtime_last_label = self._small_label("Dernier runtime : --")
-        self.diag_summary_label = self._small_label("Tentatives 0 | acceptés 0 | rejetés 0 | taux 0.00%")
-        self.diag_top_rules_label = self._small_label("Top règles : --")
-        self.diag_last_fail_label = self._small_label("Dernier rejet : --")
+        self.resource_text = self._small_label("Machine : CPU -- | RAM -- | Disque -- | Processus --", height=dp(44))
+        self.score_text = self._small_label("Qualité : MAE -- | max abs -- | composant -- | best-of --", height=dp(32))
+        self.color_text = self._small_label("Couleurs : C -- | O -- | T -- | G --", height=dp(32))
+        self.extra_text = self._small_label("Contours : bd -- | bd/4 -- | bd/8 -- | bord --", height=dp(32))
+        self.struct_text = self._small_label("Tolérance dynamique : --", height=dp(54))
+        self.runtime_last_label = self._small_label("Preuve dataset/runtime : --", height=dp(54))
+        self.diag_summary_label = self._small_label("Résumé essais : tentatives 0 | acceptés 0 | rejetés 0", height=dp(54))
+        self.diag_top_rules_label = self._small_label("Pourquoi ça rejette : --", height=dp(54))
+        self.diag_last_fail_label = self._small_label("ML / DL : --", height=dp(54))
         for widget in [
             self.resource_text,
             self.score_text,
@@ -1882,8 +1889,8 @@ class CamouflageApp(App):
         if self.log_view is not None:
             self.log_view.append(line)
         if self.runtime_last_label is not None:
-            short = line if len(line) <= 140 else line[:137] + "..."
-            self.runtime_last_label.text = f"Dernier runtime : {short}"
+            short = line if len(line) <= 180 else line[:177] + "..."
+            self.runtime_last_label.text = f"Preuve dataset/runtime : {short}"
 
     def _subscribe_runtime_feed(self):
         if camo_log is None or self._runtime_subscription_active:
@@ -2171,6 +2178,11 @@ class CamouflageApp(App):
                 self.tolerance_profile = None
         else:
             self.tolerance_profile = None
+        self.tolerance_initial_profile = self.tolerance_profile
+        self.tolerance_last_snapshot = self._profile_snapshot(self.tolerance_profile)
+        self.tolerance_change_count = 0
+        self.tolerance_last_change_attempt = 0
+        self.tolerance_history = []
         self.tolerance_runtime = {
             "rejection_rate": 0.0,
             "window_count": 0.0,
@@ -2178,6 +2190,8 @@ class CamouflageApp(App):
             "relax_after": 0.0,
         }
         self.tolerance_outcomes = []
+        self.validation_event_count = 0
+        self.last_validation_payload = None
 
     def _update_dynamic_tolerance_profile(self):
         adapter = getattr(camo, "adapt_tolerance_relax_level", None)
@@ -2236,29 +2250,127 @@ class CamouflageApp(App):
             txt += f" | best-min {bestof_min:.4f}"
         return txt
 
+    def _profile_snapshot(self, profile: Optional[Any]) -> Dict[str, float]:
+        if profile is None:
+            return {}
+        def _g(name: str, default: float = 0.0) -> float:
+            try:
+                return float(getattr(profile, name, default))
+            except Exception:
+                return float(default)
+        try:
+            per_color = tuple(float(x) for x in getattr(profile, "max_abs_error_per_color", (0.0, 0.0, 0.0, 0.0)))
+        except Exception:
+            per_color = (0.0, 0.0, 0.0, 0.0)
+        return {
+            "relax_level": _g("relax_level"),
+            "mean_abs_error": _g("max_mean_abs_error"),
+            "bestof_min_score": _g("bestof_min_score"),
+            "mirror_max": _g("max_mirror_similarity"),
+            "largest_min": _g("min_largest_component_ratio_class_1"),
+            "edge_max": _g("max_edge_contact_ratio"),
+            "orphan_max": _g("max_orphan_ratio"),
+            "micro_max": _g("max_micro_islands_per_mp"),
+            "ratio_abs_mean": float(sum(per_color) / max(1, len(per_color))),
+        }
+
+    def _remember_tolerance_change(self, global_attempt: int):
+        snap = self._profile_snapshot(self.tolerance_profile)
+        if not snap:
+            return
+        if self.tolerance_last_snapshot is None:
+            self.tolerance_last_snapshot = dict(snap)
+            return
+        changed = any(abs(float(snap.get(k, 0.0)) - float(self.tolerance_last_snapshot.get(k, 0.0))) > 1e-12 for k in snap.keys())
+        if changed:
+            self.tolerance_change_count += 1
+            self.tolerance_last_change_attempt = int(global_attempt)
+            self.tolerance_history.append({
+                "global_attempt": int(global_attempt),
+                "snapshot": dict(snap),
+                "runtime": dict(self.tolerance_runtime),
+            })
+            self.tolerance_last_snapshot = dict(snap)
+
+    def _count_file_lines(self, path: Path) -> int:
+        try:
+            if not path.exists():
+                return 0
+            with path.open("r", encoding="utf-8") as f:
+                return sum(1 for _ in f)
+        except Exception:
+            return 0
+
+    def _ml_dl_status_text(self) -> str:
+        out = Path(self.current_output_dir)
+        events = self._count_file_lines(out / getattr(camo, "EVENTS_JSONL", "validation_events.jsonl"))
+        accepts = self._count_file_lines(out / getattr(camo, "ACCEPTS_JSONL", "ml_accepts.jsonl"))
+        rejects = self._count_file_lines(out / getattr(camo, "REJECTIONS_JSONL", "ml_rejections.jsonl"))
+        dataset = self._count_file_lines(out / getattr(camo, "FULL_DATASET_JSONL", "ml_dataset_all_attempts.jsonl"))
+        checkpoint = out / "surrogate_camouflage.pt"
+        summary = out / "run_summary_ml_dl.json"
+        if summary.exists() or checkpoint.exists():
+            mode = "mode guidé ML/DL détecté"
+        else:
+            mode = "mode guidé ML/DL non branché à cette interface Kivy"
+        return (
+            f"{mode} | preuves dataset: events={events} dataset={dataset} accepts={accepts} rejects={rejects} | "
+            f"checkpoint={'oui' if checkpoint.exists() else 'non'}"
+        )
+
+    def _tolerance_proof_text(self) -> str:
+        initial = self._profile_snapshot(self.tolerance_initial_profile)
+        current = self._profile_snapshot(self.tolerance_profile)
+        rejection_rate = float(self.tolerance_runtime.get("rejection_rate", 0.0))
+        window_count = int(round(float(self.tolerance_runtime.get("window_count", 0.0))))
+        if not current:
+            return "Tolérance dynamique : profil indisponible"
+        return (
+            f"actif={'oui' if self.dynamic_tolerance_enabled else 'non'} | changements {self.tolerance_change_count} | "
+            f"dernier changement essai {self.tolerance_last_change_attempt or '--'} | "
+            f"relax {current.get('relax_level', 0.0):.2f}/{self.max_tolerance_relax:.2f} | "
+            f"rej-fen {rejection_rate:.0%} ({window_count}) | "
+            f"best-of min {initial.get('bestof_min_score', 0.0):.4f}->{current.get('bestof_min_score', 0.0):.4f} | "
+            f"MAE max {initial.get('mean_abs_error', 0.0):.6f}->{current.get('mean_abs_error', 0.0):.6f} | "
+            f"miroir max {initial.get('mirror_max', 0.0):.4f}->{current.get('mirror_max', 0.0):.4f} | "
+            f"composant min {initial.get('largest_min', 0.0):.4f}->{current.get('largest_min', 0.0):.4f} | "
+            f"orphelins {initial.get('orphan_max', 0.0):.4f}->{current.get('orphan_max', 0.0):.4f} verrouillé | "
+            f"micro {initial.get('micro_max', 0.0):.4f}->{current.get('micro_max', 0.0):.4f} verrouillé"
+        )
+
+    def _human_rejection_text(self) -> str:
+        rules = [name for name, _count in self.diag_rule_counter.most_common(3)]
+        if not rules:
+            return "aucun rejet enregistré"
+        explanation = " | ".join(rules)
+        if "orphan_pixels" in rules or "micro_islands" in rules:
+            explanation += " | cause dominante: orphelins / micro-îlots restent stricts, donc la relaxation ne les desserre pas"
+        elif "not_bestof" in rules:
+            explanation += " | cause dominante: le best-of s'est desserré, mais le candidat ne passe toujours pas les règles strictes"
+        return explanation
+
     @mainthread
     def _refresh_diag_labels(self):
         rate = (self.diag_accepts / self.diag_total) if self.diag_total else 0.0
-        tol_text = self._tolerance_debug_text()
         summary_text = (
-            f"Tentatives {self.diag_total} | acceptés {self.diag_accepts} | rejetés {self.diag_rejects} | "
-            f"taux {rate:.2%} | {tol_text}"
+            f"Résumé essais : tentatives {self.diag_total} | acceptés {self.diag_accepts} | "
+            f"rejetés {self.diag_rejects} | taux {rate:.2%}"
         )
         if self.diag_summary_label is not None:
             self.diag_summary_label.text = summary_text
         if self.diag_summary_mini_label is not None:
             self.diag_summary_mini_label.text = summary_text
-        if self.diag_rule_counter:
-            top = " | ".join(f"{n}:{c}" for n, c in self.diag_rule_counter.most_common(3))
-            top_text = f"Top règles : {top} | {tol_text}"
-        else:
-            top_text = f"Top règles : -- | {tol_text}"
+
+        top = " | ".join(f"{n}:{c}" for n, c in self.diag_rule_counter.most_common(3)) if self.diag_rule_counter else "--"
+        why_text = f"Pourquoi ça rejette : {top} | {self._human_rejection_text()}"
         if self.diag_top_rules_label is not None:
-            self.diag_top_rules_label.text = top_text
+            self.diag_top_rules_label.text = why_text
         if self.diag_top_rules_mini_label is not None:
-            self.diag_top_rules_mini_label.text = top_text
+            self.diag_top_rules_mini_label.text = why_text
+
+        ml_text = self._ml_dl_status_text()
         if self.diag_last_fail_label is not None:
-            self.diag_last_fail_label.text = "Dernier rejet : " + (" | ".join(self.diag_last_rules[:4]) if self.diag_last_rules else "--")
+            self.diag_last_fail_label.text = f"ML / DL : {ml_text}"
 
     # ---------- gallery ----------
     @mainthread
@@ -2499,6 +2611,7 @@ class CamouflageApp(App):
                     self._update_dynamic_tolerance_profile()
                     pre_metrics_text = self._tolerance_debug_text()
                     self.update_live_stage("génération backend", target_index, local_attempt, seed, metrics_text=pre_metrics_text)
+                    attempt_started_ts = time.time()
                     candidate, outcome = await async_generate_and_validate_from_seed(
                         seed,
                         tolerance_profile=self.tolerance_profile,
@@ -2507,7 +2620,55 @@ class CamouflageApp(App):
                     )
                     valid = bool(getattr(outcome, "accepted", bool(outcome)))
                     self._remember_tolerance_outcome(valid)
+                    self._remember_tolerance_change(total_attempts)
                     scores = extract_backend_scores(candidate.ratios, candidate.metrics, outcome)
+
+                    if hasattr(camo, "emit_validation_payload"):
+                        try:
+                            payload = await asyncio.to_thread(
+                                camo.emit_validation_payload,
+                                output_dir=self.current_output_dir,
+                                target_index=target_index,
+                                local_attempt=local_attempt,
+                                global_attempt=total_attempts,
+                                candidate=candidate,
+                                outcome=outcome,
+                                tolerance_profile=self.tolerance_profile,
+                                tolerance_runtime=self.tolerance_runtime,
+                            )
+                            self.last_validation_payload = payload
+                            self.validation_event_count += 1
+                        except Exception as exc:
+                            self.log(f"Export validation_payload impossible : {exc}")
+
+                    if camo_log is not None and hasattr(camo_log, "feedback_runtime_event"):
+                        try:
+                            decision = await asyncio.to_thread(
+                                camo_log.feedback_runtime_event,
+                                event_type="attempt_finished",
+                                accepted=valid,
+                                duration_s=float(time.time() - attempt_started_ts),
+                                seed=int(seed),
+                                target_index=int(target_index),
+                                local_attempt=int(local_attempt),
+                                tuning={
+                                    "machine_intensity": backend_machine_intensity(self.machine_intensity),
+                                    "max_workers": 1,
+                                    "attempt_batch_size": 1,
+                                    "parallel_attempts": False,
+                                },
+                                ratios={
+                                    "class_0": float(candidate.ratios[BACKEND_IDX_0]),
+                                    "class_1": float(candidate.ratios[BACKEND_IDX_1]),
+                                    "class_2": float(candidate.ratios[BACKEND_IDX_2]),
+                                    "class_3": float(candidate.ratios[BACKEND_IDX_3]),
+                                },
+                                metrics=dict(candidate.metrics),
+                            )
+                            if decision:
+                                self._emit_runtime("INFO", "supervisor-ui", "Décision superviseur proposée (non appliquée automatiquement par Kivy)", decision=decision)
+                        except Exception as exc:
+                            self.log(f"Feedback superviseur impossible : {exc}")
                     try:
                         projection_img = await asyncio.to_thread(projection_preview_image, candidate.image, PROJECTION_CFG, self.projection_preview_scale)
                     except Exception as exc:
@@ -2521,7 +2682,7 @@ class CamouflageApp(App):
                         f"bd {scores['boundary_density']:.4f} | "
                         f"miroir {scores['mirror_similarity']:.4f} | "
                         f"rebalance {scores['safe_rebalanced_pixels']:.0f} | "
-                        f"{self._tolerance_debug_text()}"
+                        f"{self._tolerance_proof_text()}"
                     )
 
                     if not valid:
@@ -2668,34 +2829,28 @@ class CamouflageApp(App):
         if self.color_text is not None:
             labels = BACKEND_CLASS_LABELS[:4] if len(BACKEND_CLASS_LABELS) >= 4 else ["class_0", "class_1", "class_2", "class_3"]
             self.color_text.text = (
-                f"{labels[0]} {rs[BACKEND_IDX_0]*100:.4f}% | "
+                f"Couleurs : {labels[0]} {rs[BACKEND_IDX_0]*100:.4f}% | "
                 f"{labels[1]} {rs[BACKEND_IDX_1]*100:.4f}% | "
                 f"{labels[2]} {rs[BACKEND_IDX_2]*100:.4f}% | "
                 f"{labels[3]} {rs[BACKEND_IDX_3]*100:.4f}%"
             )
         if self.score_text is not None:
             self.score_text.text = (
-                f"MAE ratio {scores['ratio_mae']:.6f} | "
+                f"Qualité : MAE {scores['ratio_mae']:.6f} | "
                 f"max abs {scores['ratio_max_abs']:.6f} | "
                 f"composant {scores['primary_component_ratio']:.4f} | "
                 f"best-of {scores['bestof_score']:.4f}"
             )
         if self.extra_text is not None:
             self.extra_text.text = (
-                f"bd {scores['boundary_density']:.4f} | "
+                f"Contours : bd {scores['boundary_density']:.4f} | "
                 f"bd/4 {scores['boundary_density_small']:.4f} | "
                 f"bd/8 {scores['boundary_density_tiny']:.4f} | "
                 f"bord {scores['edge_contact_ratio']:.4f}"
             )
         if self.struct_text is not None:
             self.struct_text.text = (
-                f"overscan {safe_metric(metrics, 'overscan'):.4f} | "
-                f"shift {safe_metric(metrics, 'shift_strength'):.4f} | "
-                f"px/cm {safe_metric(metrics, 'px_per_cm'):.4f} | "
-                f"scale {safe_metric(metrics, 'motif_scale', self.motif_scale):.4f} | "
-                f"macros {safe_metric(metrics, 'seed_macros_total'):.0f} | "
-                f"grow {safe_metric(metrics, 'growth_rounds'):.0f} | "
-                f"{self._tolerance_debug_text()}"
+                f"Tolérance dynamique : {self._tolerance_proof_text()}"
             )
 
     async def _async_export_best_of(self, top_k: int) -> Path:
@@ -2811,7 +2966,7 @@ class CamouflageApp(App):
             proc_cpu = self.process.cpu_percent(interval=None) if self.process else 0.0
             proc_mem = self.process.memory_info().rss / (1024 ** 3) if self.process else 0.0
             self.resource_text.text = (
-                f"CPU {cpu:.0f}% | RAM {ram:.0f}% | Disque {disk:.0f}% | "
+                f"Machine : CPU {cpu:.0f}% | RAM {ram:.0f}% | Disque {disk:.0f}% | "
                 f"Processus {proc_cpu:.0f}% / {proc_mem:.2f} Go | motif {self.motif_scale:.2f} | mannequin {self.projection_preview_scale:.2f}"
             )
         except Exception:
