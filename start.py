@@ -82,6 +82,7 @@ from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.gridlayout import GridLayout
 from kivy.uix.image import Image
+from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.label import Label
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.slider import Slider
@@ -1854,6 +1855,25 @@ class CamouflageApp(App):
         btn.bind(on_release=callback)
         return btn
 
+    def _set_image_widget_texture(self, image_widget: Image, pil_img: Optional[PILImage.Image]):
+        placeholder = getattr(image_widget, "_placeholder_label", None)
+        try:
+            if pil_img is None:
+                image_widget.texture = None
+                image_widget.opacity = 0.0
+                if placeholder is not None:
+                    placeholder.opacity = 1.0
+                return
+            image_widget.texture = pil_to_coreimage(pil_img).texture
+            image_widget.opacity = 1.0
+            if placeholder is not None:
+                placeholder.opacity = 0.0
+        except Exception:
+            image_widget.texture = None
+            image_widget.opacity = 0.0
+            if placeholder is not None:
+                placeholder.opacity = 1.0
+
     def _carded_view(self, title: str, image_widget: Image) -> Widget:
         box = GlassCard(orientation="vertical", spacing=dp(8))
         box.add_widget(self._section_title(title))
@@ -1866,6 +1886,7 @@ class CamouflageApp(App):
         pane.bind(width=_sync_ratio)
         Clock.schedule_once(lambda _dt: _sync_ratio(), 0)
 
+        stage = FloatLayout()
         try:
             image_widget.fit_mode = "contain"
         except Exception:
@@ -1874,8 +1895,25 @@ class CamouflageApp(App):
                 image_widget.keep_ratio = True
             except Exception:
                 pass
+        image_widget.size_hint = (1, 1)
+        image_widget.pos_hint = {"x": 0, "y": 0}
+        image_widget.opacity = 0.0
 
-        pane.add_widget(image_widget)
+        placeholder = Label(
+            text=f"{title}\nAperçu en attente",
+            font_size=sp(16),
+            halign="center",
+            valign="middle",
+            color=C["text_muted"],
+            size_hint=(1, 1),
+            pos_hint={"x": 0, "y": 0},
+        )
+        placeholder.bind(size=lambda *a: setattr(placeholder, "text_size", placeholder.size))
+        image_widget._placeholder_label = placeholder
+
+        stage.add_widget(image_widget)
+        stage.add_widget(placeholder)
+        pane.add_widget(stage)
         box.add_widget(pane)
         return box
 
@@ -2109,9 +2147,9 @@ class CamouflageApp(App):
     def update_preview(self, pil_img: PILImage.Image, projection_img: PILImage.Image):
         self._current_preview_raw_img = pil_img.copy()
         if self.preview_img is not None:
-            self.preview_img.texture = pil_to_coreimage(pil_img).texture
+            self._set_image_widget_texture(self.preview_img, pil_img)
         if self.preview_silhouette is not None:
-            self.preview_silhouette.texture = pil_to_coreimage(projection_img).texture
+            self._set_image_widget_texture(self.preview_silhouette, projection_img)
 
     @mainthread
     def update_live_stage(
@@ -2135,10 +2173,10 @@ class CamouflageApp(App):
             self.live_meta_label.text = f"Image {ti} | essai {la} | seed {sd}"
         try:
             if pil_img is not None and self.live_preview_img is not None:
-                self.live_preview_img.texture = pil_to_coreimage(pil_img).texture
+                self._set_image_widget_texture(self.live_preview_img, pil_img)
             elif preview_path and self.live_preview_img is not None and Path(preview_path).exists():
                 img = PILImage.open(preview_path).convert("RGB")
-                self.live_preview_img.texture = pil_to_coreimage(img).texture
+                self._set_image_widget_texture(self.live_preview_img, img)
         except Exception:
             pass
 
