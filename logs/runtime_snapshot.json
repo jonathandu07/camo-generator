@@ -1,9 +1,60 @@
-[
-  {
-    "ts": 1775928174.026467,
-    "level": "INFO",
-    "source": "start",
-    "message": "Interface Kivy démarrée",
-    "payload": {}
-  }
-]
+{
+  "attempt_history_tail": [
+    {
+      "accepted": false,
+      "duration_s": 895.2497718334198,
+      "seed": 202604110002,
+      "target_index": 1,
+      "local_attempt": 1
+    }
+  ],
+  "resource_history_tail": [],
+  "last_decision": {},
+  "last_tuning": {
+    "machine_intensity": 0.9,
+    "max_workers": 1,
+    "attempt_batch_size": 1,
+    "parallel_attempts": false
+  },
+  "runtime_log_tail": [
+    {
+      "ts": 1776005943.3349898,
+      "level": "INFO",
+      "source": "start",
+      "message": "Interface Kivy démarrée",
+      "payload": {}
+    },
+    {
+      "ts": 1776007167.4032476,
+      "level": "WARNING",
+      "source": "supervisor",
+      "message": "Tentative terminée",
+      "payload": {
+        "target_index": 1,
+        "local_attempt": 1,
+        "accepted": false,
+        "duration_s": 895.2497718334198,
+        "tuning": {
+          "machine_intensity": 0.9,
+          "max_workers": 1,
+          "attempt_batch_size": 1,
+          "parallel_attempts": false
+        },
+        "decision": {},
+        "ratios": {
+          "class_0": 0.3200001507040895,
+          "class_1": 0.2800001205632716,
+          "class_2": 0.2199999095775463,
+          "class_3": 0.17999981915509258
+        },
+        "metrics_subset": {
+          "boundary_density": 0.015204023196373456,
+          "boundary_density_small": 0.05911024305555555,
+          "mirror_similarity": 0.252807014371142,
+          "edge_contact_ratio": 0.32208333333333333,
+          "motif_scale": 0.55
+        }
+      }
+    }
+  ]
+}

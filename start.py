@@ -1147,6 +1147,64 @@ def apply_camo_to_reference(
     return out, mask
 
 
+def crop_person_display_16_9(
+    projected_bgr: np.ndarray,
+    subject_bgr: np.ndarray,
+    cfg: ProjectionConfig = PROJECTION_CFG,
+    margin_ratio: float = 0.18,
+) -> np.ndarray:
+    h, w = projected_bgr.shape[:2]
+    target_ratio = 16.0 / 9.0
+    person = person_mask_from_foreground(subject_bgr, cfg)
+    x, y, bw, bh = bbox_from_mask(person)
+    if bw <= 0 or bh <= 0:
+        return projected_bgr
+
+    cx = x + bw / 2.0
+    cy = y + bh / 2.0
+    crop_w = bw * (1.0 + 2.0 * margin_ratio)
+    crop_h = bh * (1.0 + 2.0 * margin_ratio)
+
+    if crop_w / max(1e-6, crop_h) < target_ratio:
+        crop_w = crop_h * target_ratio
+    else:
+        crop_h = crop_w / target_ratio
+
+    scale = min(w / max(1e-6, crop_w), h / max(1e-6, crop_h), 1.0)
+    crop_w *= scale
+    crop_h *= scale
+
+    x0 = int(round(cx - crop_w / 2.0))
+    y0 = int(round(cy - crop_h / 2.0))
+    x1 = int(round(cx + crop_w / 2.0))
+    y1 = int(round(cy + crop_h / 2.0))
+
+    if x0 < 0:
+        x1 -= x0
+        x0 = 0
+    if y0 < 0:
+        y1 -= y0
+        y0 = 0
+    if x1 > w:
+        x0 -= (x1 - w)
+        x1 = w
+    if y1 > h:
+        y0 -= (y1 - h)
+        y1 = h
+
+    x0 = max(0, x0)
+    y0 = max(0, y0)
+    x1 = min(w, x1)
+    y1 = min(h, y1)
+    if x1 <= x0 or y1 <= y0:
+        return projected_bgr
+
+    cropped = projected_bgr[y0:y1, x0:x1]
+    if cropped.size == 0:
+        return projected_bgr
+    return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_CUBIC)
+
+
 def projection_preview_image(
     camo_img: PILImage.Image,
     cfg: ProjectionConfig = PROJECTION_CFG,
@@ -1156,6 +1214,7 @@ def projection_preview_image(
     subject_bgr = analysis.subject_bgr.copy()
     camo_bgr = pil_rgb_to_bgr(camo_img)
     projected_bgr, _mask = apply_camo_to_reference(subject_bgr, camo_bgr, cfg=cfg, user_scale=user_scale)
+    projected_bgr = crop_person_display_16_9(projected_bgr, subject_bgr, cfg=cfg)
     return bgr_to_pil_rgb(projected_bgr)
 
 
@@ -1387,7 +1446,7 @@ class CamouflageApp(App):
         self.best_records: List[CandidateRecord] = []
         self.accepted_count = 0
         self.total_attempts = 0
-        self.machine_intensity = DEFAULT_BACKEND_MACHINE_INTENSITY * 100.0
+        self.machine_intensity = 100.0
         self.motif_scale = DEFAULT_UI_MOTIF_SCALE
         self.projection_preview_scale = DEFAULT_PROJECTION_PREVIEW_SCALE
         self.process = psutil.Process() if psutil else None
@@ -2426,14 +2485,16 @@ class CamouflageApp(App):
             output_dir = self.current_output_dir
             output_dir.mkdir(parents=True, exist_ok=True)
 
+            max_workers = int(getattr(camo, "CPU_COUNT", os.cpu_count() or 1))
+            attempt_batch_size = max(max_workers, max_workers * 2)
             await asyncio.to_thread(
                 camo.validate_generation_request,
                 target_count=max(1, count),
                 output_dir=output_dir,
                 base_seed=int(getattr(camo, "DEFAULT_BASE_SEED", 0)),
-                machine_intensity=intensity,
-                max_workers=1,
-                attempt_batch_size=1,
+                machine_intensity=1.0,
+                max_workers=max_workers,
+                attempt_batch_size=attempt_batch_size,
             )
 
             if hasattr(camo, "sample_process_resources"):
@@ -2613,164 +2674,166 @@ class CamouflageApp(App):
         if extra > 0:
             await asyncio.sleep(extra)
 
+    def _max_resource_plan(self) -> Tuple[int, int, bool, float]:
+        cpu_count = int(getattr(camo, "CPU_COUNT", os.cpu_count() or 1))
+        max_workers = max(1, cpu_count)
+        attempt_batch_size = max(max_workers, max_workers * 2)
+        return max_workers, attempt_batch_size, True, 1.0
+
+    def _rebuild_best_records_from_rows(self, rows: List[dict]):
+        self.best_records.clear()
+        for row in rows:
+            try:
+                image_path = Path(str(row.get("image_path", "")))
+                if not image_path.exists():
+                    continue
+                metrics = {
+                    "largest_component_ratio_class_1": float(row.get("largest_component_ratio_class_1", 0.0)),
+                    "boundary_density": float(row.get("boundary_density", 0.0)),
+                    "boundary_density_small": float(row.get("boundary_density_small", 0.0)),
+                    "boundary_density_tiny": float(row.get("boundary_density_tiny", 0.0)),
+                    "mirror_similarity": float(row.get("mirror_similarity", 0.0)),
+                    "edge_contact_ratio": float(row.get("edge_contact_ratio", 0.0)),
+                    "overscan": float(row.get("overscan", 0.0)),
+                    "shift_strength": float(row.get("shift_strength", 0.0)),
+                    "px_per_cm": float(row.get("px_per_cm", 0.0)),
+                    "bestof_score": float(row.get("bestof_score", 0.0)),
+                }
+                ratios = np.array([
+                    float(row.get("class_0_pct", 0.0)) / 100.0,
+                    float(row.get("class_1_pct", 0.0)) / 100.0,
+                    float(row.get("class_2_pct", 0.0)) / 100.0,
+                    float(row.get("class_3_pct", 0.0)) / 100.0,
+                ], dtype=np.float32)
+                self.best_records.append(CandidateRecord(
+                    index=int(row.get("index", 0)),
+                    seed=int(row.get("seed", 0)),
+                    local_attempt=int(row.get("attempts_for_this_image", 0)),
+                    global_attempt=int(row.get("global_attempt", 0)),
+                    image_path=image_path,
+                    metrics=metrics,
+                    ratios=ratios,
+                ))
+            except Exception:
+                continue
+        self.best_records.sort(key=candidate_rank_key)
+
+    async def _async_generate_missing_mannequins(self, rows: List[dict]):
+        for row in rows:
+            try:
+                image_path = Path(str(row.get("image_path", "")))
+                if not image_path.exists():
+                    continue
+                mannequin_path = self.current_output_dir / MANNEQUIN_DIR_NAME / f"{image_path.stem}__mannequin.png"
+                if mannequin_path.exists():
+                    row["mannequin_image_name"] = mannequin_path.name
+                    row["mannequin_image_path"] = str(mannequin_path)
+                    continue
+                pil_img = await asyncio.to_thread(read_pil_rgb, image_path)
+                projection_img = await asyncio.to_thread(projection_preview_image, pil_img, PROJECTION_CFG, self.projection_preview_scale)
+                saved = await async_save_mannequin_projection(projection_img, image_path, self.current_output_dir)
+                row["mannequin_image_name"] = saved.name
+                row["mannequin_image_path"] = str(saved)
+            except Exception as exc:
+                self.log(f"Projection mannequin post-run impossible : {exc}")
+
     async def _async_worker_generate(self, target_count: int):
         rows: List[dict] = []
-        total_attempts = 0
         try:
-            for target_index in range(1, target_count + 1):
-                local_attempt = 0
-                while True:
-                    if await self._async_should_stop():
-                        await self._async_finish_stopped(rows)
-                        return
+            max_workers, attempt_batch_size, parallel_attempts, machine_intensity = self._max_resource_plan()
+            self.log(
+                f"Plan ressources max : workers={max_workers} | batch={attempt_batch_size} | "
+                f"parallel={parallel_attempts} | intensity={machine_intensity:.2f}"
+            )
 
-                    total_attempts += 1
-                    local_attempt += 1
-                    self.total_attempts = total_attempts
-                    seed = camo.build_seed(target_index, local_attempt, base_seed=camo.DEFAULT_BASE_SEED)
-                    self._update_dynamic_tolerance_profile()
-                    pre_metrics_text = self._tolerance_debug_text()
-                    self.update_live_stage("génération backend", target_index, local_attempt, seed, metrics_text=pre_metrics_text)
-                    attempt_started_ts = time.time()
-                    candidate, outcome = await async_generate_and_validate_from_seed(
-                        seed,
-                        tolerance_profile=self.tolerance_profile,
-                        max_repair_rounds=self.max_repair_rounds,
-                        anti_pixel=self.anti_pixel,
+            async def progress_callback(
+                target_index: int,
+                local_attempt: int,
+                global_attempt: int,
+                target_total: int,
+                candidate: camo.CandidateResult,
+                outcome: Any,
+            ) -> None:
+                self.total_attempts = int(global_attempt)
+                valid = bool(getattr(outcome, "accepted", bool(outcome)))
+                scores = extract_backend_scores(candidate.ratios, candidate.metrics, outcome)
+                seed = int(getattr(candidate, "seed", 0))
+                tuning_text = (
+                    f"workers {max_workers} | batch {attempt_batch_size} | "
+                    f"best {scores['bestof_score']:.4f} | bd {scores['boundary_density']:.4f} | "
+                    f"miroir {scores['mirror_similarity']:.4f}"
+                )
+                self.update_live_stage(
+                    "génération parallèle max ressources",
+                    target_index,
+                    local_attempt,
+                    seed,
+                    metrics_text=tuning_text,
+                )
+                try:
+                    projection_img = await asyncio.to_thread(
+                        projection_preview_image,
+                        candidate.image,
+                        PROJECTION_CFG,
+                        self.projection_preview_scale,
                     )
-                    valid = bool(getattr(outcome, "accepted", bool(outcome)))
-                    self._remember_tolerance_outcome(valid)
-                    self._remember_tolerance_change(total_attempts)
-                    scores = extract_backend_scores(candidate.ratios, candidate.metrics, outcome)
+                except Exception as exc:
+                    projection_img = candidate.image
+                    self.log(f"Projection modèle indisponible : {exc}")
 
-                    if hasattr(camo, "emit_validation_payload"):
-                        try:
-                            payload = await asyncio.to_thread(
-                                camo.emit_validation_payload,
-                                output_dir=self.current_output_dir,
-                                target_index=target_index,
-                                local_attempt=local_attempt,
-                                global_attempt=total_attempts,
-                                candidate=candidate,
-                                outcome=outcome,
-                                tolerance_profile=self.tolerance_profile,
-                                tolerance_runtime=self.tolerance_runtime,
-                            )
-                            self.last_validation_payload = payload
-                            self.validation_event_count += 1
-                        except Exception as exc:
-                            self.log(f"Export validation_payload impossible : {exc}")
-
-                    if camo_log is not None and hasattr(camo_log, "feedback_runtime_event"):
-                        try:
-                            decision = await asyncio.to_thread(
-                                camo_log.feedback_runtime_event,
-                                event_type="attempt_finished",
-                                accepted=valid,
-                                duration_s=float(time.time() - attempt_started_ts),
-                                seed=int(seed),
-                                target_index=int(target_index),
-                                local_attempt=int(local_attempt),
-                                tuning={
-                                    "machine_intensity": backend_machine_intensity(self.machine_intensity),
-                                    "max_workers": 1,
-                                    "attempt_batch_size": 1,
-                                    "parallel_attempts": False,
-                                },
-                                ratios={
-                                    "class_0": float(candidate.ratios[BACKEND_IDX_0]),
-                                    "class_1": float(candidate.ratios[BACKEND_IDX_1]),
-                                    "class_2": float(candidate.ratios[BACKEND_IDX_2]),
-                                    "class_3": float(candidate.ratios[BACKEND_IDX_3]),
-                                },
-                                metrics=dict(candidate.metrics),
-                            )
-                            if decision:
-                                self._emit_runtime("INFO", "supervisor-ui", "Décision superviseur proposée (non appliquée automatiquement par Kivy)", decision=decision)
-                        except Exception as exc:
-                            self.log(f"Feedback superviseur impossible : {exc}")
-                    try:
-                        projection_img = await asyncio.to_thread(projection_preview_image, candidate.image, PROJECTION_CFG, self.projection_preview_scale)
-                    except Exception as exc:
-                        projection_img = candidate.image
-                        self.log(f"Projection modèle indisponible : {exc}")
-                    self.update_preview(candidate.image, projection_img)
-                    await self._register_live_diag(candidate, target_index, local_attempt, outcome)
-
-                    metrics_text = (
-                        f"best {scores['bestof_score']:.4f} | "
-                        f"bd {scores['boundary_density']:.4f} | "
-                        f"miroir {scores['mirror_similarity']:.4f} | "
-                        f"rebalance {scores['safe_rebalanced_pixels']:.0f} | "
-                        f"{self._tolerance_proof_text()}"
-                    )
-
-                    if not valid:
-                        self.update_live_stage("rejeté", target_index, local_attempt, seed, metrics_text=metrics_text, pil_img=projection_img)
-                        self._update_attempt_status(
-                            target_index,
-                            local_attempt,
-                            total_attempts,
-                            seed,
-                            target_count,
-                            self.accepted_count,
-                            self.diag_rejects,
-                            False,
-                            candidate.ratios,
-                            scores,
-                            candidate.metrics,
-                        )
-                        self.log(
-                            f"[img={target_index:03d} essai={local_attempt:04d}] rejeté | "
-                            f"MAE={scores['ratio_mae']:.6f} | best={scores['bestof_score']:.4f} | bd={scores['boundary_density']:.4f}"
-                        )
-                        review = PendingManualReview(
-                            target_index=target_index,
-                            local_attempt=local_attempt,
-                            global_attempt=total_attempts,
-                            candidate=candidate,
-                            outcome=outcome,
-                            projection_img=projection_img,
-                            metrics_text=metrics_text,
-                        )
-                        self._arm_manual_review(review)
-                        await self._adaptive_pause()
-                        await asyncio.sleep(0)
-                        continue
-
-                    self.update_live_stage("export image", target_index, local_attempt, seed, metrics_text=metrics_text, pil_img=projection_img)
-                    saved_path, mannequin_saved_path = await self._async_save_candidate_bundle(
-                        rows,
+                self.update_preview(candidate.image, projection_img)
+                await self._register_live_diag(candidate, target_index, local_attempt, outcome)
+                self._update_attempt_status(
+                    target_index,
+                    local_attempt,
+                    global_attempt,
+                    seed,
+                    target_total,
+                    self.accepted_count,
+                    self.diag_rejects,
+                    valid,
+                    candidate.ratios,
+                    scores,
+                    candidate.metrics,
+                )
+                if not valid:
+                    review = PendingManualReview(
                         target_index=target_index,
                         local_attempt=local_attempt,
-                        global_attempt=total_attempts,
+                        global_attempt=global_attempt,
                         candidate=candidate,
                         outcome=outcome,
                         projection_img=projection_img,
-                        manual_accept=False,
+                        metrics_text=tuning_text,
                     )
-                    self.update_live_stage("accepté", target_index, local_attempt, seed, metrics_text=metrics_text, pil_img=projection_img)
-                    self._update_attempt_status(
-                        target_index,
-                        local_attempt,
-                        total_attempts,
-                        seed,
-                        target_count,
-                        self.accepted_count,
-                        self.diag_rejects,
-                        True,
-                        candidate.ratios,
-                        scores,
-                        candidate.metrics,
-                    )
-                    self.log(
-                        f"[img={target_index:03d}] accepté -> {saved_path.name} | "
-                        f"mannequin -> {mannequin_saved_path.name} | "
-                        f"MAE={scores['ratio_mae']:.6f} | best={scores['bestof_score']:.4f} | composant={scores['primary_component_ratio']:.4f}"
-                    )
-                    await self._adaptive_pause()
-                    await asyncio.sleep(0)
-                    break
+                    self._arm_manual_review(review)
+                await asyncio.sleep(0)
+
+            rows = await camo.async_generate_all(
+                target_count=target_count,
+                output_dir=self.current_output_dir,
+                base_seed=camo.DEFAULT_BASE_SEED,
+                progress_callback=progress_callback,
+                stop_requested=self._async_should_stop,
+                max_workers=max_workers,
+                attempt_batch_size=attempt_batch_size,
+                parallel_attempts=parallel_attempts,
+                machine_intensity=machine_intensity,
+                resource_sample_every_batches=1,
+                live_console=False,
+                dynamic_tolerance_enabled=self.dynamic_tolerance_enabled,
+                rejection_rate_window=self.rejection_rate_window,
+                rejection_rate_high=self.rejection_rate_high,
+                rejection_rate_low=self.rejection_rate_low,
+                tolerance_min_attempts=self.tolerance_min_attempts,
+                tolerance_relax_step=self.tolerance_relax_step,
+                anti_pixel=self.anti_pixel,
+            )
+
+            self.generated_rows = list(rows)
+            self.accepted_count = len(rows)
+            await self._async_generate_missing_mannequins(rows)
+            self._rebuild_best_records_from_rows(rows)
             await self._async_finish_success(rows)
         except asyncio.CancelledError:
             await self._async_finish_stopped(rows)
