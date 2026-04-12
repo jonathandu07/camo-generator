@@ -27,6 +27,8 @@ import math
 import random
 import sys
 import time
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -154,6 +156,8 @@ class MLDLConfig:
     early_stopping_patience: int = 6
     early_stopping_min_delta: float = 1e-4
     random_seed: int = 12345
+    parallel_train_enabled: bool = True
+    parallel_train_min_interval_s: float = 3.0
 
 
 @dataclass
@@ -743,6 +747,15 @@ class CamouflageMLDLGenerator:
         self.training_log: List[Dict[str, Any]] = []
         self.last_rejected_candidate: Optional[camo.CandidateResult] = None
         self.last_analysis: Optional[RejectionAnalysis] = None
+
+        self._buffer_lock = threading.RLock()
+        self._trainer_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="camo-mldl-trainer")
+        self._train_future: Optional[Future] = None
+        self._last_train_request_ts = 0.0
+        self._last_train_request_samples = 0
+        self._latest_train_stats: Optional[Dict[str, float]] = None
+        self._latest_train_error: Optional[str] = None
+
         self._maybe_load_existing_state()
 
     def _maybe_load_existing_state(self) -> None:
@@ -774,18 +787,141 @@ class CamouflageMLDLGenerator:
             return "cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu"
         return device
 
+    def _buffer_arrays_copy(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        with self._buffer_lock:
+            return self.buffer.as_arrays()
+
+    def _write_parallel_training_log(self) -> None:
+        path = self.output_dir / "training_log_ml_dl.json"
+        payload = {
+            "training_log": self.training_log,
+            "latest_stats": self._latest_train_stats,
+            "latest_error": self._latest_train_error,
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _train_snapshot_worker(
+        self,
+        x: np.ndarray,
+        y_valid: np.ndarray,
+        y_reward: np.ndarray,
+        sample_count: int,
+    ) -> Dict[str, Any]:
+        surrogate = DeepSurrogate(
+            input_dim=len(FEATURE_KEYS),
+            hidden_dim=self.cfg.hidden_dim,
+            lr=self.cfg.learning_rate,
+            device=self.device,
+        )
+        stats = surrogate.fit(
+            x,
+            y_valid,
+            y_reward,
+            epochs=self.cfg.train_epochs,
+            batch_size=self.cfg.batch_size,
+            val_split=self.cfg.val_split,
+            patience=self.cfg.early_stopping_patience,
+            min_delta=self.cfg.early_stopping_min_delta,
+            random_seed=self.cfg.random_seed,
+        )
+        checkpoint_tmp = self.output_dir / f"{self.cfg.checkpoint_name}.tmp"
+        dataset_tmp = self.output_dir / f"{self.cfg.dataset_name}.tmp.npz"
+        surrogate.save(checkpoint_tmp)
+        np.savez_compressed(dataset_tmp, x=x, y_valid=y_valid, y_reward=y_reward)
+        checkpoint_final = self.output_dir / self.cfg.checkpoint_name
+        dataset_final = self.output_dir / self.cfg.dataset_name
+        checkpoint_tmp.replace(checkpoint_final)
+        dataset_tmp.replace(dataset_final)
+        return {
+            "n_samples": int(sample_count),
+            "stats": stats,
+            "ts": time.time(),
+            "checkpoint": str(checkpoint_final),
+            "dataset": str(dataset_final),
+        }
+
+    def _schedule_background_train(self, force: bool = False) -> Optional[Future]:
+        if not self.cfg.parallel_train_enabled:
+            return None
+        self._poll_background_train()
+        if self._train_future is not None and not self._train_future.done():
+            return self._train_future
+
+        x, y_valid, y_reward = self._buffer_arrays_copy()
+        sample_count = int(len(x))
+        if sample_count < self.cfg.min_train_size:
+            return None
+        if not force and (sample_count % self.cfg.retrain_every != 0):
+            return None
+
+        now = time.time()
+        if not force and (now - self._last_train_request_ts) < float(self.cfg.parallel_train_min_interval_s):
+            return None
+
+        self._last_train_request_ts = now
+        self._last_train_request_samples = sample_count
+        self._latest_train_error = None
+        self._train_future = self._trainer_pool.submit(
+            self._train_snapshot_worker,
+            np.asarray(x, dtype=np.float32).copy(),
+            np.asarray(y_valid, dtype=np.float32).copy(),
+            np.asarray(y_reward, dtype=np.float32).copy(),
+            sample_count,
+        )
+        return self._train_future
+
+    def _apply_latest_checkpoint(self) -> None:
+        checkpoint = self.output_dir / self.cfg.checkpoint_name
+        if checkpoint.exists():
+            self.surrogate.load(checkpoint)
+
+    def _poll_background_train(self) -> Optional[Dict[str, Any]]:
+        fut = self._train_future
+        if fut is None or not fut.done():
+            return None
+        self._train_future = None
+        try:
+            payload = fut.result()
+        except Exception as exc:
+            self._latest_train_error = str(exc)
+            self.training_log.append({
+                "ts": time.time(),
+                "error": self._latest_train_error,
+                "n_samples": int(self._last_train_request_samples),
+            })
+            self._write_parallel_training_log()
+            return None
+
+        self._apply_latest_checkpoint()
+        self._latest_train_stats = dict(payload.get("stats", {}))
+        self.training_log.append(payload)
+        self._write_parallel_training_log()
+        return payload
+
+    def _flush_background_train(self) -> None:
+        fut = self._train_future
+        if fut is None:
+            return
+        self._train_future = None
+        payload = fut.result()
+        self._apply_latest_checkpoint()
+        self._latest_train_stats = dict(payload.get("stats", {}))
+        self.training_log.append(payload)
+        self._write_parallel_training_log()
+
     def warmup(self) -> None:
         for i in range(self.cfg.warmup_samples):
             seed = camo.build_seed(0, i + 1, self.cfg.base_seed)
             candidate, outcome = camo.generate_and_validate_from_seed(seed)
             accepted = bool(outcome.accepted)
-            self.buffer.add(candidate, accepted)
+            with self._buffer_lock:
+                self.buffer.add(candidate, accepted)
             if not accepted:
                 self.last_rejected_candidate = candidate
                 self.last_analysis = analyze_rejection(candidate, target_index=0, local_attempt=i + 1)
 
     def maybe_train(self, force: bool = False) -> Optional[Dict[str, float]]:
-        x, y_valid, y_reward = self.buffer.as_arrays()
+        x, y_valid, y_reward = self._buffer_arrays_copy()
         if len(x) < self.cfg.min_train_size:
             return None
         if not force and (len(x) % self.cfg.retrain_every != 0):
@@ -807,7 +943,10 @@ class CamouflageMLDLGenerator:
             "ts": time.time(),
         })
         self.surrogate.save(self.output_dir / self.cfg.checkpoint_name)
-        self.buffer.save(self.output_dir / self.cfg.dataset_name)
+        with self._buffer_lock:
+            self.buffer.save(self.output_dir / self.cfg.dataset_name)
+        self._latest_train_stats = dict(stats)
+        self._write_parallel_training_log()
         return stats
 
     def _select_action_indexes(self, analysis: Optional[RejectionAnalysis]) -> List[int]:
@@ -822,6 +961,7 @@ class CamouflageMLDLGenerator:
         return ranked + others[: max(0, self.cfg.candidate_pool_size - len(ranked))]
 
     def _propose_candidates(self, target_index: int, local_attempt: int, analysis: Optional[RejectionAnalysis]) -> List[Proposal]:
+        self._poll_background_train()
         proposals: List[Proposal] = []
         action_indexes = self._select_action_indexes(analysis)
         for offset, action_idx in enumerate(action_indexes, start=0):
@@ -864,8 +1004,10 @@ class CamouflageMLDLGenerator:
                 pred_reward=proposal.pred_reward,
             )
             real_ok = bool(final_outcome.accepted)
-            reward = self.buffer.add(proposal.candidate, real_ok)
-            self.maybe_train(force=False)
+            with self._buffer_lock:
+                reward = self.buffer.add(proposal.candidate, real_ok)
+            self._schedule_background_train(force=False)
+            self._poll_background_train()
 
             if real_ok:
                 accepted = proposal
@@ -890,7 +1032,10 @@ class CamouflageMLDLGenerator:
 
     def generate(self) -> List[Dict[str, object]]:
         self.warmup()
+        # Bootstrap synchrone pour obtenir un premier modèle utile,
+        # puis entraînement continu en arrière-plan pendant la génération.
         self.maybe_train(force=True)
+        self._schedule_background_train(force=True)
 
         if self.last_rejected_candidate is None:
             self.last_rejected_candidate = camo.generate_candidate_from_seed(self.cfg.base_seed)
@@ -902,6 +1047,7 @@ class CamouflageMLDLGenerator:
             current_analysis = self.last_analysis
 
             while local_attempt <= self.cfg.max_attempts_per_target:
+                self._poll_background_train()
                 proposals = self._propose_candidates(
                     target_index=target_index,
                     local_attempt=local_attempt,
@@ -935,8 +1081,10 @@ class CamouflageMLDLGenerator:
                     f"dans la limite de {self.cfg.max_attempts_per_target} tentatives locales."
                 )
 
+        self._flush_background_train()
         camo.write_report(self.rows, self.output_dir, filename=self.cfg.report_name)
         self._write_summary()
+        self._trainer_pool.shutdown(wait=False, cancel_futures=False)
         return self.rows
 
     def _write_summary(self) -> None:
@@ -947,6 +1095,9 @@ class CamouflageMLDLGenerator:
             "total_rows": len(self.rows),
             "total_attempts": self.total_attempts,
             "training_log": self.training_log,
+            "latest_train_stats": self._latest_train_stats,
+            "latest_train_error": self._latest_train_error,
+            "parallel_train_enabled": bool(self.cfg.parallel_train_enabled),
             "report": str((self.output_dir / self.cfg.report_name).resolve()),
             "checkpoint": str((self.output_dir / self.cfg.checkpoint_name).resolve()),
             "dataset": str((self.output_dir / self.cfg.dataset_name).resolve()),
@@ -984,6 +1135,8 @@ def parse_args() -> MLDLConfig:
     parser.add_argument("--early-stopping-patience", type=int, default=6)
     parser.add_argument("--early-stopping-min-delta", type=float, default=1e-4)
     parser.add_argument("--random-seed", type=int, default=12345)
+    parser.add_argument("--parallel-train-enabled", action="store_true", default=True)
+    parser.add_argument("--parallel-train-min-interval-s", type=float, default=3.0)
     args = parser.parse_args()
     return MLDLConfig(
         target_count=args.target_count,
@@ -1005,6 +1158,8 @@ def parse_args() -> MLDLConfig:
         early_stopping_patience=args.early_stopping_patience,
         early_stopping_min_delta=args.early_stopping_min_delta,
         random_seed=args.random_seed,
+        parallel_train_enabled=bool(args.parallel_train_enabled),
+        parallel_train_min_interval_s=float(args.parallel_train_min_interval_s),
     )
 
 
@@ -1029,6 +1184,8 @@ def build_config_from_main_args(args: Any) -> MLDLConfig:
         early_stopping_patience=int(getattr(args, "mldl_early_stopping_patience", 6)),
         early_stopping_min_delta=float(getattr(args, "mldl_early_stopping_min_delta", 1e-4)),
         random_seed=int(getattr(args, "random_seed", 12345)),
+        parallel_train_enabled=bool(getattr(args, "mldl_parallel_train_enabled", True)),
+        parallel_train_min_interval_s=float(getattr(args, "mldl_parallel_train_min_interval_s", 3.0)),
     )
 
 
