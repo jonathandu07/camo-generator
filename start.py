@@ -1549,6 +1549,7 @@ class CamouflageApp(App):
         self._current_preview_raw_img: Optional[PILImage.Image] = None
         self.pending_manual_review: Optional[PendingManualReview] = None
         self.generated_rows: List[dict] = []
+        self._gallery_reload_scheduled = False
 
         self.status_label: Optional[Label] = None
         self.attempt_text: Optional[Label] = None
@@ -1917,6 +1918,15 @@ class CamouflageApp(App):
         box.add_widget(pane)
         return box
 
+    def schedule_gallery_reload(self, delay: float = 0.12) -> None:
+        Clock.unschedule(self._run_scheduled_gallery_reload)
+        self._gallery_reload_scheduled = True
+        Clock.schedule_once(self._run_scheduled_gallery_reload, delay)
+
+    def _run_scheduled_gallery_reload(self, _dt) -> None:
+        self._gallery_reload_scheduled = False
+        self.reload_gallery()
+
     def _projection_cache_key(self, image_path: Path) -> str:
         try:
             stat = image_path.stat()
@@ -2207,6 +2217,7 @@ class CamouflageApp(App):
                 preview_path=str(preview_path) if preview_path else None,
             )
 
+    @mainthread
     def _refresh_controls_state(self):
         if self.start_btn is not None:
             self.start_btn.disabled = self.running or self.stopping or self.preflight_running
@@ -2252,10 +2263,18 @@ class CamouflageApp(App):
 
         if self._current_preview_raw_img is not None:
             raw = self._current_preview_raw_img.copy()
-            fut = self.async_runner.submit(asyncio.to_thread(projection_preview_image, raw, PROJECTION_CFG, self.projection_preview_scale))
+            fut = self.async_runner.submit(
+                asyncio.to_thread(
+                    projection_preview_image,
+                    raw,
+                    PROJECTION_CFG,
+                    self.projection_preview_scale,
+                    "fast",
+                )
+            )
             fut.add_done_callback(lambda f, img=raw: self._on_live_projection_scale_done(img, f))
 
-        Clock.schedule_once(lambda _dt: self.reload_gallery(), 0.05)
+        self.schedule_gallery_reload(0.08)
 
     def _on_live_projection_scale_done(self, raw_img: PILImage.Image, fut: Future):
         try:
@@ -2775,10 +2794,35 @@ class CamouflageApp(App):
             await asyncio.sleep(extra)
 
     def _max_resource_plan(self) -> Tuple[int, int, bool, float]:
+        intensity = backend_machine_intensity(self.machine_intensity)
+        try:
+            sampler = getattr(camo, "sample_process_resources", None)
+            sample = sampler(machine_intensity=intensity, output_dir=self.current_output_dir) if callable(sampler) else None
+            planner = getattr(camo, "compute_runtime_tuning", None)
+            if callable(planner):
+                tuning = planner(
+                    max_workers=None,
+                    attempt_batch_size=None,
+                    parallel_attempts=True,
+                    machine_intensity=intensity,
+                    sample=sample,
+                )
+                max_workers = max(1, int(getattr(tuning, "max_workers", 1)))
+                attempt_batch_size = max(1, int(getattr(tuning, "attempt_batch_size", max_workers)))
+                parallel = bool(getattr(tuning, "parallel_attempts", max_workers > 1))
+                tuned_intensity = float(getattr(tuning, "machine_intensity", intensity))
+                # Front Kivy: on garde toujours 1 coeur pour l'UI si possible.
+                if max_workers > 1:
+                    max_workers = max(1, min(max_workers, int(getattr(camo, "CPU_COUNT", os.cpu_count() or 1)) - 1 or 1))
+                attempt_batch_size = max(1, min(attempt_batch_size, max_workers * 2))
+                return max_workers, attempt_batch_size, parallel, tuned_intensity
+        except Exception:
+            pass
+
         cpu_count = int(getattr(camo, "CPU_COUNT", os.cpu_count() or 1))
-        max_workers = max(1, cpu_count)
+        max_workers = max(1, cpu_count - 1) if cpu_count > 2 else 1
         attempt_batch_size = max(max_workers, max_workers * 2)
-        return max_workers, attempt_batch_size, True, 1.0
+        return max_workers, attempt_batch_size, max_workers > 1, intensity
 
     def _rebuild_best_records_from_rows(self, rows: List[dict]):
         self.best_records.clear()
@@ -2905,13 +2949,14 @@ class CamouflageApp(App):
                             except Exception as exc:
                                 self.log(f"Export validation_payload impossible : {exc}")
 
+                        preview_mode = "quality" if valid else "fast"
                         try:
                             projection_img = await asyncio.to_thread(
                                 projection_preview_image,
                                 candidate.image,
                                 PROJECTION_CFG,
                                 self.projection_preview_scale,
-                                "quality",
+                                preview_mode,
                             )
                         except Exception as exc:
                             projection_img = candidate.image
@@ -2962,6 +3007,16 @@ class CamouflageApp(App):
                         continue
 
                     accepted_attempt, accepted_candidate, accepted_outcome, projection_img, scores = accepted_item
+                    try:
+                        projection_img = await asyncio.to_thread(
+                            projection_preview_image,
+                            accepted_candidate.image,
+                            PROJECTION_CFG,
+                            self.projection_preview_scale,
+                            "quality",
+                        )
+                    except Exception:
+                        pass
                     saved_path, mannequin_saved_path = await self._async_save_candidate_bundle(
                         rows,
                         target_index=target_index,
@@ -3055,7 +3110,7 @@ class CamouflageApp(App):
         rows.append(row)
         self.accepted_count = len(rows)
         self.update_progress(len(rows), int(self.requested_target_count))
-        self.reload_gallery()
+        self.schedule_gallery_reload(0.02)
         return saved_path, mannequin_saved_path
 
     @mainthread
@@ -3144,41 +3199,51 @@ class CamouflageApp(App):
             writer.writeheader()
             writer.writerows(rows)
 
-    async def _async_finish_success(self, rows: List[dict]):
-        report_path = await async_write_report(rows, self.current_output_dir, filename=REPORT_NAME)
-        best_dir = await self._async_export_best_of(min(DEFAULT_TOP_K, len(self.best_records)))
+    @mainthread
+    def _apply_run_finished(self, status_text: str, ok: bool, log_lines: List[str], reload_gallery: bool = True):
         prevent_sleep(False)
         self.running = False
         self.stopping = False
         self.stop_flag = False
-        self.status("Terminé", ok=True)
-        self.log(f"Rapport écrit : {report_path}")
-        self.log(f"Best-of exporté : {best_dir}")
-        self.reload_gallery()
+        self.status(status_text, ok=ok)
+        for line in log_lines:
+            self.log(line)
+        if reload_gallery:
+            self.reload_gallery()
         self._refresh_controls_state()
+
+    async def _async_finish_success(self, rows: List[dict]):
+        report_path = await async_write_report(rows, self.current_output_dir, filename=REPORT_NAME)
+        best_dir = await self._async_export_best_of(min(DEFAULT_TOP_K, len(self.best_records)))
+        Clock.schedule_once(
+            lambda _dt, rp=str(report_path), bd=str(best_dir): self._apply_run_finished(
+                "Terminé",
+                True,
+                [f"Rapport écrit : {rp}", f"Best-of exporté : {bd}"],
+                True,
+            ),
+            0,
+        )
 
     async def _async_finish_stopped(self, rows: List[dict]):
         report_path = await async_write_report(rows, self.current_output_dir, filename=REPORT_NAME)
         if rows:
             await self._async_export_best_of(min(DEFAULT_TOP_K, len(rows)))
-        prevent_sleep(False)
-        self.running = False
-        self.stopping = False
-        self.stop_flag = False
-        self.status("Arrêté", ok=False)
-        self.log(f"Rapport partiel : {report_path}")
-        self.reload_gallery()
-        self._refresh_controls_state()
+        Clock.schedule_once(
+            lambda _dt, rp=str(report_path): self._apply_run_finished(
+                "Arrêté",
+                False,
+                [f"Rapport partiel : {rp}"],
+                True,
+            ),
+            0,
+        )
 
     async def _async_finish_error(self, message: str):
-        prevent_sleep(False)
-        self.running = False
-        self.stopping = False
-        self.stop_flag = False
-        self.status("Erreur", ok=False)
-        self.log(f"Erreur : {message}")
-        self.diag_log(f"Erreur diagnostic : {message}")
-        self._refresh_controls_state()
+        Clock.schedule_once(
+            lambda _dt, msg=str(message): self._finish_error(msg),
+            0,
+        )
 
     @mainthread
     def _finish_error(self, message: str):
@@ -3188,6 +3253,7 @@ class CamouflageApp(App):
         self.stop_flag = False
         self.status("Erreur", ok=False)
         self.log(f"Erreur : {message}")
+        self.diag_log(f"Erreur diagnostic : {message}")
         self._refresh_controls_state()
 
     # ---------- monitoring ----------
