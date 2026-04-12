@@ -1747,14 +1747,14 @@ class CamouflageApp(App):
         # ---------------------
         # RIGHT CONTENT
         # ---------------------
-        preview_row = GridLayout(cols=2, spacing=dp(12), size_hint_y=None, height=dp(340))
+        preview_row = GridLayout(cols=2, spacing=dp(12), size_hint_y=None, height=dp(300))
         self.preview_img = Image()
         self.preview_silhouette = Image()
         preview_row.add_widget(self._carded_view("Camouflage courant", self.preview_img))
         preview_row.add_widget(self._carded_view("Projection sur soldat modèle", self.preview_silhouette))
         right.add_widget(preview_row)
 
-        info_row = GridLayout(cols=3, spacing=dp(12), size_hint_y=None, height=dp(136))
+        info_row = GridLayout(cols=3, spacing=dp(12), size_hint_y=None, height=dp(110))
 
         progress_card = GlassCard(orientation="vertical", spacing=dp(8))
         progress_card.add_widget(self._section_title("Progression", "Suivi du lot courant."))
@@ -1779,7 +1779,7 @@ class CamouflageApp(App):
         info_row.add_widget(manual_card)
         right.add_widget(info_row)
 
-        live_card = GlassCard(orientation="vertical", size_hint_y=None, height=dp(238), spacing=dp(8))
+        live_card = GlassCard(orientation="vertical", size_hint_y=None, height=dp(190), spacing=dp(8))
         live_card.add_widget(self._section_title("Suivi direct de construction", "Ce que le pipeline est en train de faire maintenant."))
         self.live_stage_label = self._small_label("Étape : attente")
         self.live_counts_label = self._small_label("État backend strict")
@@ -1793,15 +1793,15 @@ class CamouflageApp(App):
         live_card.add_widget(live_pane)
         right.add_widget(live_card)
 
-        bottom = GridLayout(cols=2, spacing=dp(12))
-        log_card = GlassCard(orientation="vertical", spacing=dp(10))
-        log_card.add_widget(self._section_title("Journal opérationnel", "Événements généraux, export et états du front."))
+        bottom = GridLayout(cols=1, spacing=dp(12), size_hint_y=1)
+        log_card = GlassCard(orientation="vertical", spacing=dp(10), size_hint_y=0.52)
+        log_card.add_widget(self._section_title("Journal opérationnel", "Vue large pour les événements généraux, exports et états du front."))
         self.log_view = LogView()
         log_card.add_widget(self.log_view)
         bottom.add_widget(log_card)
 
-        diag_card = GlassCard(orientation="vertical", spacing=dp(10))
-        diag_card.add_widget(self._section_title("Diagnostic live", "Raisons de rejet et détails candidat par candidat."))
+        diag_card = GlassCard(orientation="vertical", spacing=dp(10), size_hint_y=0.48)
+        diag_card.add_widget(self._section_title("Diagnostic live", "Vue large des rejets, règles et détails candidat par candidat."))
         self.diag_log_view = LogView()
         diag_card.add_widget(self.diag_log_view)
         bottom.add_widget(diag_card)
