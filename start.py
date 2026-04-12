@@ -84,6 +84,7 @@ from kivy.uix.gridlayout import GridLayout
 from kivy.uix.image import Image
 from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.label import Label
+from kivy.uix.popup import Popup
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.slider import Slider
 from kivy.uix.textinput import TextInput
@@ -1794,14 +1795,20 @@ class CamouflageApp(App):
         right.add_widget(live_card)
 
         bottom = GridLayout(cols=1, spacing=dp(12), size_hint_y=1)
-        log_card = GlassCard(orientation="vertical", spacing=dp(10), size_hint_y=0.52)
+        log_card = GlassCard(orientation="vertical", spacing=dp(10), size_hint_y=0.54)
         log_card.add_widget(self._section_title("Journal opérationnel", "Vue large pour les événements généraux, exports et états du front."))
+        log_actions = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(10))
+        log_actions.add_widget(self._button("Ouvrir en grand", "neutral", lambda *_: self._open_text_modal("Journal opérationnel", "log")))
+        log_card.add_widget(log_actions)
         self.log_view = LogView()
         log_card.add_widget(self.log_view)
         bottom.add_widget(log_card)
 
-        diag_card = GlassCard(orientation="vertical", spacing=dp(10), size_hint_y=0.48)
+        diag_card = GlassCard(orientation="vertical", spacing=dp(10), size_hint_y=0.46)
         diag_card.add_widget(self._section_title("Diagnostic live", "Vue large des rejets, règles et détails candidat par candidat."))
+        diag_actions = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(10))
+        diag_actions.add_widget(self._button("Ouvrir en grand", "neutral", lambda *_: self._open_text_modal("Diagnostic live", "diag")))
+        diag_card.add_widget(diag_actions)
         self.diag_log_view = LogView()
         diag_card.add_widget(self.diag_log_view)
         bottom.add_widget(diag_card)
@@ -1855,6 +1862,51 @@ class CamouflageApp(App):
         btn = SoftButton(text=text, role=role)
         btn.bind(on_release=callback)
         return btn
+
+
+    def _collect_log_text(self, source: str) -> str:
+        view = self.log_view if source == "log" else self.diag_log_view
+        if view is None or getattr(view, "label", None) is None:
+            return "Aucun contenu disponible."
+        text = str(view.label.text or "").strip()
+        return text or "Aucun contenu disponible."
+
+    def _open_text_modal(self, title: str, source: str) -> None:
+        content = BoxLayout(orientation="vertical", spacing=dp(12), padding=dp(12))
+
+        heading = self._label(title, font_size=sp(19), height=dp(30))
+        heading.bold = True
+        content.add_widget(heading)
+
+        viewer = TextInput(
+            text=self._collect_log_text(source),
+            readonly=True,
+            multiline=True,
+            font_size=sp(15),
+            background_normal="",
+            background_active="",
+            background_color=C["bg_input"],
+            foreground_color=C["text_main"],
+            cursor_color=C["text_main"],
+            padding=[dp(14), dp(14), dp(14), dp(14)],
+        )
+        content.add_widget(viewer)
+
+        buttons = BoxLayout(size_hint_y=None, height=dp(56), spacing=dp(10))
+        refresh_btn = self._button("Actualiser", "neutral", lambda *_: setattr(viewer, "text", self._collect_log_text(source)))
+        close_btn = self._button("Fermer", "launch", lambda *_: popup.dismiss())
+        buttons.add_widget(refresh_btn)
+        buttons.add_widget(close_btn)
+        content.add_widget(buttons)
+
+        popup = Popup(
+            title="",
+            content=content,
+            size_hint=(0.96, 0.92),
+            separator_height=0,
+            auto_dismiss=True,
+        )
+        popup.open()
 
     def _set_image_widget_texture(self, image_widget: Image, pil_img: Optional[PILImage.Image]):
         placeholder = getattr(image_widget, "_placeholder_label", None)
