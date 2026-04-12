@@ -61,6 +61,11 @@ try:
 except Exception as exc:
     raise RuntimeError("Impossible d'importer main.py depuis start.py") from exc
 
+try:
+    import camouflage_ml_dl as camo_mldl
+except Exception:
+    camo_mldl = None
+
 from kivy.config import Config
 
 Config.set("graphics", "fullscreen", "0")
@@ -160,6 +165,7 @@ REPORT_NAME = "rapport_textures.csv" if hasattr(camo, "validate_with_reasons") e
 BEST_DIR_NAME = "best_of"
 MANNEQUIN_DIR_NAME = "mannequin_previews"
 OUTPUT_IMAGE_GLOB = "pattern_*.png" if hasattr(camo, "validate_with_reasons") else "camouflage_*.png"
+DEFAULT_MLDL_REPORT_NAME = "rapport_camouflages_ml_dl.csv"
 
 RUN_MODE_BLOCKING = "blocking"
 RUN_MODE_NON_BLOCKING = "non_blocking"
@@ -619,29 +625,41 @@ class ProjectionConfig:
     bg_sat_max: int = 24
     bg_val_min: int = 185
 
-    # Détection du vert textile réel.
-    hue_min: int = 32
-    hue_max: int = 86
-    sat_min: int = 36
-    val_min: int = 28
+    # Graine verte robuste : on cherche le textile vert dominant.
+    hue_min: int = 28
+    hue_max: int = 95
+    sat_min: int = 30
+    val_min: int = 22
     sat_max: int = 255
-    val_max: int = 245
+    val_max: int = 248
 
     # Dominance RGB pour rester sur le textile vert, y compris en ombre.
-    green_dom_g_over_r: int = 9
-    green_dom_g_over_b: int = 6
-    green_dom_g_min: int = 44
+    green_dom_g_over_r: int = 8
+    green_dom_g_over_b: int = 5
+    green_dom_g_min: int = 38
+
+    # Extension du masque aux ombres du textile déjà connectées à la graine.
+    shadow_hue_min: int = 20
+    shadow_hue_max: int = 100
+    shadow_green_dom_g_over_r: int = 1
+    shadow_green_dom_g_over_b: int = -6
+    shadow_val_min: int = 18
 
     # Protection des zones non textiles ou interdites à repeindre.
-    dark_val_max: int = 48
-    dark_sat_max: int = 70
-    tan_hue_min: int = 8
+    dark_val_max: int = 38
+    dark_sat_max: int = 80
+    tan_hue_min: int = 6
     tan_hue_max: int = 28
-    tan_sat_min: int = 20
-    tan_val_min: int = 55
+    tan_sat_min: int = 18
+    tan_val_min: int = 40
     tan_val_max: int = 240
-    metal_sat_max: int = 40
-    metal_val_max: int = 190
+    metal_sat_max: int = 30
+    metal_val_min: int = 30
+    metal_val_max: int = 210
+    neutral_sat_max: int = 20
+    neutral_val_min: int = 25
+    neutral_val_max: int = 150
+    neutral_green_margin: int = 4
 
     # Morphologie.
     open_kernel: int = 3
@@ -649,6 +667,8 @@ class ProjectionConfig:
     protect_dilate_kernel: int = 5
     blur_radius: int = 5
     min_component_area_px: int = 220
+    min_connected_shadow_area_px: int = 60
+    min_uniform_pixels: int = 1500
 
     # Répartition verticale du vêtement.
     hat_ratio: float = 0.13
@@ -676,11 +696,28 @@ class ProjectionConfig:
     shadow_strength: float = 0.62
     detail_strength: float = 0.18
     edge_darkening: float = 0.09
-    alpha_gamma: float = 1.0
+    alpha_gamma: float = 0.92
+    alpha_hard_threshold: float = 0.35
+    min_alpha_inside_mask: float = 0.90
 
-    # Réparation des résidus verts.
-    residual_rounds: int = 3
-    residual_threshold: int = 18
+    # Réparation et vérification stricte des résidus verts.
+    residual_rounds: int = 5
+    residual_threshold: int = 12
+    repair_seed_base: int = 211
+    repair_seed_step: int = 17
+    repair_scale_decay: float = 0.10
+
+    verify_hue_window: int = 14
+    verify_sat_margin: int = 18
+    verify_val_min: int = 12
+    verify_lab_distance_max: float = 30.0
+    verify_lab_green_distance_max: float = 42.0
+    verify_rgb_delta_max: float = 28.0
+    verify_rgb_green_delta_max: float = 36.0
+    max_residual_ratio_quality: float = 0.015
+    max_residual_pixels_quality: int = 180
+    max_residual_ratio_fast: float = 0.030
+    max_residual_pixels_fast: int = 320
 
 
 PROJECTION_CFG = ProjectionConfig()
@@ -691,13 +728,28 @@ _PROJECTION_ANALYSIS_PATH: Optional[Path] = None
 
 
 @dataclass
+class ProjectionVerificationReport:
+    uniform_pixels: int
+    residual_pixels: int
+    still_green_pixels: int
+    residual_ratio: float
+    mean_lab_distance: float
+    mean_rgb_delta: float
+    valid: bool
+
+
+@dataclass
 class ProjectionSubjectAnalysis:
     model_path: Path
     subject_bgr: np.ndarray
+    person_mask: np.ndarray
+    protect_mask: np.ndarray
     uniform_mask: np.ndarray
     bbox: Tuple[int, int, int, int]
     regions: Dict[str, np.ndarray]
     mannequin_px_per_cm: float
+    green_reference_lab: np.ndarray
+    green_reference_hsv: np.ndarray
 
 
 def ensure_odd(v: int) -> int:
@@ -820,6 +872,7 @@ def build_protection_mask(subject_bgr: np.ndarray, person_mask: np.ndarray, cfg:
     g = subject_bgr[:, :, 1].astype(np.int16)
     r = subject_bgr[:, :, 2].astype(np.int16)
 
+    person_bool = person_mask > 0
     dark = (
         (hsv[:, :, 2] <= cfg.dark_val_max)
         & (hsv[:, :, 1] <= cfg.dark_sat_max)
@@ -832,19 +885,23 @@ def build_protection_mask(subject_bgr: np.ndarray, person_mask: np.ndarray, cfg:
         & (hsv[:, :, 2] >= cfg.tan_val_min)
         & (hsv[:, :, 2] <= cfg.tan_val_max)
     )
-    tan_rgb = (r > g + 6) & (g >= b - 8) & (r > 70)
+    tan_rgb = (r >= g + 2) & (r >= b - 6)
     tan = tan_hsv & tan_rgb
 
     metal = (
         (hsv[:, :, 1] <= cfg.metal_sat_max)
+        & (hsv[:, :, 2] >= cfg.metal_val_min)
         & (hsv[:, :, 2] <= cfg.metal_val_max)
-        & (person_mask > 0)
     )
 
-    edges = cv2.Canny(cv2.cvtColor(subject_bgr, cv2.COLOR_BGR2GRAY), 55, 140)
-    edges = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1) > 0
+    neutral = (
+        (hsv[:, :, 1] <= cfg.neutral_sat_max)
+        & (hsv[:, :, 2] >= cfg.neutral_val_min)
+        & (hsv[:, :, 2] <= cfg.neutral_val_max)
+        & (g < r + cfg.neutral_green_margin)
+    )
 
-    protect = (dark | tan | metal | edges).astype(np.uint8) * 255
+    protect = (dark | tan | metal | neutral).astype(np.uint8) * 255
     protect = cv2.bitwise_and(protect, person_mask)
     protect = cv2.dilate(
         protect,
@@ -854,55 +911,99 @@ def build_protection_mask(subject_bgr: np.ndarray, person_mask: np.ndarray, cfg:
     return protect
 
 
+def _grow_connected_green_regions(
+    grow_mask: np.ndarray,
+    seed_mask: np.ndarray,
+    min_area: int,
+) -> np.ndarray:
+    grow_u8 = (grow_mask.astype(np.uint8) * 255) if grow_mask.dtype != np.uint8 else grow_mask.copy()
+    seed_bool = seed_mask > 0
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(grow_u8, connectivity=8)
+    out = np.zeros_like(grow_u8)
+    min_area = max(1, int(min_area))
+    for label_idx in range(1, num_labels):
+        comp = labels == label_idx
+        area = int(stats[label_idx, cv2.CC_STAT_AREA])
+        if area < min_area:
+            continue
+        if np.any(seed_bool & comp):
+            out[comp] = 255
+    return out
+
+
+def _sample_uniform_reference(subject_bgr: np.ndarray, uniform_mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    mask = uniform_mask > 32
+    if not np.any(mask):
+        lab = np.array([128.0, 128.0, 128.0], dtype=np.float32)
+        hsv = np.array([60.0, 128.0, 128.0], dtype=np.float32)
+        return lab, hsv
+    subj_lab = cv2.cvtColor(subject_bgr, cv2.COLOR_BGR2LAB)
+    subj_hsv = cv2.cvtColor(subject_bgr, cv2.COLOR_BGR2HSV)
+    ref_lab = np.median(subj_lab[mask], axis=0).astype(np.float32)
+    ref_hsv = np.median(subj_hsv[mask], axis=0).astype(np.float32)
+    return ref_lab, ref_hsv
+
+
 def green_uniform_mask(subject_bgr: np.ndarray, cfg: ProjectionConfig) -> np.ndarray:
     hsv = cv2.cvtColor(subject_bgr, cv2.COLOR_BGR2HSV)
     person = person_mask_from_foreground(subject_bgr, cfg)
 
-    hsv_green = (
+    b = subject_bgr[:, :, 0].astype(np.int16)
+    g = subject_bgr[:, :, 1].astype(np.int16)
+    r = subject_bgr[:, :, 2].astype(np.int16)
+
+    person_bool = person > 0
+    seed_mask = (
         (hsv[:, :, 0] >= cfg.hue_min)
         & (hsv[:, :, 0] <= cfg.hue_max)
         & (hsv[:, :, 1] >= cfg.sat_min)
         & (hsv[:, :, 2] >= cfg.val_min)
         & (hsv[:, :, 2] <= cfg.val_max)
-    ).astype(np.uint8) * 255
-
-    b = subject_bgr[:, :, 0].astype(np.int16)
-    g = subject_bgr[:, :, 1].astype(np.int16)
-    r = subject_bgr[:, :, 2].astype(np.int16)
-    green_dominance = (
-        (g >= r + cfg.green_dom_g_over_r)
+        & (g >= r + cfg.green_dom_g_over_r)
         & (g >= b + cfg.green_dom_g_over_b)
         & (g >= cfg.green_dom_g_min)
-    ).astype(np.uint8) * 255
+        & person_bool
+    )
 
-    broad = cv2.bitwise_and(hsv_green, green_dominance)
-    broad = cv2.bitwise_and(broad, person)
-    broad = cv2.morphologyEx(
-        broad,
+    protect = build_protection_mask(subject_bgr, person, cfg)
+    allowed = person_bool & (protect == 0)
+
+    grow_mask = (
+        (hsv[:, :, 0] >= cfg.shadow_hue_min)
+        & (hsv[:, :, 0] <= cfg.shadow_hue_max)
+        & (hsv[:, :, 2] >= cfg.shadow_val_min)
+        & (g >= r + cfg.shadow_green_dom_g_over_r)
+        & (g >= b + cfg.shadow_green_dom_g_over_b)
+        & allowed
+    )
+
+    seed_u8 = (seed_mask.astype(np.uint8) * 255)
+    grown = _grow_connected_green_regions(
+        (grow_mask.astype(np.uint8) * 255),
+        seed_u8,
+        cfg.min_connected_shadow_area_px,
+    )
+
+    if int(np.sum(grown > 0)) < cfg.min_uniform_pixels and int(np.sum(seed_u8 > 0)) > 0:
+        grown = seed_u8.copy()
+
+    grown = cv2.morphologyEx(
+        grown,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (cfg.close_kernel, cfg.close_kernel)),
+    )
+    grown = cv2.morphologyEx(
+        grown,
         cv2.MORPH_OPEN,
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (cfg.open_kernel, cfg.open_kernel)),
     )
-    broad = cv2.morphologyEx(
-        broad,
-        cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (cfg.close_kernel, cfg.close_kernel)),
-    )
-    broad = keep_significant_components(broad, cfg.min_component_area_px)
-
-    protect = build_protection_mask(subject_bgr, person, cfg)
-    refined = cv2.bitwise_and(broad, 255 - protect)
-    refined = cv2.morphologyEx(
-        refined,
-        cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (cfg.close_kernel, cfg.close_kernel)),
-    )
-    refined = keep_significant_components(refined, cfg.min_component_area_px)
+    grown = keep_significant_components(grown, max(cfg.min_component_area_px, cfg.min_connected_shadow_area_px))
 
     blur_k = ensure_odd(cfg.blur_radius)
-    refined = cv2.GaussianBlur(refined, (blur_k, blur_k), 0)
-    refined = cv2.bitwise_and(refined, 255 - protect)
-    refined = cv2.bitwise_and(refined, person)
-    return refined
+    grown = cv2.GaussianBlur(grown, (blur_k, blur_k), 0)
+    grown = cv2.bitwise_and(grown, 255 - protect)
+    grown = cv2.bitwise_and(grown, person)
+    return grown
 
 
 def split_uniform_regions(mask: np.ndarray, cfg: ProjectionConfig) -> Dict[str, np.ndarray]:
@@ -948,18 +1049,25 @@ def build_projection_analysis_from_bgr(
     cfg: ProjectionConfig = PROJECTION_CFG,
     model_path: Optional[Path] = None,
 ) -> ProjectionSubjectAnalysis:
+    person_mask = person_mask_from_foreground(subject_bgr, cfg)
+    protect_mask = build_protection_mask(subject_bgr, person_mask, cfg)
     uniform_mask = green_uniform_mask(subject_bgr, cfg)
     bbox = bbox_from_mask(uniform_mask)
     regions = split_uniform_regions(uniform_mask, cfg)
+    ref_lab, ref_hsv = _sample_uniform_reference(subject_bgr, uniform_mask)
     _, _, _, bbox_h = bbox
     mannequin_px_per_cm = (bbox_h / max(1.0, cfg.uniform_visible_height_cm)) if bbox_h > 0 else 1.0
     return ProjectionSubjectAnalysis(
-        model_path=model_path or Path("."),
+        model_path=model_path or Path('.'),
         subject_bgr=subject_bgr,
+        person_mask=person_mask,
+        protect_mask=protect_mask,
         uniform_mask=uniform_mask,
         bbox=bbox,
         regions=regions,
         mannequin_px_per_cm=float(max(0.01, mannequin_px_per_cm)),
+        green_reference_lab=ref_lab,
+        green_reference_hsv=ref_hsv,
     )
 
 
@@ -1074,8 +1182,12 @@ def shading_detail_edges(subject_bgr: np.ndarray, alpha_mask: np.ndarray) -> Tup
 
 
 def compose_region(base_bgr: np.ndarray, region_mask: np.ndarray, camo_bgr: np.ndarray, scale: float, seed: int, cfg: ProjectionConfig) -> np.ndarray:
-    alpha = (region_mask.astype(np.float32) / 255.0) ** max(0.2, cfg.alpha_gamma)
+    alpha_raw = np.clip(region_mask.astype(np.float32) / 255.0, 0.0, 1.0)
+    strong = alpha_raw >= float(cfg.alpha_hard_threshold)
+    alpha_raw[strong] = np.maximum(alpha_raw[strong], float(cfg.min_alpha_inside_mask))
+    alpha = np.clip(alpha_raw, 0.0, 1.0) ** max(0.2, cfg.alpha_gamma)
     alpha = alpha[..., None]
+
     tiled = tile_camo(camo_bgr, base_bgr.shape[:2], scale=scale, seed=seed).astype(np.float32) / 255.0
     shading, detail, edges = shading_detail_edges(base_bgr, region_mask)
     camo_layer = tiled.copy()
@@ -1083,9 +1195,15 @@ def compose_region(base_bgr: np.ndarray, region_mask: np.ndarray, camo_bgr: np.n
     camo_layer += detail[..., None] * cfg.detail_strength
     camo_layer *= (1.0 - edges[..., None] * cfg.edge_darkening)
     camo_layer = np.clip(camo_layer, 0.0, 1.0)
+
     base = base_bgr.astype(np.float32) / 255.0
     out = base * (1.0 - alpha) + camo_layer * alpha
     return (np.clip(out, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+
+def _hue_distance_wrap(hue: np.ndarray, ref_hue: float) -> np.ndarray:
+    diff = np.abs(hue.astype(np.float32) - float(ref_hue))
+    return np.minimum(diff, 180.0 - diff)
 
 
 def build_residual_uniform_mask(
@@ -1094,30 +1212,135 @@ def build_residual_uniform_mask(
     uniform_mask: np.ndarray,
     protect_mask: np.ndarray,
     cfg: ProjectionConfig,
+    reference_lab: Optional[np.ndarray] = None,
+    reference_hsv: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    if uniform_mask is None or not np.any(uniform_mask > 8):
+    uniform_bool = uniform_mask > 24
+    if not np.any(uniform_bool):
         return np.zeros(subject_bgr.shape[:2], dtype=np.uint8)
-    subj_hsv = cv2.cvtColor(subject_bgr, cv2.COLOR_BGR2HSV)
-    proj_hsv = cv2.cvtColor(projected_bgr, cv2.COLOR_BGR2HSV)
-    uniform_bin = (uniform_mask > 24).astype(np.uint8) * 255
-    original_green = cv2.inRange(
-        subj_hsv,
-        np.array([cfg.hue_min, max(0, cfg.sat_min - 12), 0], dtype=np.uint8),
-        np.array([cfg.hue_max, 255, 255], dtype=np.uint8),
+
+    if reference_lab is None or reference_hsv is None:
+        reference_lab, reference_hsv = _sample_uniform_reference(subject_bgr, uniform_mask)
+
+    allowed = uniform_bool & ~(protect_mask > 24)
+    if not np.any(allowed):
+        return np.zeros(subject_bgr.shape[:2], dtype=np.uint8)
+
+    projected_lab = cv2.cvtColor(projected_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    projected_hsv = cv2.cvtColor(projected_bgr, cv2.COLOR_BGR2HSV)
+
+    ref_lab = np.asarray(reference_lab, dtype=np.float32)
+    lab_distance = np.linalg.norm(projected_lab - ref_lab[None, None, :], axis=2)
+    rgb_delta = np.mean(np.abs(projected_bgr.astype(np.int16) - subject_bgr.astype(np.int16)), axis=2).astype(np.float32)
+
+    hue_distance = _hue_distance_wrap(projected_hsv[:, :, 0], float(reference_hsv[0]))
+    still_green = (
+        (hue_distance <= float(cfg.verify_hue_window))
+        & (projected_hsv[:, :, 1] >= max(12.0, float(reference_hsv[1]) - float(cfg.verify_sat_margin)))
+        & (projected_hsv[:, :, 2] >= float(cfg.verify_val_min))
     )
-    still_green = cv2.inRange(
-        proj_hsv,
-        np.array([cfg.hue_min, max(0, cfg.sat_min - 18), 0], dtype=np.uint8),
-        np.array([cfg.hue_max, 255, 255], dtype=np.uint8),
+
+    too_close = (
+        (lab_distance <= float(cfg.verify_lab_distance_max))
+        & (rgb_delta <= float(cfg.verify_rgb_delta_max))
     )
-    color_diff = np.mean(np.abs(projected_bgr.astype(np.int16) - subject_bgr.astype(np.int16)), axis=2)
-    too_close = (color_diff < 24.0).astype(np.uint8) * 255
-    residual = cv2.bitwise_and(uniform_bin, cv2.bitwise_or(still_green, cv2.bitwise_and(original_green, too_close)))
-    residual = cv2.bitwise_and(residual, 255 - protect_mask)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    residual = cv2.morphologyEx(residual, cv2.MORPH_CLOSE, kernel)
-    residual = cv2.GaussianBlur(residual, (0, 0), 1.2)
+    green_close = (
+        still_green
+        & (
+            (lab_distance <= float(cfg.verify_lab_green_distance_max))
+            | (rgb_delta <= float(cfg.verify_rgb_green_delta_max))
+        )
+    )
+
+    residual = (allowed & (too_close | green_close)).astype(np.uint8) * 255
+    residual = cv2.morphologyEx(
+        residual,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+    )
+    residual = cv2.morphologyEx(
+        residual,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+    )
+    residual = keep_significant_components(residual, 14)
+    residual = cv2.GaussianBlur(residual, (0, 0), 1.1)
+    residual = cv2.bitwise_and(residual, (allowed.astype(np.uint8) * 255))
     return residual
+
+
+def evaluate_projection_verification(
+    subject_bgr: np.ndarray,
+    projected_bgr: np.ndarray,
+    uniform_mask: np.ndarray,
+    protect_mask: np.ndarray,
+    cfg: ProjectionConfig,
+    reference_lab: Optional[np.ndarray] = None,
+    reference_hsv: Optional[np.ndarray] = None,
+    preview_mode: str = 'quality',
+) -> ProjectionVerificationReport:
+    uniform_bool = uniform_mask > 24
+    allowed = uniform_bool & ~(protect_mask > 24)
+    uniform_pixels = int(np.sum(allowed))
+    if uniform_pixels <= 0:
+        return ProjectionVerificationReport(
+            uniform_pixels=0,
+            residual_pixels=0,
+            still_green_pixels=0,
+            residual_ratio=1.0,
+            mean_lab_distance=0.0,
+            mean_rgb_delta=0.0,
+            valid=False,
+        )
+
+    if reference_lab is None or reference_hsv is None:
+        reference_lab, reference_hsv = _sample_uniform_reference(subject_bgr, uniform_mask)
+
+    residual_mask = build_residual_uniform_mask(
+        subject_bgr,
+        projected_bgr,
+        uniform_mask,
+        protect_mask,
+        cfg,
+        reference_lab=reference_lab,
+        reference_hsv=reference_hsv,
+    )
+
+    projected_lab = cv2.cvtColor(projected_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    projected_hsv = cv2.cvtColor(projected_bgr, cv2.COLOR_BGR2HSV)
+    ref_lab = np.asarray(reference_lab, dtype=np.float32)
+    lab_distance = np.linalg.norm(projected_lab - ref_lab[None, None, :], axis=2)
+    rgb_delta = np.mean(np.abs(projected_bgr.astype(np.int16) - subject_bgr.astype(np.int16)), axis=2).astype(np.float32)
+    hue_distance = _hue_distance_wrap(projected_hsv[:, :, 0], float(reference_hsv[0]))
+    still_green_mask = (
+        (hue_distance <= float(cfg.verify_hue_window))
+        & (projected_hsv[:, :, 1] >= max(12.0, float(reference_hsv[1]) - float(cfg.verify_sat_margin)))
+        & allowed
+    )
+
+    residual_pixels = int(np.sum(residual_mask > cfg.residual_threshold))
+    residual_ratio = float(residual_pixels / max(1, uniform_pixels))
+    still_green_pixels = int(np.sum(still_green_mask))
+    mean_lab_distance = float(np.mean(lab_distance[allowed])) if np.any(allowed) else 0.0
+    mean_rgb_delta = float(np.mean(rgb_delta[allowed])) if np.any(allowed) else 0.0
+
+    if preview_mode == 'fast':
+        ratio_max = float(cfg.max_residual_ratio_fast)
+        pixels_max = int(cfg.max_residual_pixels_fast)
+    else:
+        ratio_max = float(cfg.max_residual_ratio_quality)
+        pixels_max = int(cfg.max_residual_pixels_quality)
+
+    valid = residual_ratio <= ratio_max and residual_pixels <= pixels_max
+    return ProjectionVerificationReport(
+        uniform_pixels=uniform_pixels,
+        residual_pixels=residual_pixels,
+        still_green_pixels=still_green_pixels,
+        residual_ratio=residual_ratio,
+        mean_lab_distance=mean_lab_distance,
+        mean_rgb_delta=mean_rgb_delta,
+        valid=bool(valid),
+    )
 
 
 def correct_projection_residuals(
@@ -1128,18 +1351,67 @@ def correct_projection_residuals(
     camo_bgr: np.ndarray,
     base_scale: float,
     cfg: ProjectionConfig,
+    reference_lab: Optional[np.ndarray] = None,
+    reference_hsv: Optional[np.ndarray] = None,
+    preview_mode: str = 'quality',
     rounds: Optional[int] = None,
-) -> np.ndarray:
+) -> Tuple[np.ndarray, ProjectionVerificationReport]:
     out = projected_bgr.copy()
     total_rounds = cfg.residual_rounds if rounds is None else max(0, int(rounds))
+    report = evaluate_projection_verification(
+        subject_bgr,
+        out,
+        uniform_mask,
+        protect_mask,
+        cfg,
+        reference_lab=reference_lab,
+        reference_hsv=reference_hsv,
+        preview_mode=preview_mode,
+    )
+    if report.valid:
+        return out, report
+
     for round_idx in range(total_rounds):
-        residual = build_residual_uniform_mask(subject_bgr, out, uniform_mask, protect_mask, cfg)
+        residual = build_residual_uniform_mask(
+            subject_bgr,
+            out,
+            uniform_mask,
+            protect_mask,
+            cfg,
+            reference_lab=reference_lab,
+            reference_hsv=reference_hsv,
+        )
         residual_px = int(np.sum(residual > cfg.residual_threshold))
-        if residual_px <= 32:
+        if residual_px <= 0:
             break
-        local_scale = float(np.clip(base_scale * (0.90 - 0.08 * round_idx), cfg.min_region_scale, cfg.max_region_scale))
-        out = compose_region(out, residual, camo_bgr, local_scale, seed=211 + round_idx * 17, cfg=cfg)
-    return out
+        local_scale = float(
+            np.clip(
+                base_scale * max(0.55, 0.92 - cfg.repair_scale_decay * round_idx),
+                cfg.min_region_scale,
+                cfg.max_region_scale,
+            )
+        )
+        out = compose_region(
+            out,
+            residual,
+            camo_bgr,
+            local_scale,
+            seed=int(cfg.repair_seed_base + round_idx * cfg.repair_seed_step),
+            cfg=cfg,
+        )
+        report = evaluate_projection_verification(
+            subject_bgr,
+            out,
+            uniform_mask,
+            protect_mask,
+            cfg,
+            reference_lab=reference_lab,
+            reference_hsv=reference_hsv,
+            preview_mode=preview_mode,
+        )
+        if report.valid:
+            break
+    return out, report
 
 
 def apply_camo_to_reference(
@@ -1149,30 +1421,34 @@ def apply_camo_to_reference(
     user_scale: float = 1.0,
     analysis: Optional[ProjectionSubjectAnalysis] = None,
     fast_preview: bool = False,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, ProjectionVerificationReport]:
     analysis = analysis or build_projection_analysis_from_bgr(subject_bgr, cfg=cfg)
     full_mask = analysis.uniform_mask.copy()
-    person_mask = person_mask_from_foreground(subject_bgr, cfg)
-    protect_mask = build_protection_mask(subject_bgr, person_mask, cfg)
+    if int(np.sum(full_mask > 24)) < int(cfg.min_uniform_pixels):
+        raise RuntimeError(
+            f'Masque uniforme trop faible pour une projection fiable ({int(np.sum(full_mask > 24))} px).'
+        )
+
+    protect_mask = analysis.protect_mask.copy()
     full_mask = cv2.bitwise_and(full_mask, 255 - protect_mask)
 
-    hat_mask = cv2.bitwise_and(analysis.regions.get("hat", np.zeros_like(full_mask)), full_mask)
-    jacket_mask = cv2.bitwise_and(analysis.regions.get("jacket", np.zeros_like(full_mask)), full_mask)
-    pants_mask = cv2.bitwise_and(analysis.regions.get("pants", np.zeros_like(full_mask)), full_mask)
+    hat_mask = cv2.bitwise_and(analysis.regions.get('hat', np.zeros_like(full_mask)), full_mask)
+    jacket_mask = cv2.bitwise_and(analysis.regions.get('jacket', np.zeros_like(full_mask)), full_mask)
+    pants_mask = cv2.bitwise_and(analysis.regions.get('pants', np.zeros_like(full_mask)), full_mask)
 
     out = subject_bgr.copy()
     for region_name, region_mask, region_seed in (
-        ("hat", hat_mask, 23),
-        ("jacket", jacket_mask, 31),
-        ("pants", pants_mask, 47),
+        ('hat', hat_mask, 23),
+        ('jacket', jacket_mask, 31),
+        ('pants', pants_mask, 47),
     ):
         if int(np.sum(region_mask > 8)) <= 8:
             continue
         scale = adaptive_region_scale(region_name, region_mask, camo_bgr, analysis, cfg, user_scale=user_scale)
         out = compose_region(out, region_mask, camo_bgr, scale, seed=region_seed, cfg=cfg)
 
-    jacket_scale = adaptive_region_scale("jacket", full_mask, camo_bgr, analysis, cfg, user_scale=user_scale)
-    out = correct_projection_residuals(
+    jacket_scale = adaptive_region_scale('jacket', full_mask, camo_bgr, analysis, cfg, user_scale=user_scale)
+    out, report = correct_projection_residuals(
         subject_bgr,
         out,
         full_mask,
@@ -1180,9 +1456,12 @@ def apply_camo_to_reference(
         camo_bgr,
         jacket_scale,
         cfg,
+        reference_lab=analysis.green_reference_lab,
+        reference_hsv=analysis.green_reference_hsv,
+        preview_mode='fast' if fast_preview else 'quality',
         rounds=1 if fast_preview else None,
     )
-    return out, full_mask
+    return out, full_mask, report
 
 
 def crop_person_display_16_9(
@@ -1256,13 +1535,40 @@ def projection_preview_image(
     analysis = get_projection_subject_analysis(cfg)
     subject_bgr = analysis.subject_bgr.copy()
     camo_bgr = pil_rgb_to_bgr(camo_img)
+
     if preview_mode == "fast":
         subject_small = resize_long_side(subject_bgr, 960)
         camo_small = resize_long_side(camo_bgr, 960)
         fast_analysis = build_projection_analysis_from_bgr(subject_small, cfg=cfg, model_path=analysis.model_path)
-        projected_bgr, _mask = apply_camo_to_reference(subject_small, camo_small, cfg=cfg, user_scale=user_scale, analysis=fast_analysis, fast_preview=True)
+        projected_bgr, _mask, report = apply_camo_to_reference(
+            subject_small,
+            camo_small,
+            cfg=cfg,
+            user_scale=user_scale,
+            analysis=fast_analysis,
+            fast_preview=True,
+        )
+        if not report.valid:
+            raise RuntimeError(
+                f"Projection refusée : vert originel encore visible ({report.residual_pixels} px, {report.residual_ratio:.2%})."
+            )
         projected_bgr = crop_person_display_16_9(projected_bgr, subject_small, cfg=cfg)
         return bgr_to_pil_rgb(projected_bgr)
+
+    projected_bgr, _mask, report = apply_camo_to_reference(
+        subject_bgr,
+        camo_bgr,
+        cfg=cfg,
+        user_scale=user_scale,
+        analysis=analysis,
+        fast_preview=False,
+    )
+    if not report.valid:
+        raise RuntimeError(
+            f"Projection refusée : vert originel encore visible ({report.residual_pixels} px, {report.residual_ratio:.2%})."
+        )
+    projected_bgr = crop_person_display_16_9(projected_bgr, subject_bgr, cfg=cfg)
+    return bgr_to_pil_rgb(projected_bgr)
 
     projected_bgr, _mask = apply_camo_to_reference(subject_bgr, camo_bgr, cfg=cfg, user_scale=user_scale, analysis=analysis, fast_preview=False)
     projected_bgr = crop_person_display_16_9(projected_bgr, subject_bgr, cfg=cfg)
@@ -1547,6 +1853,10 @@ class CamouflageApp(App):
         self.gallery_projection_semaphore = asyncio.Semaphore(2)
         self.preview_projection_semaphore = asyncio.Semaphore(1)
         self.requested_target_count = DEFAULT_TARGET_COUNT
+        self.current_report_name = REPORT_NAME
+        self.current_generation_mode = "classic"
+        self.use_mldl = bool(camo_mldl is not None and getattr(camo_mldl, "TORCH_AVAILABLE", False))
+        self.mldl_last_stats: Optional[Dict[str, Any]] = None
         self._current_preview_raw_img: Optional[PILImage.Image] = None
         self.pending_manual_review: Optional[PendingManualReview] = None
         self.generated_rows: List[dict] = []
@@ -2737,6 +3047,32 @@ class CamouflageApp(App):
         self._refresh_diag_labels()
 
     # ---------- generation ----------
+    def _mldl_available(self) -> bool:
+        return bool(camo_mldl is not None and getattr(camo_mldl, "TORCH_AVAILABLE", False))
+
+    def _build_mldl_config(self, target_count: int):
+        if camo_mldl is None:
+            raise RuntimeError("camouflage_ml_dl.py est indisponible.")
+        warmup_samples = max(64, min(256, int(target_count) * 8))
+        return camo_mldl.MLDLConfig(
+            target_count=int(target_count),
+            warmup_samples=int(warmup_samples),
+            candidate_pool_size=8,
+            validate_top_k=3,
+            max_attempts_per_target=max(120, int(target_count) * 12),
+            train_epochs=24,
+            batch_size=32,
+            learning_rate=1e-3,
+            hidden_dim=128,
+            device="auto",
+            base_seed=int(getattr(camo, "DEFAULT_BASE_SEED", 202604010001)),
+            output_dir=str(self.current_output_dir),
+            report_name=DEFAULT_MLDL_REPORT_NAME,
+            random_seed=int(getattr(camo, "DEFAULT_BASE_SEED", 202604010001) & 0x7FFF_FFFF),
+            parallel_train_enabled=True,
+            parallel_train_min_interval_s=3.0,
+        )
+
     def start_generation(self, *_):
         if self.running or self.preflight_running:
             return
@@ -2789,13 +3125,21 @@ class CamouflageApp(App):
         self.diag_rule_counter = Counter()
         self.diag_last_rules = []
         self._reset_dynamic_tolerance_state()
+        self.current_generation_mode = "mldl" if self._mldl_available() and self.use_mldl else "classic"
+        self.current_report_name = DEFAULT_MLDL_REPORT_NAME if self.current_generation_mode == "mldl" else REPORT_NAME
         self.update_progress(0, count)
         self._refresh_diag_labels()
         prevent_sleep(True)
         self.status("Génération en cours…", ok=True)
-        self.log(f"Démarrage : {count} camouflage(s) | sortie={self.current_output_dir} | motif_scale={self.motif_scale:.2f}")
+        if self.use_mldl and not self._mldl_available():
+            import_err = getattr(camo_mldl, "TORCH_IMPORT_ERROR", None) if camo_mldl is not None else None
+            self.log(f"ML/DL indisponible, bascule sur le backend classique. Détail: {import_err}")
+        self.log(
+            f"Démarrage : {count} camouflage(s) | sortie={self.current_output_dir} | motif_scale={self.motif_scale:.2f} | mode={self.current_generation_mode}"
+        )
         self._refresh_controls_state()
-        fut = self.async_runner.submit(self._async_worker_generate(count))
+        worker_coro = self._async_worker_generate_mldl(count) if self.current_generation_mode == "mldl" else self._async_worker_generate(count)
+        fut = self.async_runner.submit(worker_coro)
         self.current_future = fut
         fut.add_done_callback(self._on_generation_done)
 
@@ -2932,6 +3276,340 @@ class CamouflageApp(App):
                 row["mannequin_image_path"] = str(saved)
             except Exception as exc:
                 self.log(f"Projection mannequin post-run impossible : {exc}")
+
+    async def _async_worker_generate_mldl(self, target_count: int):
+        if not self._mldl_available() or camo_mldl is None:
+            await self._async_worker_generate(target_count)
+            return
+
+        rows: List[dict] = []
+        cfg = self._build_mldl_config(target_count)
+        runner = camo_mldl.CamouflageMLDLGenerator(cfg)
+        self.current_report_name = str(cfg.report_name)
+        self.mldl_last_stats = None
+        self._emit_runtime(
+            "INFO",
+            "mldl",
+            "Mode ML/DL activé",
+            target_count=int(target_count),
+            output_dir=str(self.current_output_dir),
+            warmup_samples=int(cfg.warmup_samples),
+            candidate_pool_size=int(cfg.candidate_pool_size),
+            validate_top_k=int(cfg.validate_top_k),
+        )
+        self.log(f"Mode ML/DL : device={runner.device} | warmup={cfg.warmup_samples} | pool={cfg.candidate_pool_size} | top_k={cfg.validate_top_k}")
+
+        try:
+            for i in range(cfg.warmup_samples):
+                if await self._async_should_stop():
+                    runner.rows = rows
+                    try:
+                        runner._flush_background_train()
+                    except Exception:
+                        pass
+                    runner._trainer_pool.shutdown(wait=False, cancel_futures=False)
+                    await self._async_finish_stopped(rows)
+                    return
+
+                self.update_live_stage("warmup ML/DL", target_index=0, local_attempt=i + 1, seed=None, metrics_text=f"échantillon {i + 1}/{cfg.warmup_samples}")
+                seed = camo.build_seed(0, i + 1, cfg.base_seed)
+                candidate, outcome = await asyncio.to_thread(
+                    camo.generate_and_validate_from_seed,
+                    seed,
+                    self.max_repair_rounds,
+                    self.tolerance_profile,
+                    self.anti_pixel,
+                )
+                accepted = bool(getattr(outcome, "accepted", False))
+                with runner._buffer_lock:
+                    runner.buffer.add(candidate, accepted)
+                if not accepted:
+                    runner.last_rejected_candidate = candidate
+                    runner.last_analysis = await asyncio.to_thread(camo_mldl.analyze_rejection, candidate, 0, i + 1)
+                if (i + 1) % 8 == 0 or (i + 1) == cfg.warmup_samples:
+                    self.log(f"Warmup ML/DL : {i + 1}/{cfg.warmup_samples}")
+                    self._emit_runtime("INFO", "mldl", "Warmup ML/DL", progress=int(i + 1), total=int(cfg.warmup_samples))
+
+            stats = await asyncio.to_thread(runner.maybe_train, True)
+            if stats:
+                self.mldl_last_stats = dict(stats)
+                self.log(f"Bootstrap DL : {json.dumps(stats, ensure_ascii=False, sort_keys=True)}")
+                self._emit_runtime("INFO", "mldl", "Bootstrap DL terminé", stats=stats)
+            runner._schedule_background_train(force=True)
+
+            if runner.last_rejected_candidate is None:
+                runner.last_rejected_candidate = await asyncio.to_thread(camo.generate_candidate_from_seed, cfg.base_seed, self.anti_pixel)
+                runner.last_analysis = None
+
+            for target_index in range(1, target_count + 1):
+                local_attempt = 1
+                accepted_payload = None
+                current_analysis = runner.last_analysis
+
+                while local_attempt <= cfg.max_attempts_per_target:
+                    if await self._async_should_stop():
+                        runner.rows = rows
+                        try:
+                            runner._flush_background_train()
+                        except Exception:
+                            pass
+                        runner._trainer_pool.shutdown(wait=False, cancel_futures=False)
+                        await self._async_finish_stopped(rows)
+                        return
+
+                    polled = runner._poll_background_train()
+                    if polled and isinstance(polled, dict):
+                        stats = dict(polled.get("stats") or {})
+                        if stats:
+                            self.mldl_last_stats = stats
+                            self.log(f"DL mis à jour : {json.dumps(stats, ensure_ascii=False, sort_keys=True)}")
+                            self._emit_runtime("INFO", "mldl", "Checkpoint DL mis à jour", stats=stats)
+
+                    action_indexes = runner._select_action_indexes(current_analysis)
+                    proposals: List[Any] = []
+                    for offset, action_idx in enumerate(action_indexes, start=0):
+                        action_name, action = camo_mldl.ACTION_LIBRARY[action_idx]
+                        base_seed = camo.build_seed(target_index, local_attempt + offset, cfg.base_seed)
+                        seed = camo_mldl.propose_seed(base_seed, action)
+                        candidate = await asyncio.to_thread(camo.generate_candidate_from_seed, seed, self.anti_pixel)
+                        if runner.surrogate.trained:
+                            pred_valid, pred_reward = runner.surrogate.predict(camo_mldl.candidate_to_feature_vector(candidate))
+                            pred_valid_f = float(pred_valid[0])
+                            pred_reward_f = float(pred_reward[0])
+                        else:
+                            pred_valid_f = 0.5
+                            pred_reward_f = 0.0
+                        proposals.append(camo_mldl.Proposal(
+                            seed=int(seed),
+                            action_idx=int(action_idx),
+                            action_name=str(action_name),
+                            candidate=candidate,
+                            pred_valid=pred_valid_f,
+                            pred_reward=pred_reward_f,
+                        ))
+                    proposals.sort(key=lambda p: (p.pred_valid, p.pred_reward), reverse=True)
+
+                    self.log(
+                        f"[ML/DL][img={target_index:03d}] pool={len(proposals)} | top={proposals[0].action_name if proposals else '--'} | pred={proposals[0].pred_valid if proposals else 0.0:.4f}"
+                    )
+
+                    best_analysis = None
+                    best_reward = -1e18
+                    accepted_payload = None
+
+                    for rank, proposal in enumerate(proposals[: cfg.validate_top_k], start=1):
+                        if await self._async_should_stop():
+                            runner.rows = rows
+                            try:
+                                runner._flush_background_train()
+                            except Exception:
+                                pass
+                            runner._trainer_pool.shutdown(wait=False, cancel_futures=False)
+                            await self._async_finish_stopped(rows)
+                            return
+
+                        candidate, outcome = await asyncio.to_thread(
+                            camo.generate_and_validate_from_seed,
+                            proposal.seed,
+                            self.max_repair_rounds,
+                            self.tolerance_profile,
+                            self.anti_pixel,
+                        )
+                        runner.total_attempts += 1
+                        total_attempts = int(runner.total_attempts)
+                        self.total_attempts = total_attempts
+
+                        valid = bool(getattr(outcome, "accepted", False))
+                        self._remember_tolerance_outcome(valid)
+                        self._remember_tolerance_change(total_attempts)
+                        scores = extract_backend_scores(candidate.ratios, candidate.metrics, outcome)
+
+                        reward = runner.buffer.add(candidate, valid)
+                        runner._schedule_background_train(force=False)
+                        polled = runner._poll_background_train()
+                        if polled and isinstance(polled, dict):
+                            stats = dict(polled.get("stats") or {})
+                            if stats:
+                                self.mldl_last_stats = stats
+
+                        if hasattr(camo, "emit_validation_payload"):
+                            try:
+                                payload = await asyncio.to_thread(
+                                    camo.emit_validation_payload,
+                                    output_dir=self.current_output_dir,
+                                    target_index=target_index,
+                                    local_attempt=local_attempt + rank - 1,
+                                    global_attempt=total_attempts,
+                                    candidate=candidate,
+                                    outcome=outcome,
+                                    tolerance_profile=self.tolerance_profile,
+                                    tolerance_runtime=self.tolerance_runtime,
+                                )
+                                self.last_validation_payload = payload
+                                self.validation_event_count += 1
+                            except Exception as exc:
+                                self.log(f"Export validation_payload impossible : {exc}")
+
+                        preview_mode = "quality" if valid else "fast"
+                        try:
+                            projection_img = await asyncio.to_thread(
+                                projection_preview_image,
+                                candidate.image,
+                                PROJECTION_CFG,
+                                self.projection_preview_scale,
+                                preview_mode,
+                            )
+                        except Exception as exc:
+                            projection_img = candidate.image
+                            self.log(f"Projection modèle indisponible : {exc}")
+
+                        self.update_preview(candidate.image, projection_img)
+                        await self._register_live_diag(candidate, target_index, local_attempt + rank - 1, outcome)
+
+                        metrics_text = (
+                            f"ML/DL {proposal.action_name} | pred {proposal.pred_valid:.3f}/{proposal.pred_reward:.3f} | "
+                            f"best {scores['bestof_score']:.4f} | bd {scores['boundary_density']:.4f}"
+                        )
+                        self._update_attempt_status(
+                            target_index,
+                            local_attempt + rank - 1,
+                            total_attempts,
+                            proposal.seed,
+                            target_count,
+                            self.accepted_count,
+                            self.diag_rejects,
+                            valid,
+                            candidate.ratios,
+                            scores,
+                            candidate.metrics,
+                        )
+
+                        self._emit_runtime(
+                            "INFO" if valid else "WARNING",
+                            "mldl",
+                            "Validation candidate ML/DL",
+                            target_index=int(target_index),
+                            local_attempt=int(local_attempt + rank - 1),
+                            global_attempt=int(total_attempts),
+                            seed=int(proposal.seed),
+                            action_name=str(proposal.action_name),
+                            pred_valid=float(proposal.pred_valid),
+                            pred_reward=float(proposal.pred_reward),
+                            accepted=bool(valid),
+                        )
+
+                        if valid:
+                            context = camo_mldl.build_context_vector(candidate, None)
+                            runner.bandit.update(proposal.action_idx, context, reward)
+                            accepted_payload = (proposal, candidate, outcome, projection_img, scores)
+                            self.update_live_stage("accepté ML/DL", target_index, local_attempt + rank - 1, proposal.seed, metrics_text=metrics_text, pil_img=projection_img)
+                            break
+
+                        analysis = await asyncio.to_thread(
+                            camo_mldl.analyze_rejection,
+                            candidate,
+                            target_index,
+                            local_attempt + rank - 1,
+                        )
+                        if reward > best_reward:
+                            best_reward = reward
+                            best_analysis = analysis
+                        context = camo_mldl.build_context_vector(candidate, analysis)
+                        runner.bandit.update(proposal.action_idx, context, reward)
+                        runner.last_rejected_candidate = candidate
+                        runner.last_analysis = analysis
+
+                        review = PendingManualReview(
+                            target_index=target_index,
+                            local_attempt=local_attempt + rank - 1,
+                            global_attempt=total_attempts,
+                            candidate=candidate,
+                            outcome=outcome,
+                            projection_img=projection_img,
+                            metrics_text=metrics_text,
+                        )
+                        self._arm_manual_review(review)
+                        self.update_live_stage("rejeté ML/DL", target_index, local_attempt + rank - 1, proposal.seed, metrics_text=metrics_text, pil_img=projection_img)
+                        await asyncio.sleep(0)
+
+                    current_analysis = best_analysis
+
+                    if accepted_payload is None:
+                        local_attempt += max(1, cfg.candidate_pool_size)
+                        await self._adaptive_pause()
+                        continue
+
+                    proposal, candidate, outcome, projection_img, scores = accepted_payload
+                    try:
+                        projection_img = await asyncio.to_thread(
+                            projection_preview_image,
+                            candidate.image,
+                            PROJECTION_CFG,
+                            self.projection_preview_scale,
+                            "quality",
+                        )
+                    except Exception:
+                        pass
+
+                    saved_path, mannequin_saved_path = await self._async_save_candidate_bundle(
+                        rows,
+                        target_index=target_index,
+                        local_attempt=local_attempt,
+                        global_attempt=self.total_attempts,
+                        candidate=candidate,
+                        outcome=outcome,
+                        projection_img=projection_img,
+                        manual_accept=False,
+                    )
+                    rows[-1]["mldl_enabled"] = 1
+                    rows[-1]["mldl_action_name"] = str(proposal.action_name)
+                    rows[-1]["mldl_action_idx"] = int(proposal.action_idx)
+                    rows[-1]["mldl_pred_valid"] = float(proposal.pred_valid)
+                    rows[-1]["mldl_pred_reward"] = float(proposal.pred_reward)
+                    rows[-1]["mldl_device"] = str(runner.device)
+                    if runner._latest_train_stats:
+                        rows[-1]["mldl_latest_train_stats"] = json.dumps(runner._latest_train_stats, ensure_ascii=False, sort_keys=True)
+
+                    self.update_live_stage(
+                        "accepté ML/DL",
+                        target_index,
+                        local_attempt,
+                        candidate.seed,
+                        metrics_text=f"{proposal.action_name} | best {scores['bestof_score']:.4f} | export {saved_path.name}",
+                        pil_img=projection_img,
+                    )
+                    self.log(
+                        f"[ML/DL][img={target_index:03d}] accepté -> {saved_path.name} | mannequin -> {mannequin_saved_path.name} | action={proposal.action_name} | pred={proposal.pred_valid:.4f}"
+                    )
+                    await self._adaptive_pause()
+                    break
+
+                if accepted_payload is None and local_attempt > cfg.max_attempts_per_target:
+                    raise RuntimeError(
+                        f"Impossible d'obtenir un camouflage valide en mode ML/DL pour target_index={target_index} dans la limite de {cfg.max_attempts_per_target} tentatives locales."
+                    )
+
+            try:
+                runner._flush_background_train()
+            except Exception:
+                pass
+            if runner._latest_train_stats:
+                self.mldl_last_stats = dict(runner._latest_train_stats)
+            runner.rows = rows
+            runner._write_summary()
+            await self._async_finish_success(rows)
+        except asyncio.CancelledError:
+            runner.rows = rows
+            try:
+                runner._flush_background_train()
+            except Exception:
+                pass
+            await self._async_finish_stopped(rows)
+            raise
+        except Exception as exc:
+            await self._async_finish_error(str(exc))
+        finally:
+            runner._trainer_pool.shutdown(wait=False, cancel_futures=False)
 
     async def _async_worker_generate(self, target_count: int):
         rows: List[dict] = []
@@ -3265,7 +3943,7 @@ class CamouflageApp(App):
         self._refresh_controls_state()
 
     async def _async_finish_success(self, rows: List[dict]):
-        report_path = await async_write_report(rows, self.current_output_dir, filename=REPORT_NAME)
+        report_path = await async_write_report(rows, self.current_output_dir, filename=self.current_report_name)
         best_dir = await self._async_export_best_of(min(DEFAULT_TOP_K, len(self.best_records)))
         Clock.schedule_once(
             lambda _dt, rp=str(report_path), bd=str(best_dir): self._apply_run_finished(
@@ -3278,7 +3956,7 @@ class CamouflageApp(App):
         )
 
     async def _async_finish_stopped(self, rows: List[dict]):
-        report_path = await async_write_report(rows, self.current_output_dir, filename=REPORT_NAME)
+        report_path = await async_write_report(rows, self.current_output_dir, filename=self.current_report_name)
         if rows:
             await self._async_export_best_of(min(DEFAULT_TOP_K, len(rows)))
         Clock.schedule_once(

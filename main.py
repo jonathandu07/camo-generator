@@ -140,8 +140,8 @@ MACRO_GUIDE_PENALTY = 0.030
 MIN_DST_NEIGHBORS_FOR_FLIP = 3
 COHERENCE_GAIN_WEIGHT = 0.035
 
-# Best-of obligatoire.
-BESTOF_REQUIRED = True
+# Best-of informatif : score calculé et exporté, mais non bloquant.
+BESTOF_REQUIRED = False
 BESTOF_MIN_SCORE = 0.945
 
 # Exports logs / ML / DL.
