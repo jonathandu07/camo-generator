@@ -1715,13 +1715,13 @@ class CamouflageApp(App):
 
         previews = BoxLayout(orientation="vertical", spacing=dp(12), size_hint_y=0.56)
         previews_top = GridLayout(cols=2, spacing=dp(12), size_hint_y=0.62)
-        self.preview_img = make_fill_image()
-        self.preview_silhouette = make_fill_image()
+        self.preview_img = Image()
+        self.preview_silhouette = Image()
         previews_top.add_widget(self._carded_view("Camouflage courant", self.preview_img))
         previews_top.add_widget(self._carded_view("Projection sur soldat modèle", self.preview_silhouette))
         previews.add_widget(previews_top)
 
-        self.live_preview_img = make_fill_image()
+        self.live_preview_img = Image()
         live_card = GlassCard(orientation="vertical", size_hint_y=0.38, spacing=dp(8))
         live_card.add_widget(self._section_title("Suivi direct de construction", "Ce que le pipeline est en train de faire maintenant."))
         self.live_stage_label = self._small_label("Étape : attente")
@@ -1802,7 +1802,24 @@ class CamouflageApp(App):
     def _carded_view(self, title: str, image_widget: Image) -> Widget:
         box = GlassCard(orientation="vertical", spacing=dp(8))
         box.add_widget(self._section_title(title))
-        pane = SoftPane(orientation="vertical")
+        pane = SoftPane(orientation="vertical", size_hint_y=None)
+
+        def _sync_ratio(*_args):
+            inner_w = max(dp(120), pane.width - dp(16))
+            pane.height = (inner_w * 9.0 / 16.0) + dp(16)
+
+        pane.bind(width=_sync_ratio)
+        Clock.schedule_once(lambda _dt: _sync_ratio(), 0)
+
+        try:
+            image_widget.fit_mode = "contain"
+        except Exception:
+            try:
+                image_widget.allow_stretch = True
+                image_widget.keep_ratio = True
+            except Exception:
+                pass
+
         pane.add_widget(image_widget)
         box.add_widget(pane)
         return box

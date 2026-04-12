@@ -60,3 +60,7 @@
 2026-04-03 20:13:34 | INFO     | camo_supervisor | [start] Interface Kivy démarrée
 2026-04-11 12:51:14 | INFO     | camo_supervisor | [start] Interface Kivy démarrée
 2026-04-11 19:22:54 | INFO     | camo_supervisor | [start] Interface Kivy démarrée
+2026-04-12 16:59:03 | INFO     | camo_supervisor | [start] Interface Kivy démarrée
+2026-04-12 17:19:27 | WARNING  | camo_supervisor | [supervisor] Tentative terminée | payload={"accepted": false, "decision": {}, "duration_s": 895.2497718334198, "local_attempt": 1, "metrics_subset": {"boundary_density": 0.015204023196373456, "boundary_density_small": 0.05911024305555555, "edge_contact_ratio": 0.32208333333333333, "mirror_similarity": 0.252807014371142, "motif_scale": 0.55}, "ratios": {"class_0": 0.3200001507040895, "class_1": 0.2800001205632716, "class_2": 0.2199999095775463, "class_3": 0.17999981915509258}, "target_index": 1, "tuning": {"attempt_batch_size": 1, "machine_intensity": 0.9, "max_workers": 1, "parallel_attempts": false}}
+2026-04-12 17:34:47 | INFO     | camo_supervisor | [start] Interface Kivy démarrée
+2026-04-12 17:40:51 | INFO     | camo_supervisor | [start] Interface Kivy démarrée
