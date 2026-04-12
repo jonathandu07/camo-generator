@@ -584,24 +584,40 @@ def build_candidate_row_compatible(
 
 @dataclass
 class ProjectionConfig:
-    # Détection resserrée du vert réellement visible sur l'uniforme.
-    hue_min: int = 38
-    hue_max: int = 78
-    sat_min: int = 48
-    val_min: int = 35
+    # Détection du fond clair studio.
+    bg_sat_max: int = 24
+    bg_val_min: int = 185
+
+    # Détection du vert textile réel.
+    hue_min: int = 32
+    hue_max: int = 86
+    sat_min: int = 36
+    val_min: int = 28
     sat_max: int = 255
-    val_max: int = 235
+    val_max: int = 245
 
-    # Protection des zones sombres non à repeindre.
-    dark_val_max: int = 42
-    dark_sat_max: int = 58
+    # Dominance RGB pour rester sur le textile vert, y compris en ombre.
+    green_dom_g_over_r: int = 9
+    green_dom_g_over_b: int = 6
+    green_dom_g_min: int = 44
 
-    # Morphologie : volontairement modérée pour ne pas recouvrir l'arme,
-    # les sangles, les poches noires ou les bottes.
+    # Protection des zones non textiles ou interdites à repeindre.
+    dark_val_max: int = 48
+    dark_sat_max: int = 70
+    tan_hue_min: int = 8
+    tan_hue_max: int = 28
+    tan_sat_min: int = 20
+    tan_val_min: int = 55
+    tan_val_max: int = 240
+    metal_sat_max: int = 40
+    metal_val_max: int = 190
+
+    # Morphologie.
     open_kernel: int = 3
     close_kernel: int = 5
-    blur_radius: int = 3
-    min_component_area_px: int = 260
+    protect_dilate_kernel: int = 5
+    blur_radius: int = 5
+    min_component_area_px: int = 220
 
     # Répartition verticale du vêtement.
     hat_ratio: float = 0.13
@@ -628,8 +644,12 @@ class ProjectionConfig:
     # Composition.
     shadow_strength: float = 0.62
     detail_strength: float = 0.18
-    edge_darkening: float = 0.08
+    edge_darkening: float = 0.09
     alpha_gamma: float = 1.0
+
+    # Réparation des résidus verts.
+    residual_rounds: int = 3
+    residual_threshold: int = 18
 
 
 PROJECTION_CFG = ProjectionConfig()
@@ -721,15 +741,15 @@ def get_projection_subject_bgr() -> np.ndarray:
     return _PROJECTION_SUBJECT_CACHE.copy()
 
 
-def white_background_mask(bgr: np.ndarray) -> np.ndarray:
+def white_background_mask(bgr: np.ndarray, cfg: ProjectionConfig = PROJECTION_CFG) -> np.ndarray:
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    white = ((hsv[:, :, 1] < 30) & (hsv[:, :, 2] > 190)).astype(np.uint8) * 255
-    white = cv2.GaussianBlur(white, (0, 0), 3)
+    white = ((hsv[:, :, 1] <= cfg.bg_sat_max) & (hsv[:, :, 2] >= cfg.bg_val_min)).astype(np.uint8) * 255
+    white = cv2.GaussianBlur(white, (0, 0), 2.0)
     return white
 
 
-def person_mask_from_foreground(bgr: np.ndarray) -> np.ndarray:
-    white = white_background_mask(bgr)
+def person_mask_from_foreground(bgr: np.ndarray, cfg: ProjectionConfig = PROJECTION_CFG) -> np.ndarray:
+    white = white_background_mask(bgr, cfg)
     fg = 255 - white
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
     fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, kernel)
@@ -745,7 +765,7 @@ def person_mask_from_foreground(bgr: np.ndarray) -> np.ndarray:
     largest = 1 + int(np.argmax(areas))
     out = np.zeros_like(fg)
     out[labels == largest] = 255
-    out = cv2.GaussianBlur(out, (0, 0), 2)
+    out = cv2.GaussianBlur(out, (0, 0), 1.8)
     return out
 
 
@@ -763,96 +783,93 @@ def keep_significant_components(mask: np.ndarray, min_area: int) -> np.ndarray:
     return out
 
 
-def largest_component_mask(mask: np.ndarray) -> Tuple[np.ndarray, Tuple[int, int, int, int], int]:
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    if num_labels <= 1:
-        zero = np.zeros_like(mask)
-        return zero, (0, 0, 0, 0), 0
-
-    areas = stats[1:, cv2.CC_STAT_AREA]
-    best = 1 + int(np.argmax(areas))
-
-    x = int(stats[best, cv2.CC_STAT_LEFT])
-    y = int(stats[best, cv2.CC_STAT_TOP])
-    w = int(stats[best, cv2.CC_STAT_WIDTH])
-    h = int(stats[best, cv2.CC_STAT_HEIGHT])
-    area = int(stats[best, cv2.CC_STAT_AREA])
-
-    out = np.zeros_like(mask)
-    out[labels == best] = 255
-    return out, (x, y, w, h), area
-
-
-def refine_green_thresholds(subject_bgr: np.ndarray, broad_mask: np.ndarray, cfg: ProjectionConfig) -> Tuple[np.ndarray, np.ndarray]:
+def build_protection_mask(subject_bgr: np.ndarray, person_mask: np.ndarray, cfg: ProjectionConfig) -> np.ndarray:
     hsv = cv2.cvtColor(subject_bgr, cv2.COLOR_BGR2HSV)
-    px = hsv[broad_mask > 0]
-    if px.size == 0:
-        lower = np.array([cfg.hue_min, cfg.sat_min, cfg.val_min], dtype=np.uint8)
-        upper = np.array([cfg.hue_max, cfg.sat_max, cfg.val_max], dtype=np.uint8)
-        return lower, upper
+    b = subject_bgr[:, :, 0].astype(np.int16)
+    g = subject_bgr[:, :, 1].astype(np.int16)
+    r = subject_bgr[:, :, 2].astype(np.int16)
 
-    h_vals = px[:, 0].astype(np.float32)
-    s_vals = px[:, 1].astype(np.float32)
-    v_vals = px[:, 2].astype(np.float32)
+    dark = (
+        (hsv[:, :, 2] <= cfg.dark_val_max)
+        & (hsv[:, :, 1] <= cfg.dark_sat_max)
+    )
 
-    lower = np.array([
-        max(cfg.hue_min, int(np.quantile(h_vals, 0.02)) - 4),
-        max(18, int(np.quantile(s_vals, 0.03)) - 10),
-        max(18, int(np.quantile(v_vals, 0.03)) - 10),
-    ], dtype=np.uint8)
+    tan_hsv = (
+        (hsv[:, :, 0] >= cfg.tan_hue_min)
+        & (hsv[:, :, 0] <= cfg.tan_hue_max)
+        & (hsv[:, :, 1] >= cfg.tan_sat_min)
+        & (hsv[:, :, 2] >= cfg.tan_val_min)
+        & (hsv[:, :, 2] <= cfg.tan_val_max)
+    )
+    tan_rgb = (r > g + 6) & (g >= b - 8) & (r > 70)
+    tan = tan_hsv & tan_rgb
 
-    upper = np.array([
-        min(cfg.hue_max, int(np.quantile(h_vals, 0.98)) + 4),
-        255,
-        min(cfg.val_max, int(np.quantile(v_vals, 0.98)) + 25),
-    ], dtype=np.uint8)
+    metal = (
+        (hsv[:, :, 1] <= cfg.metal_sat_max)
+        & (hsv[:, :, 2] <= cfg.metal_val_max)
+        & (person_mask > 0)
+    )
 
-    return lower, upper
+    edges = cv2.Canny(cv2.cvtColor(subject_bgr, cv2.COLOR_BGR2GRAY), 55, 140)
+    edges = cv2.dilate(edges, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1) > 0
+
+    protect = (dark | tan | metal | edges).astype(np.uint8) * 255
+    protect = cv2.bitwise_and(protect, person_mask)
+    protect = cv2.dilate(
+        protect,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (cfg.protect_dilate_kernel, cfg.protect_dilate_kernel)),
+        iterations=1,
+    )
+    return protect
 
 
 def green_uniform_mask(subject_bgr: np.ndarray, cfg: ProjectionConfig) -> np.ndarray:
     hsv = cv2.cvtColor(subject_bgr, cv2.COLOR_BGR2HSV)
-    person = person_mask_from_foreground(subject_bgr)
+    person = person_mask_from_foreground(subject_bgr, cfg)
 
-    lower0 = np.array([cfg.hue_min, cfg.sat_min, cfg.val_min], dtype=np.uint8)
-    upper0 = np.array([cfg.hue_max, cfg.sat_max, cfg.val_max], dtype=np.uint8)
-
-    hsv_green = cv2.inRange(hsv, lower0, upper0)
+    hsv_green = (
+        (hsv[:, :, 0] >= cfg.hue_min)
+        & (hsv[:, :, 0] <= cfg.hue_max)
+        & (hsv[:, :, 1] >= cfg.sat_min)
+        & (hsv[:, :, 2] >= cfg.val_min)
+        & (hsv[:, :, 2] <= cfg.val_max)
+    ).astype(np.uint8) * 255
 
     b = subject_bgr[:, :, 0].astype(np.int16)
     g = subject_bgr[:, :, 1].astype(np.int16)
     r = subject_bgr[:, :, 2].astype(np.int16)
-    green_dominance = (((g > r + 10) & (g > b + 8) & (g > 55))).astype(np.uint8) * 255
+    green_dominance = (
+        (g >= r + cfg.green_dom_g_over_r)
+        & (g >= b + cfg.green_dom_g_over_b)
+        & (g >= cfg.green_dom_g_min)
+    ).astype(np.uint8) * 255
 
     broad = cv2.bitwise_and(hsv_green, green_dominance)
     broad = cv2.bitwise_and(broad, person)
-
-    dark = (((hsv[:, :, 2] <= cfg.dark_val_max) & (hsv[:, :, 1] <= cfg.dark_sat_max))).astype(np.uint8) * 255
-    broad = cv2.bitwise_and(broad, 255 - dark)
-
-    open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (cfg.open_kernel, cfg.open_kernel))
-    close_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (cfg.close_kernel, cfg.close_kernel))
-
-    broad = cv2.morphologyEx(broad, cv2.MORPH_OPEN, open_k)
-    broad = cv2.morphologyEx(broad, cv2.MORPH_CLOSE, close_k)
+    broad = cv2.morphologyEx(
+        broad,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (cfg.open_kernel, cfg.open_kernel)),
+    )
+    broad = cv2.morphologyEx(
+        broad,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (cfg.close_kernel, cfg.close_kernel)),
+    )
     broad = keep_significant_components(broad, cfg.min_component_area_px)
 
-    if not np.any(broad > 0):
-        blur_k = ensure_odd(cfg.blur_radius)
-        return cv2.GaussianBlur(broad, (blur_k, blur_k), 0)
-
-    lower, upper = refine_green_thresholds(subject_bgr, broad, cfg)
-
-    refined = cv2.inRange(hsv, lower, upper)
-    refined = cv2.bitwise_and(refined, green_dominance)
-    refined = cv2.bitwise_and(refined, person)
-    refined = cv2.bitwise_and(refined, 255 - dark)
-    refined = cv2.morphologyEx(refined, cv2.MORPH_OPEN, open_k)
-    refined = cv2.morphologyEx(refined, cv2.MORPH_CLOSE, close_k)
+    protect = build_protection_mask(subject_bgr, person, cfg)
+    refined = cv2.bitwise_and(broad, 255 - protect)
+    refined = cv2.morphologyEx(
+        refined,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (cfg.close_kernel, cfg.close_kernel)),
+    )
     refined = keep_significant_components(refined, cfg.min_component_area_px)
 
     blur_k = ensure_odd(cfg.blur_radius)
     refined = cv2.GaussianBlur(refined, (blur_k, blur_k), 0)
+    refined = cv2.bitwise_and(refined, 255 - protect)
     refined = cv2.bitwise_and(refined, person)
     return refined
 
@@ -1052,7 +1069,13 @@ def compose_region(base_bgr: np.ndarray, region_mask: np.ndarray, camo_bgr: np.n
     return (np.clip(out, 0.0, 1.0) * 255.0).astype(np.uint8)
 
 
-def build_residual_uniform_mask(subject_bgr: np.ndarray, projected_bgr: np.ndarray, uniform_mask: np.ndarray, cfg: ProjectionConfig) -> np.ndarray:
+def build_residual_uniform_mask(
+    subject_bgr: np.ndarray,
+    projected_bgr: np.ndarray,
+    uniform_mask: np.ndarray,
+    protect_mask: np.ndarray,
+    cfg: ProjectionConfig,
+) -> np.ndarray:
     if uniform_mask is None or not np.any(uniform_mask > 8):
         return np.zeros(subject_bgr.shape[:2], dtype=np.uint8)
 
@@ -1063,28 +1086,23 @@ def build_residual_uniform_mask(subject_bgr: np.ndarray, projected_bgr: np.ndarr
 
     original_green = cv2.inRange(
         subj_hsv,
-        np.array([cfg.hue_min, max(0, cfg.sat_min - 10), max(0, cfg.val_min - 10)], dtype=np.uint8),
-        np.array([cfg.hue_max, 255, min(255, cfg.val_max + 35)], dtype=np.uint8),
-    )
-    original_dark = (((subj_hsv[:, :, 2] <= min(255, cfg.dark_val_max + 30)) & (subj_hsv[:, :, 1] <= min(255, cfg.dark_sat_max + 35)))).astype(np.uint8) * 255
-
-    still_green = cv2.inRange(
-        proj_hsv,
-        np.array([cfg.hue_min, max(0, cfg.sat_min - 15), 0], dtype=np.uint8),
+        np.array([cfg.hue_min, max(0, cfg.sat_min - 12), 0], dtype=np.uint8),
         np.array([cfg.hue_max, 255, 255], dtype=np.uint8),
     )
-    still_dark = (((proj_hsv[:, :, 2] <= min(255, cfg.dark_val_max + 18)) & (proj_hsv[:, :, 1] <= min(255, cfg.dark_sat_max + 28)))).astype(np.uint8) * 255
+    still_green = cv2.inRange(
+        proj_hsv,
+        np.array([cfg.hue_min, max(0, cfg.sat_min - 18), 0], dtype=np.uint8),
+        np.array([cfg.hue_max, 255, 255], dtype=np.uint8),
+    )
 
     color_diff = np.mean(np.abs(projected_bgr.astype(np.int16) - subject_bgr.astype(np.int16)), axis=2)
-    too_close = (color_diff < 26.0).astype(np.uint8) * 255
+    too_close = (color_diff < 24.0).astype(np.uint8) * 255
 
-    source_sensitive = cv2.bitwise_or(original_green, original_dark)
-    leaked = cv2.bitwise_or(still_green, still_dark)
-    residual = cv2.bitwise_and(uniform_bin, cv2.bitwise_or(leaked, cv2.bitwise_and(source_sensitive, too_close)))
+    residual = cv2.bitwise_and(uniform_bin, cv2.bitwise_or(still_green, cv2.bitwise_and(original_green, too_close)))
+    residual = cv2.bitwise_and(residual, 255 - protect_mask)
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     residual = cv2.morphologyEx(residual, cv2.MORPH_CLOSE, kernel)
-    residual = cv2.morphologyEx(residual, cv2.MORPH_OPEN, kernel)
     residual = cv2.GaussianBlur(residual, (0, 0), 1.2)
     return residual
 
@@ -1093,15 +1111,16 @@ def correct_projection_residuals(
     subject_bgr: np.ndarray,
     projected_bgr: np.ndarray,
     uniform_mask: np.ndarray,
+    protect_mask: np.ndarray,
     camo_bgr: np.ndarray,
     base_scale: float,
     cfg: ProjectionConfig,
 ) -> np.ndarray:
     out = projected_bgr.copy()
-    for round_idx in range(3):
-        residual = build_residual_uniform_mask(subject_bgr, out, uniform_mask, cfg)
-        residual_px = int(np.sum(residual > 24))
-        if residual_px <= 24:
+    for round_idx in range(cfg.residual_rounds):
+        residual = build_residual_uniform_mask(subject_bgr, out, uniform_mask, protect_mask, cfg)
+        residual_px = int(np.sum(residual > cfg.residual_threshold))
+        if residual_px <= 32:
             break
         local_scale = float(np.clip(base_scale * (0.90 - 0.08 * round_idx), cfg.min_region_scale, cfg.max_region_scale))
         out = compose_region(out, residual, camo_bgr, local_scale, seed=211 + round_idx * 17, cfg=cfg)
@@ -1116,14 +1135,15 @@ def apply_camo_to_reference(
 ) -> Tuple[np.ndarray, np.ndarray]:
     analysis = get_projection_subject_analysis(cfg)
     mask = analysis.uniform_mask
+    person_mask = person_mask_from_foreground(subject_bgr, cfg)
+    protect_mask = build_protection_mask(subject_bgr, person_mask, cfg)
+    mask = cv2.bitwise_and(mask, 255 - protect_mask)
 
-    # Passe unique sur tout ce qui est vert : ainsi la veste, le pantalon et le chapeau
-    # reçoivent tous le camouflage partout où le masque détecte du vert.
     full_scale = adaptive_region_scale("jacket", mask, camo_bgr, analysis, cfg, user_scale=user_scale)
 
     out = subject_bgr.copy()
     out = compose_region(out, mask, camo_bgr, full_scale, seed=23, cfg=cfg)
-    out = correct_projection_residuals(subject_bgr, out, mask, camo_bgr, full_scale, cfg)
+    out = correct_projection_residuals(subject_bgr, out, mask, protect_mask, camo_bgr, full_scale, cfg)
     return out, mask
 
 
@@ -1636,13 +1656,13 @@ class CamouflageApp(App):
 
         previews = BoxLayout(orientation="vertical", spacing=dp(12), size_hint_y=0.56)
         previews_top = GridLayout(cols=2, spacing=dp(12), size_hint_y=0.62)
-        self.preview_img = Image()
-        self.preview_silhouette = Image()
+        self.preview_img = make_fill_image()
+        self.preview_silhouette = make_fill_image()
         previews_top.add_widget(self._carded_view("Camouflage courant", self.preview_img))
         previews_top.add_widget(self._carded_view("Projection sur soldat modèle", self.preview_silhouette))
         previews.add_widget(previews_top)
 
-        self.live_preview_img = Image()
+        self.live_preview_img = make_fill_image()
         live_card = GlassCard(orientation="vertical", size_hint_y=0.38, spacing=dp(8))
         live_card.add_widget(self._section_title("Suivi direct de construction", "Ce que le pipeline est en train de faire maintenant."))
         self.live_stage_label = self._small_label("Étape : attente")
