@@ -18,5 +18,55 @@
       "candidate_pool_size": 8,
       "validate_top_k": 3
     }
+  },
+  {
+    "ts": 1776024460.4792867,
+    "level": "INFO",
+    "source": "mldl",
+    "message": "Warmup ML/DL",
+    "payload": {
+      "progress": 8,
+      "total": 256
+    }
+  },
+  {
+    "ts": 1776032037.5180323,
+    "level": "INFO",
+    "source": "mldl",
+    "message": "Warmup ML/DL",
+    "payload": {
+      "progress": 16,
+      "total": 256
+    }
+  },
+  {
+    "ts": 1776039567.3959126,
+    "level": "INFO",
+    "source": "mldl",
+    "message": "Warmup ML/DL",
+    "payload": {
+      "progress": 24,
+      "total": 256
+    }
+  },
+  {
+    "ts": 1776046862.779547,
+    "level": "INFO",
+    "source": "mldl",
+    "message": "Warmup ML/DL",
+    "payload": {
+      "progress": 32,
+      "total": 256
+    }
+  },
+  {
+    "ts": 1776054186.4087415,
+    "level": "INFO",
+    "source": "mldl",
+    "message": "Warmup ML/DL",
+    "payload": {
+      "progress": 40,
+      "total": 256
+    }
   }
 ]
