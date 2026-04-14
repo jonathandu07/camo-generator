@@ -1,13 +1,13 @@
 [
   {
-    "ts": 1776190822.3161025,
+    "ts": 1776192335.2911296,
     "level": "INFO",
     "source": "start",
     "message": "Interface Kivy démarrée",
     "payload": {}
   },
   {
-    "ts": 1776190837.5878465,
+    "ts": 1776192356.4063306,
     "level": "INFO",
     "source": "mldl",
     "message": "Mode ML/DL activé",
