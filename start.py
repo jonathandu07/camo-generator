@@ -1848,6 +1848,11 @@ class CamouflageApp(App):
         self.tolerance_min_attempts = int(getattr(camo, "DEFAULT_TOLERANCE_MIN_ATTEMPTS", 24))
         self.tolerance_relax_step = float(getattr(camo, "DEFAULT_TOLERANCE_RELAX_STEP", 0.08))
         self.max_tolerance_relax = float(getattr(camo, "MAX_TOLERANCE_RELAX", 0.40))
+        self.champion_tolerance_enabled = bool(getattr(camo, "DEFAULT_CHAMPION_TOLERANCE_ENABLED", True))
+        self.champion_min_score = float(getattr(camo, "DEFAULT_CHAMPION_MIN_SCORE", 0.18))
+        self.champion_recent_window = int(getattr(camo, "DEFAULT_CHAMPION_RECENT_WINDOW", 12))
+        self.champion_stagnation_attempts = int(getattr(camo, "DEFAULT_CHAMPION_STAGNATION_ATTEMPTS", 18))
+        self.champion_reopen_step = float(getattr(camo, "DEFAULT_CHAMPION_REOPEN_STEP", 0.04))
         self.max_repair_rounds = int(getattr(camo, "MAX_REPAIR_ROUNDS", 3))
         self.anti_pixel = bool(getattr(camo, "DEFAULT_ENABLE_ANTI_PIXEL", True))
         self.tolerance_relax_level = 0.0
@@ -2784,6 +2789,8 @@ class CamouflageApp(App):
                 self.tolerance_profile = None
         else:
             self.tolerance_profile = None
+        champion_factory = getattr(camo, "ChampionToleranceState", None)
+        self.champion_tolerance_state = champion_factory(enabled=bool(self.champion_tolerance_enabled)) if callable(champion_factory) else None
         self.tolerance_initial_profile = self.tolerance_profile
         self.tolerance_last_snapshot = self._profile_snapshot(self.tolerance_profile)
         self.tolerance_change_count = 0
@@ -2794,12 +2801,17 @@ class CamouflageApp(App):
             "window_count": 0.0,
             "relax_before": 0.0,
             "relax_after": 0.0,
+            "quality_score": 0.0,
+            "best_score": 0.0,
+            "rolling_score": 0.0,
+            "margin_scale": 0.0,
+            "champion_active": 0.0,
         }
         self.tolerance_outcomes = []
         self.validation_event_count = 0
         self.last_validation_payload = None
 
-    def _update_dynamic_tolerance_profile(self):
+    def _update_dynamic_tolerance_profile(self, candidate: Optional[Any] = None, outcome: Optional[Any] = None, global_attempt: int = 0):
         adapter = getattr(camo, "adapt_tolerance_relax_level", None)
         builder = getattr(camo, "build_validation_tolerance_profile", None)
 
@@ -2822,16 +2834,45 @@ class CamouflageApp(App):
                     "window_count": float(runtime.get("window_count", 0.0)),
                     "relax_before": float(runtime.get("relax_before", 0.0)),
                     "relax_after": float(runtime.get("relax_after", 0.0)),
+                    "quality_score": float(self.tolerance_runtime.get("quality_score", 0.0)),
+                    "best_score": float(self.tolerance_runtime.get("best_score", 0.0)),
+                    "rolling_score": float(self.tolerance_runtime.get("rolling_score", 0.0)),
+                    "margin_scale": float(self.tolerance_runtime.get("margin_scale", 0.0)),
+                    "champion_active": float(self.tolerance_runtime.get("champion_active", 0.0)),
                 }
-                return
             except Exception:
                 pass
-
-        if callable(builder):
+        elif callable(builder):
             try:
                 self.tolerance_profile = builder(self.tolerance_relax_level)
             except Exception:
                 self.tolerance_profile = None
+
+        champion_updater = getattr(camo, "update_champion_tolerance_state", None)
+        if callable(champion_updater) and candidate is not None and outcome is not None and self.tolerance_profile is not None:
+            try:
+                state, profile, runtime = champion_updater(
+                    self.champion_tolerance_state,
+                    candidate,
+                    outcome,
+                    int(global_attempt),
+                    base_profile=self.tolerance_profile,
+                    enabled=bool(self.champion_tolerance_enabled),
+                    min_score=float(self.champion_min_score),
+                    recent_window=int(self.champion_recent_window),
+                    stagnation_attempts=int(self.champion_stagnation_attempts),
+                    reopen_step=float(self.champion_reopen_step),
+                )
+                self.champion_tolerance_state = state
+                if profile is not None:
+                    self.tolerance_profile = profile
+                for key, value in dict(runtime).items():
+                    try:
+                        self.tolerance_runtime[str(key)] = float(value)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
 
     def _remember_tolerance_outcome(self, accepted: bool):
         self.tolerance_outcomes.append(bool(accepted))
@@ -2848,10 +2889,15 @@ class CamouflageApp(App):
                 bestof_min = float(getattr(self.tolerance_profile, "bestof_min_score"))
             except Exception:
                 bestof_min = None
+        champion_best = float(self.tolerance_runtime.get("best_score", 0.0))
+        champion_margin = float(self.tolerance_runtime.get("margin_scale", 0.0))
+        champion_active = bool(round(float(self.tolerance_runtime.get("champion_active", 0.0))))
         txt = (
             f"tol relax {self.tolerance_relax_level:.2f}/{self.max_tolerance_relax:.2f} | "
             f"rej-fen {rejection_rate:.0%} | fen {window_count}"
         )
+        if champion_active:
+            txt += f" | champ {champion_best:.3f} | marge {champion_margin:.3f}"
         if bestof_min is not None:
             txt += f" | best-min {bestof_min:.4f}"
         return txt
@@ -3343,12 +3389,23 @@ class CamouflageApp(App):
                     self.anti_pixel,
                 )
                 accepted = bool(getattr(outcome, "accepted", False))
+                reward = runner._reward_from_outcome(candidate, outcome) if hasattr(runner, "_reward_from_outcome") else None
                 with runner._buffer_lock:
-                    runner.buffer.add(candidate, accepted)
+                    runner.buffer.add(candidate, accepted, reward_override=reward) if reward is not None else runner.buffer.add(candidate, accepted)
+                if hasattr(runner, "_update_tolerance_from_candidate"):
+                    runner._update_tolerance_from_candidate(candidate, outcome, i + 1)
+                self._remember_tolerance_outcome(accepted)
+                self._update_dynamic_tolerance_profile(candidate, outcome, i + 1)
+                self._remember_tolerance_change(i + 1)
                 if not accepted:
                     runner.last_rejected_candidate = candidate
                     runner.last_analysis = await asyncio.to_thread(camo_mldl.analyze_rejection, candidate, 0, i + 1)
                 if (i + 1) % 8 == 0 or (i + 1) == cfg.warmup_samples:
+                    try:
+                        if hasattr(runner, "_persist_runtime_state"):
+                            await asyncio.to_thread(runner._persist_runtime_state, True)
+                    except Exception as exc:
+                        self.log(f"Persist warmup ML/DL impossible : {exc}")
                     self.log(f"Warmup ML/DL : {i + 1}/{cfg.warmup_samples}")
                     self._emit_runtime("INFO", "mldl", "Warmup ML/DL", progress=int(i + 1), total=int(cfg.warmup_samples))
 
@@ -3443,6 +3500,7 @@ class CamouflageApp(App):
 
                         valid = bool(getattr(outcome, "accepted", False))
                         self._remember_tolerance_outcome(valid)
+                        self._update_dynamic_tolerance_profile(candidate, outcome, total_attempts)
                         self._remember_tolerance_change(total_attempts)
                         scores = extract_backend_scores(candidate.ratios, candidate.metrics, outcome)
 
@@ -3680,6 +3738,7 @@ class CamouflageApp(App):
                         self.total_attempts = total_attempts
                         valid = bool(getattr(outcome, "accepted", bool(outcome)))
                         self._remember_tolerance_outcome(valid)
+                        self._update_dynamic_tolerance_profile(candidate, outcome, total_attempts)
                         self._remember_tolerance_change(total_attempts)
                         scores = extract_backend_scores(candidate.ratios, candidate.metrics, outcome)
 
