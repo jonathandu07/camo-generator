@@ -1841,6 +1841,26 @@ class CamouflageApp(App):
         self.diag_rule_counter: Counter[str] = Counter()
         self.diag_last_rules: List[str] = []
 
+        self.mldl_runtime_state: Dict[str, Any] = {
+            "device": "--",
+            "warmup_progress": 0,
+            "warmup_total": 0,
+            "warmup_remaining": 0,
+            "warmup_in_background": False,
+            "candidate_pool_size": 0,
+            "validate_top_k": 0,
+            "dataset_samples": 0,
+            "dataset_loaded": False,
+            "checkpoint_loaded": False,
+            "tolerance_state_loaded": False,
+            "resume_used": False,
+            "checkpoint_path": "",
+            "dataset_path": "",
+            "latest_stats": {},
+            "champion": {},
+            "surrogate_trained": False,
+        }
+
         self.dynamic_tolerance_enabled = bool(getattr(camo, "DEFAULT_DYNAMIC_TOLERANCE_ENABLED", True))
         self.rejection_rate_window = int(getattr(camo, "DEFAULT_REJECTION_RATE_WINDOW", 24))
         self.rejection_rate_high = float(getattr(camo, "DEFAULT_REJECTION_RATE_HIGH", 0.90))
@@ -1879,25 +1899,6 @@ class CamouflageApp(App):
         self.current_generation_mode = "classic"
         self.use_mldl = bool(camo_mldl is not None and getattr(camo_mldl, "TORCH_AVAILABLE", False))
         self.mldl_last_stats: Optional[Dict[str, Any]] = None
-        self.mldl_runtime_state: Dict[str, Any] = {
-            "device": "--",
-            "warmup_progress": 0,
-            "warmup_total": 0,
-            "candidate_pool_size": 0,
-            "validate_top_k": 0,
-            "dataset_samples": 0,
-            "dataset_loaded": False,
-            "checkpoint_loaded": False,
-            "tolerance_state_loaded": False,
-            "resume_used": False,
-            "checkpoint_path": "",
-            "dataset_path": "",
-            "summary_path": "",
-            "training_log_path": "",
-            "latest_stats": None,
-            "latest_error": None,
-            "champion": {},
-        }
         self._current_preview_raw_img: Optional[PILImage.Image] = None
         self.pending_manual_review: Optional[PendingManualReview] = None
         self.generated_rows: List[dict] = []
@@ -2597,28 +2598,12 @@ class CamouflageApp(App):
         payload = getattr(event, "payload", {}) or {}
         if not isinstance(payload, dict):
             return
-        source = str(getattr(event, "source", "") or "")
-        message = str(getattr(event, "message", "") or "")
         stage = payload.get("stage") or payload.get("live_stage") or payload.get("phase")
         preview_path = payload.get("preview_path") or payload.get("snapshot_path") or payload.get("frame_path")
         target_index = payload.get("target_index")
         local_attempt = payload.get("local_attempt")
         seed = payload.get("seed")
         metrics_text = None
-        if source == "mldl":
-            if "progress" in payload:
-                self.mldl_runtime_state["warmup_progress"] = int(payload.get("progress") or 0)
-            if "total" in payload:
-                self.mldl_runtime_state["warmup_total"] = int(payload.get("total") or 0)
-            if "dataset_samples" in payload:
-                self.mldl_runtime_state["dataset_samples"] = int(payload.get("dataset_samples") or 0)
-            if isinstance(payload.get("stats"), dict):
-                self.mldl_runtime_state["latest_stats"] = dict(payload.get("stats") or {})
-            if "checkpoint_loaded" in payload:
-                self.mldl_runtime_state["checkpoint_loaded"] = bool(payload.get("checkpoint_loaded"))
-            if "tolerance_state_loaded" in payload:
-                self.mldl_runtime_state["tolerance_state_loaded"] = bool(payload.get("tolerance_state_loaded"))
-            self._refresh_diag_labels()
         if "metrics" in payload and isinstance(payload["metrics"], dict):
             m = payload["metrics"]
             metrics_text = (
@@ -2626,11 +2611,9 @@ class CamouflageApp(App):
                 f"miroir {m.get('mirror_similarity', '--')} | "
                 f"bord {m.get('edge_contact_ratio', '--')}"
             )
-        elif source == "mldl" and message == "Warmup ML/DL":
-            metrics_text = f"warmup {self.mldl_runtime_state.get('warmup_progress', 0)}/{self.mldl_runtime_state.get('warmup_total', 0)}"
-        if stage or preview_path or (source == "mldl" and message):
+        if stage or preview_path:
             self.update_live_stage(
-                stage=str(stage or message or "runtime"),
+                stage=str(stage or "runtime"),
                 target_index=int(target_index) if target_index is not None else None,
                 local_attempt=int(local_attempt) if local_attempt is not None else None,
                 seed=int(seed) if seed is not None else None,
@@ -2835,18 +2818,6 @@ class CamouflageApp(App):
         self.tolerance_outcomes = []
         self.validation_event_count = 0
         self.last_validation_payload = None
-        self.mldl_runtime_state.update({
-            "warmup_progress": 0,
-            "warmup_total": 0,
-            "dataset_samples": 0,
-            "dataset_loaded": False,
-            "checkpoint_loaded": False,
-            "tolerance_state_loaded": False,
-            "resume_used": False,
-            "latest_stats": None,
-            "latest_error": None,
-            "champion": {},
-        })
 
     def _update_dynamic_tolerance_profile(self):
         adapter = getattr(camo, "adapt_tolerance_relax_level", None)
@@ -2956,118 +2927,17 @@ class CamouflageApp(App):
         except Exception:
             return 0
 
-    def _safe_json_load(self, path: Path) -> Optional[Dict[str, Any]]:
-        try:
-            if not path.exists():
-                return None
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return None
-
-    def _sync_mldl_runtime_state_from_disk(self) -> None:
+    def _ml_dl_status_text(self) -> str:
         out = Path(self.current_output_dir)
         checkpoint = out / "surrogate_camouflage.pt"
-        dataset = out / "dataset_camouflage_ml_dl.npz"
-        training_log = out / "training_log_ml_dl.json"
-        summary = out / "run_summary_ml_dl.json"
-        tolerance_state = out / "adaptive_tolerance_state.json"
-
-        state = dict(self.mldl_runtime_state)
-        state["checkpoint_loaded"] = bool(checkpoint.exists())
-        state["dataset_loaded"] = bool(dataset.exists())
-        state["tolerance_state_loaded"] = bool(tolerance_state.exists())
-        state["checkpoint_path"] = str(checkpoint) if checkpoint.exists() else ""
-        state["dataset_path"] = str(dataset) if dataset.exists() else ""
-        state["training_log_path"] = str(training_log) if training_log.exists() else ""
-        state["summary_path"] = str(summary) if summary.exists() else ""
-
-        if dataset.exists():
-            try:
-                data = np.load(dataset)
-                x = np.asarray(data.get("x", []), dtype=np.float32)
-                state["dataset_samples"] = int(len(x))
-            except Exception:
-                pass
-
-        training_payload = self._safe_json_load(training_log)
-        if isinstance(training_payload, dict):
-            if isinstance(training_payload.get("latest_stats"), dict):
-                state["latest_stats"] = dict(training_payload.get("latest_stats") or {})
-            latest_error = training_payload.get("latest_error")
-            if latest_error:
-                state["latest_error"] = str(latest_error)
-
-        summary_payload = self._safe_json_load(summary)
-        if isinstance(summary_payload, dict):
-            if "device" in summary_payload:
-                state["device"] = str(summary_payload.get("device") or state.get("device") or "--")
-            if isinstance(summary_payload.get("latest_train_stats"), dict):
-                state["latest_stats"] = dict(summary_payload.get("latest_train_stats") or {})
-
-        tol_payload = self._safe_json_load(tolerance_state)
-        if isinstance(tol_payload, dict):
-            state["champion"] = {
-                "best_score": float(tol_payload.get("best_score", 0.0) or 0.0),
-                "rolling_score": float(tol_payload.get("rolling_score", 0.0) or 0.0),
-                "margin_scale": float(tol_payload.get("margin_scale", 0.0) or 0.0),
-                "champion_seed": int(tol_payload.get("champion_seed", 0) or 0),
-                "accepted_seen": int(tol_payload.get("accepted_seen", 0) or 0),
-                "total_seen": int(tol_payload.get("total_seen", 0) or 0),
-                "reopen_count": int(tol_payload.get("reopen_count", 0) or 0),
-            }
-
-        self.mldl_runtime_state.update(state)
-
-    def _ml_dl_status_text(self) -> str:
-        self._sync_mldl_runtime_state_from_disk()
-        state = self.mldl_runtime_state
-        if self.current_generation_mode != "mldl" and not bool(state.get("dataset_loaded") or state.get("checkpoint_loaded")):
-            return "mode classique | aucun artefact ML/DL actif"
-        device = str(state.get("device") or "--")
-        warm_p = int(state.get("warmup_progress") or 0)
-        warm_t = int(state.get("warmup_total") or 0)
-        ds = int(state.get("dataset_samples") or 0)
-        ckpt = "oui" if bool(state.get("checkpoint_loaded")) else "non"
-        tol = "oui" if bool(state.get("tolerance_state_loaded")) else "non"
-        resume = "reprise" if bool(state.get("resume_used")) else "nouveau"
-        stats = state.get("latest_stats") or {}
-        parts = [f"device={device}", f"dataset={ds}", f"checkpoint={ckpt}", f"tol={tol}", resume]
-        if warm_t > 0:
-            parts.append(f"warmup={warm_p}/{warm_t}")
-        if isinstance(stats, dict) and stats:
-            n_samples = stats.get("n_samples")
-            if n_samples is not None:
-                parts.append(f"train={n_samples}")
-            val_loss = stats.get("val_loss")
-            if val_loss is not None:
-                try:
-                    parts.append(f"val_loss={float(val_loss):.4f}")
-                except Exception:
-                    pass
-        return " | ".join(parts)
+        if checkpoint.exists():
+            return "ML/DL : artefacts détectés, mais non synchronisé finement avec le front"
+        return "ML/DL : non synchronisé / indisponible côté front"
 
     def _tolerance_proof_text(self) -> str:
-        self._sync_mldl_runtime_state_from_disk()
-        champion = self.mldl_runtime_state.get("champion") or {}
-        if isinstance(champion, dict) and champion:
-            best = float(champion.get("best_score", 0.0) or 0.0)
-            rolling = float(champion.get("rolling_score", 0.0) or 0.0)
-            margin = float(champion.get("margin_scale", 0.0) or 0.0)
-            seed = int(champion.get("champion_seed", 0) or 0)
-            reopen = int(champion.get("reopen_count", 0) or 0)
-            return (
-                f"champion best={best:.4f} | rolling={rolling:.4f} | marge={margin:.3f} | "
-                f"seed={seed if seed else '--'} | reopen={reopen}"
-            )
         if self.last_validation_payload:
-            return "pilotée par le backend | état partiel reçu"
-        profile = self._profile_snapshot(self.tolerance_profile)
-        if profile:
-            return (
-                f"relax={profile.get('relax_level', 0.0):.3f} | mean_abs={profile.get('mean_abs_error', 0.0):.5f} | "
-                f"mirror_max={profile.get('mirror_max', 0.0):.3f}"
-            )
-        return "état de tolérance indisponible"
+            return "Tolérance dynamique : pilotée par le backend (état partiel reçu)"
+        return "Tolérance dynamique : non synchronisé côté front"
 
     def _human_rejection_text(self) -> str:
         rules = [name for name, _count in self.diag_rule_counter.most_common(3)]
@@ -3100,13 +2970,8 @@ class CamouflageApp(App):
             self.diag_top_rules_mini_label.text = why_text
 
         ml_text = self._ml_dl_status_text()
-        tol_text = self._tolerance_proof_text()
         if self.diag_last_fail_label is not None:
             self.diag_last_fail_label.text = f"ML / DL : {ml_text}"
-        if self.struct_text is not None:
-            self.struct_text.text = f"Tolérance adaptative : {tol_text}"
-        if self.diag_top_rules_mini_label is not None and self.current_generation_mode == "mldl":
-            self.diag_top_rules_mini_label.text = f"Top règles : {top} | tol {tol_text}"
 
     # ---------- gallery ----------
     @mainthread
@@ -3231,7 +3096,7 @@ class CamouflageApp(App):
         if camo_mldl is None:
             raise RuntimeError("camouflage_ml_dl.py est indisponible.")
         warmup_samples = max(64, min(256, int(target_count) * 8))
-        kwargs = dict(
+        return camo_mldl.MLDLConfig(
             target_count=int(target_count),
             warmup_samples=int(warmup_samples),
             candidate_pool_size=8,
@@ -3249,16 +3114,6 @@ class CamouflageApp(App):
             parallel_train_enabled=True,
             parallel_train_min_interval_s=3.0,
         )
-        fields = getattr(getattr(camo_mldl, "MLDLConfig", None), "__dataclass_fields__", {}) or {}
-        if "warmup_persist_every" in fields:
-            kwargs["warmup_persist_every"] = 8
-        if "tolerance_state_name" in fields:
-            kwargs["tolerance_state_name"] = "adaptive_tolerance_state.json"
-        if "bootstrap_first_candidate" in fields:
-            kwargs["bootstrap_first_candidate"] = True
-        if "bootstrap_image_name" in fields:
-            kwargs["bootstrap_image_name"] = "bootstrap_reference.png"
-        return camo_mldl.MLDLConfig(**kwargs)
 
     def start_generation(self, *_):
         if self.running or self.preflight_running:
@@ -3474,29 +3329,43 @@ class CamouflageApp(App):
         runner = camo_mldl.CamouflageMLDLGenerator(cfg)
         self.current_report_name = str(cfg.report_name)
         self.mldl_last_stats = None
-        existing_samples = 0
-        try:
-            existing_samples = int(len(getattr(getattr(runner, "buffer", None), "features", []) or []))
-        except Exception:
-            existing_samples = 0
-        checkpoint_exists = (self.current_output_dir / getattr(cfg, "checkpoint_name", "surrogate_camouflage.pt")).exists()
-        dataset_exists = (self.current_output_dir / getattr(cfg, "dataset_name", "dataset_camouflage_ml_dl.npz")).exists()
-        tol_state_exists = (self.current_output_dir / getattr(cfg, "tolerance_state_name", "adaptive_tolerance_state.json")).exists()
-        remaining_warmup = max(0, int(cfg.warmup_samples) - int(existing_samples))
-        self.mldl_runtime_state.update({
-            "device": str(getattr(runner, "device", "--")),
-            "warmup_progress": int(existing_samples),
-            "warmup_total": int(cfg.warmup_samples),
-            "candidate_pool_size": int(cfg.candidate_pool_size),
-            "validate_top_k": int(cfg.validate_top_k),
-            "dataset_samples": int(existing_samples),
-            "dataset_loaded": bool(dataset_exists or existing_samples > 0),
-            "checkpoint_loaded": bool(checkpoint_exists),
-            "tolerance_state_loaded": bool(tol_state_exists),
-            "resume_used": bool(existing_samples > 0 or checkpoint_exists or tol_state_exists),
-            "checkpoint_path": str(self.current_output_dir / getattr(cfg, "checkpoint_name", "surrogate_camouflage.pt")),
-            "dataset_path": str(self.current_output_dir / getattr(cfg, "dataset_name", "dataset_camouflage_ml_dl.npz")),
-        })
+
+        def _buffer_len() -> int:
+            try:
+                return int(len(getattr(getattr(runner, "buffer", None), "features", []) or []))
+            except Exception:
+                return 0
+
+        async def _refresh_mldl_runtime_state() -> None:
+            dataset_samples = _buffer_len()
+            self.mldl_runtime_state["device"] = str(getattr(runner, "device", "--"))
+            self.mldl_runtime_state["warmup_progress"] = int(min(dataset_samples, int(cfg.warmup_samples)))
+            self.mldl_runtime_state["warmup_total"] = int(cfg.warmup_samples)
+            self.mldl_runtime_state["dataset_samples"] = int(dataset_samples)
+            self.mldl_runtime_state["dataset_loaded"] = bool(dataset_samples > 0)
+            self.mldl_runtime_state["checkpoint_loaded"] = bool((self.current_output_dir / getattr(cfg, "checkpoint_name", "surrogate_camouflage.pt")).exists())
+            if hasattr(runner, "surrogate"):
+                self.mldl_runtime_state["surrogate_trained"] = bool(getattr(runner.surrogate, "trained", False))
+            self.mldl_runtime_state["warmup_in_background"] = True
+            self.mldl_runtime_state["warmup_remaining"] = int(max(0, int(cfg.warmup_samples) - dataset_samples))
+            self.mldl_runtime_state["candidate_pool_size"] = int(cfg.candidate_pool_size)
+            self.mldl_runtime_state["validate_top_k"] = int(cfg.validate_top_k)
+            try:
+                self._refresh_diag_labels()
+            except Exception:
+                pass
+
+        def _persist_buffer_if_needed(sample_count: int) -> None:
+            every = max(1, int(getattr(cfg, "warmup_persist_every", 8) or 8))
+            if sample_count <= 0 or (sample_count % every != 0):
+                return
+            try:
+                getattr(runner, "buffer").save(self.current_output_dir / getattr(cfg, "dataset_name", "dataset_camouflage_ml_dl.npz"))
+            except Exception as exc:
+                self.log(f"Persist dataset ML/DL impossible : {exc}")
+
+        existing_samples = _buffer_len()
+        await _refresh_mldl_runtime_state()
         self._emit_runtime(
             "INFO",
             "mldl",
@@ -3504,182 +3373,35 @@ class CamouflageApp(App):
             target_count=int(target_count),
             output_dir=str(self.current_output_dir),
             warmup_samples=int(cfg.warmup_samples),
-            warmup_remaining=int(remaining_warmup),
+            warmup_remaining=int(max(0, int(cfg.warmup_samples) - existing_samples)),
             dataset_samples=int(existing_samples),
-            checkpoint_loaded=bool(checkpoint_exists),
-            tolerance_state_loaded=bool(tol_state_exists),
+            checkpoint_loaded=bool((self.current_output_dir / getattr(cfg, "checkpoint_name", "surrogate_camouflage.pt")).exists()),
             candidate_pool_size=int(cfg.candidate_pool_size),
             validate_top_k=int(cfg.validate_top_k),
+            warmup_in_background=True,
         )
         self.log(
-            f"Mode ML/DL : device={runner.device} | warmup={existing_samples}/{cfg.warmup_samples}"
-            f" ({remaining_warmup} restant) | pool={cfg.candidate_pool_size} | top_k={cfg.validate_top_k}"
-            f" | checkpoint={'oui' if checkpoint_exists else 'non'} | dataset={'oui' if dataset_exists else 'non'}"
+            f"Mode ML/DL : device={runner.device} | warmup intégré aux tentatives | "
+            f"dataset={existing_samples}/{cfg.warmup_samples} | pool={cfg.candidate_pool_size} | top_k={cfg.validate_top_k}"
         )
-        self._refresh_diag_labels()
 
-        bootstrap_info = None
-        if existing_samples <= 0 and hasattr(runner, "bootstrap_first_reference"):
+        # Si un dataset repris est déjà suffisant, on lance l'entraînement en arrière-plan immédiatement.
+        if existing_samples >= int(getattr(cfg, "min_train_size", 32) or 32):
             try:
-                bootstrap_info = await asyncio.to_thread(runner.bootstrap_first_reference)
-            except Exception as exc:
-                self.log(f"Bootstrap premier candidat ML/DL impossible : {exc}")
-                bootstrap_info = None
-            if bootstrap_info:
-                existing_samples = int(len(getattr(getattr(runner, "buffer", None), "features", []) or []))
-                self.mldl_runtime_state["warmup_progress"] = int(existing_samples)
-                self.mldl_runtime_state["dataset_samples"] = int(existing_samples)
-                self.mldl_runtime_state["dataset_loaded"] = True
-                self.mldl_runtime_state["resume_used"] = True
-                self.mldl_runtime_state["checkpoint_loaded"] = bool((self.current_output_dir / getattr(cfg, "checkpoint_name", "surrogate_camouflage.pt")).exists())
-                if hasattr(runner, "champion_state") and getattr(runner, "champion_state", None) is not None:
-                    try:
-                        self.mldl_runtime_state["champion"] = getattr(runner, "champion_state").to_dict()
-                    except Exception:
-                        pass
-                if hasattr(runner, "tolerance_profile") and getattr(runner, "tolerance_profile", None) is not None:
-                    try:
-                        self.tolerance_profile = getattr(runner, "tolerance_profile")
-                    except Exception:
-                        pass
-                b_candidate = bootstrap_info.get("candidate")
-                b_outcome = bootstrap_info.get("outcome")
-                b_accepted = bool(bootstrap_info.get("accepted"))
-                b_quality = float(bootstrap_info.get("quality", 0.0))
-                b_image_path = bootstrap_info.get("image_path")
-                if b_candidate is not None:
-                    try:
-                        proj = await asyncio.to_thread(self.silhouette_projection_image, b_candidate.image, self.soldier_model_path, self.projection_subject)
-                        self.update_preview(b_candidate.image, proj)
-                    except Exception:
-                        pass
-                    try:
-                        self.last_rejected_payload = PendingManualReview(
-                            target_index=0,
-                            local_attempt=1,
-                            global_attempt=1,
-                            candidate=b_candidate,
-                            outcome=b_outcome,
-                            projection_img=getattr(self, "last_projection_img", b_candidate.image),
-                            metrics_text=f"bootstrap | accepted={'oui' if b_accepted else 'non'} | quality={b_quality:.4f}",
-                        )
-                    except Exception:
-                        pass
-                self.log(
-                    f"Bootstrap premier candidat ML/DL : seed={bootstrap_info.get('seed')} | accepted={'oui' if b_accepted else 'non'}"
-                    f" | quality={b_quality:.4f}"
-                    + (f" | image={b_image_path}" if b_image_path else "")
-                )
-                self._emit_runtime(
-                    "INFO",
-                    "mldl",
-                    "Bootstrap premier candidat ML/DL",
-                    seed=int(bootstrap_info.get("seed") or 0),
-                    accepted=bool(b_accepted),
-                    quality=float(b_quality),
-                    image_path=str(b_image_path) if b_image_path else None,
-                    dataset_samples=int(existing_samples),
-                )
-                self._refresh_diag_labels()
+                runner._schedule_background_train(force=True)
+            except Exception:
+                pass
 
         try:
-            for i in range(existing_samples, cfg.warmup_samples):
-                if await self._async_should_stop():
-                    runner.rows = rows
-                    try:
-                        runner._flush_background_train()
-                    except Exception:
-                        pass
-                    runner._trainer_pool.shutdown(wait=False, cancel_futures=False)
-                    await self._async_finish_stopped(rows)
-                    return
-
-                self.update_live_stage("warmup ML/DL", target_index=0, local_attempt=i + 1, seed=None, metrics_text=f"échantillon {i + 1}/{cfg.warmup_samples}")
-                seed = camo.build_seed(0, i + 1, cfg.base_seed)
-                candidate, outcome = await asyncio.to_thread(
-                    camo.generate_and_validate_from_seed,
-                    seed,
-                    self.max_repair_rounds,
-                    self.tolerance_profile,
-                    self.anti_pixel,
-                )
-                accepted = bool(getattr(outcome, "accepted", False))
-                reward = float(runner._reward_from_outcome(candidate, outcome)) if hasattr(runner, "_reward_from_outcome") else 0.0
-                with runner._buffer_lock:
-                    reward = runner.buffer.add(candidate, accepted, reward_override=reward)
-                if hasattr(runner, "_update_tolerance_from_candidate"):
-                    try:
-                        runner._update_tolerance_from_candidate(candidate, outcome, i + 1)
-                    except Exception:
-                        pass
-                self.mldl_runtime_state["warmup_progress"] = int(i + 1)
-                self.mldl_runtime_state["warmup_total"] = int(cfg.warmup_samples)
-                self.mldl_runtime_state["dataset_samples"] = int(len(getattr(runner.buffer, "features", []) or []))
-                if hasattr(runner, "tolerance_profile") and getattr(runner, "tolerance_profile", None) is not None:
-                    try:
-                        self.tolerance_profile = getattr(runner, "tolerance_profile")
-                    except Exception:
-                        pass
-                if hasattr(runner, "champion_state") and getattr(runner, "champion_state", None) is not None:
-                    try:
-                        self.mldl_runtime_state["champion"] = getattr(runner, "champion_state").to_dict()
-                    except Exception:
-                        pass
-                if hasattr(runner, "tolerance_profile") and getattr(runner, "tolerance_profile", None) is not None:
-                    try:
-                        self.tolerance_profile = getattr(runner, "tolerance_profile")
-                    except Exception:
-                        pass
-                if hasattr(runner, "champion_state") and getattr(runner, "champion_state", None) is not None:
-                    try:
-                        self.mldl_runtime_state["champion"] = getattr(runner, "champion_state").to_dict()
-                    except Exception:
-                        pass
-                if not accepted:
-                    runner.last_rejected_candidate = candidate
-                    runner.last_analysis = await asyncio.to_thread(camo_mldl.analyze_rejection, candidate, 0, i + 1)
-                elif runner.last_rejected_candidate is None:
-                    runner.last_rejected_candidate = candidate
-                    runner.last_analysis = None
-                if (i + 1) % int(getattr(cfg, "warmup_persist_every", 8) or 8) == 0 or (i + 1) == cfg.warmup_samples:
-                    try:
-                        if hasattr(runner, "_persist_runtime_state"):
-                            await asyncio.to_thread(runner._persist_runtime_state, True)
-                        elif hasattr(getattr(runner, "buffer", None), "save"):
-                            await asyncio.to_thread(runner.buffer.save, self.current_output_dir / getattr(cfg, "dataset_name", "dataset_camouflage_ml_dl.npz"))
-                    except Exception as exc:
-                        self.log(f"Persist warmup ML/DL impossible : {exc}")
-                    self.log(f"Warmup ML/DL : {i + 1}/{cfg.warmup_samples} | buffer={self.mldl_runtime_state['dataset_samples']} | reward={float(reward):.4f}")
-                    self._emit_runtime(
-                        "INFO",
-                        "mldl",
-                        "Warmup ML/DL",
-                        progress=int(i + 1),
-                        total=int(cfg.warmup_samples),
-                        dataset_samples=int(self.mldl_runtime_state["dataset_samples"]),
-                        checkpoint_loaded=bool(self.mldl_runtime_state.get("checkpoint_loaded")),
-                    )
-                    self._refresh_diag_labels()
-
-            stats = await asyncio.to_thread(runner.maybe_train, True)
-            if stats:
-                self.mldl_last_stats = dict(stats)
-                self.mldl_runtime_state["latest_stats"] = dict(stats)
-                self.mldl_runtime_state["checkpoint_loaded"] = True
-                self.mldl_runtime_state["dataset_loaded"] = True
-                self.log(f"Bootstrap DL : {json.dumps(stats, ensure_ascii=False, sort_keys=True)}")
-                self._emit_runtime("INFO", "mldl", "Bootstrap DL terminé", stats=stats)
-                self._refresh_diag_labels()
-            runner._schedule_background_train(force=True)
-
-            if runner.last_rejected_candidate is None:
-                runner.last_rejected_candidate = await asyncio.to_thread(camo.generate_candidate_from_seed, cfg.base_seed, self.anti_pixel)
+            current_analysis = getattr(runner, "last_analysis", None)
+            if getattr(runner, "last_rejected_candidate", None) is None:
+                runner.last_rejected_candidate = None
                 runner.last_analysis = None
 
             for target_index in range(1, target_count + 1):
                 local_attempt = 1
                 accepted_payload = None
-                current_analysis = runner.last_analysis
+                current_analysis = getattr(runner, "last_analysis", current_analysis)
 
                 while local_attempt <= cfg.max_attempts_per_target:
                     if await self._async_should_stop():
@@ -3702,7 +3424,17 @@ class CamouflageApp(App):
                             self.mldl_runtime_state["dataset_loaded"] = True
                             self.log(f"DL mis à jour : {json.dumps(stats, ensure_ascii=False, sort_keys=True)}")
                             self._emit_runtime("INFO", "mldl", "Checkpoint DL mis à jour", stats=stats)
-                            self._refresh_diag_labels()
+                            await _refresh_mldl_runtime_state()
+
+                    warmup_done = _buffer_len() >= int(cfg.warmup_samples)
+                    stage_name = "génération ML/DL" if warmup_done else "génération ML/DL + warmup arrière-plan"
+                    self.update_live_stage(
+                        stage_name,
+                        target_index=target_index,
+                        local_attempt=local_attempt,
+                        seed=None,
+                        metrics_text=f"dataset={_buffer_len()}/{cfg.warmup_samples} | rejets et acceptations alimentent le warmup",
+                    )
 
                     action_indexes = runner._select_action_indexes(current_analysis)
                     proposals: List[Any] = []
@@ -3729,7 +3461,7 @@ class CamouflageApp(App):
                     proposals.sort(key=lambda p: (p.pred_valid, p.pred_reward), reverse=True)
 
                     self.log(
-                        f"[ML/DL][img={target_index:03d}] pool={len(proposals)} | top={proposals[0].action_name if proposals else '--'} | pred={proposals[0].pred_valid if proposals else 0.0:.4f}"
+                        f"[ML/DL][img={target_index:03d}] pool={len(proposals)} | top={proposals[0].action_name if proposals else '--'} | pred={proposals[0].pred_valid if proposals else 0.0:.4f} | dataset={_buffer_len()}/{cfg.warmup_samples}"
                     )
 
                     best_analysis = None
@@ -3760,16 +3492,28 @@ class CamouflageApp(App):
 
                         valid = bool(getattr(outcome, "accepted", False))
                         self._remember_tolerance_outcome(valid)
+                        self._update_dynamic_tolerance_profile()
                         self._remember_tolerance_change(total_attempts)
                         scores = extract_backend_scores(candidate.ratios, candidate.metrics, outcome)
 
                         reward = runner.buffer.add(candidate, valid)
-                        runner._schedule_background_train(force=False)
+                        dataset_samples = _buffer_len()
+                        _persist_buffer_if_needed(dataset_samples)
+
+                        if dataset_samples >= int(getattr(cfg, "min_train_size", 32) or 32) and not bool(getattr(runner.surrogate, "trained", False)):
+                            runner._schedule_background_train(force=True)
+                        else:
+                            runner._schedule_background_train(force=False)
                         polled = runner._poll_background_train()
                         if polled and isinstance(polled, dict):
                             stats = dict(polled.get("stats") or {})
                             if stats:
                                 self.mldl_last_stats = stats
+                                self.mldl_runtime_state["latest_stats"] = dict(stats)
+                                self.mldl_runtime_state["checkpoint_loaded"] = True
+                                self.mldl_runtime_state["dataset_loaded"] = True
+
+                        await _refresh_mldl_runtime_state()
 
                         if hasattr(camo, "emit_validation_payload"):
                             try:
@@ -3807,7 +3551,7 @@ class CamouflageApp(App):
 
                         metrics_text = (
                             f"ML/DL {proposal.action_name} | pred {proposal.pred_valid:.3f}/{proposal.pred_reward:.3f} | "
-                            f"best {scores['bestof_score']:.4f} | bd {scores['boundary_density']:.4f}"
+                            f"best {scores['bestof_score']:.4f} | bd {scores['boundary_density']:.4f} | warmup={min(dataset_samples, cfg.warmup_samples)}/{cfg.warmup_samples}"
                         )
                         self._update_attempt_status(
                             target_index,
@@ -3835,6 +3579,9 @@ class CamouflageApp(App):
                             pred_valid=float(proposal.pred_valid),
                             pred_reward=float(proposal.pred_reward),
                             accepted=bool(valid),
+                            dataset_samples=int(dataset_samples),
+                            warmup_progress=int(min(dataset_samples, int(cfg.warmup_samples))),
+                            warmup_in_background=True,
                         )
 
                         if valid:
@@ -3906,6 +3653,8 @@ class CamouflageApp(App):
                     rows[-1]["mldl_pred_valid"] = float(proposal.pred_valid)
                     rows[-1]["mldl_pred_reward"] = float(proposal.pred_reward)
                     rows[-1]["mldl_device"] = str(runner.device)
+                    rows[-1]["mldl_warmup_progress"] = int(min(_buffer_len(), int(cfg.warmup_samples)))
+                    rows[-1]["mldl_dataset_samples"] = int(_buffer_len())
                     if runner._latest_train_stats:
                         rows[-1]["mldl_latest_train_stats"] = json.dumps(runner._latest_train_stats, ensure_ascii=False, sort_keys=True)
 
@@ -4229,9 +3978,9 @@ class CamouflageApp(App):
                 f"bord {scores['edge_contact_ratio']:.4f}"
             )
         if self.struct_text is not None:
-            self.struct_text.text = f"Tolérance adaptative : {self._tolerance_proof_text()}"
-        if self.diag_last_fail_label is not None and self.current_generation_mode == "mldl":
-            self.diag_last_fail_label.text = f"ML / DL : {self._ml_dl_status_text()}"
+            self.struct_text.text = (
+                f"Tolérance dynamique : {self._tolerance_proof_text()}"
+            )
 
     async def _async_export_best_of(self, top_k: int) -> Path:
         best_dir = self.current_output_dir / BEST_DIR_NAME

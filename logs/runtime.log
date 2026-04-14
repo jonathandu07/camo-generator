@@ -108,3 +108,9 @@
 2026-04-14 20:20:37 | INFO     | camo_supervisor | [mldl] Mode ML/DL activé | payload={"candidate_pool_size": 8, "checkpoint_loaded": false, "dataset_samples": 0, "output_dir": "textures_bestof_8k", "target_count": 100, "tolerance_state_loaded": false, "validate_top_k": 3, "warmup_remaining": 256, "warmup_samples": 256}
 2026-04-14 20:45:35 | INFO     | camo_supervisor | [start] Interface Kivy démarrée
 2026-04-14 20:45:56 | INFO     | camo_supervisor | [mldl] Mode ML/DL activé | payload={"candidate_pool_size": 8, "checkpoint_loaded": false, "dataset_samples": 0, "output_dir": "textures_bestof_8k", "target_count": 100, "tolerance_state_loaded": false, "validate_top_k": 3, "warmup_remaining": 256, "warmup_samples": 256}
+2026-04-14 21:02:35 | INFO     | camo_supervisor | [mldl] Bootstrap premier candidat ML/DL | payload={"accepted": false, "dataset_samples": 1, "image_path": "textures_bestof_8k\\bootstrap_reference.png", "quality": 0.8874829853076003, "seed": 740732864}
+2026-04-14 21:12:48 | INFO     | camo_supervisor | [start] Interface Kivy démarrée
+2026-04-14 21:13:37 | INFO     | camo_supervisor | [start] Arrêt de l'interface Kivy
+2026-04-14 21:16:00 | INFO     | camo_supervisor | [start] Interface Kivy démarrée
+2026-04-14 21:19:08 | INFO     | camo_supervisor | [start] Arrêt de l'interface Kivy
+2026-04-14 21:19:20 | INFO     | camo_supervisor | [start] Interface Kivy démarrée
