@@ -160,6 +160,8 @@ class MLDLConfig:
     parallel_train_min_interval_s: float = 3.0
     warmup_persist_every: int = 8
     tolerance_state_name: str = "adaptive_tolerance_state.json"
+    bootstrap_first_candidate: bool = True
+    bootstrap_image_name: str = "bootstrap_reference.png"
 
 
 @dataclass
@@ -751,6 +753,7 @@ class CamouflageMLDLGenerator:
         self.last_analysis: Optional[RejectionAnalysis] = None
         self.tolerance_profile = camo.build_validation_tolerance_profile(0.0)
         self.champion_state = camo.ChampionToleranceState(enabled=True)
+        self.bootstrap_candidate_info: Optional[Dict[str, Any]] = None
 
         self._buffer_lock = threading.RLock()
         self._trainer_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="camo-mldl-trainer")
@@ -806,6 +809,54 @@ class CamouflageMLDLGenerator:
                     self.tolerance_profile = profile
             except Exception:
                 pass
+
+    def bootstrap_first_reference(self) -> Optional[Dict[str, Any]]:
+        if not bool(getattr(self.cfg, "bootstrap_first_candidate", True)):
+            return None
+        if len(getattr(self.buffer, "features", []) or []) > 0:
+            return None
+        if int(getattr(self.champion_state, "best_attempt", 0) or 0) > 0:
+            return None
+
+        seed = camo.build_seed(0, 1, self.cfg.base_seed)
+        candidate, outcome = camo.generate_and_validate_from_seed(seed, tolerance_profile=self.tolerance_profile)
+        accepted = bool(getattr(outcome, "accepted", False))
+        reward = self._reward_from_outcome(candidate, outcome)
+        with self._buffer_lock:
+            reward = self.buffer.add(candidate, accepted, reward_override=reward)
+        self.total_attempts = max(int(self.total_attempts), 1)
+        self._update_tolerance_from_candidate(candidate, outcome, self.total_attempts)
+
+        analysis: Optional[RejectionAnalysis] = None
+        if not accepted:
+            analysis = analyze_rejection(candidate, target_index=0, local_attempt=1)
+            self.last_rejected_candidate = candidate
+            self.last_analysis = analysis
+        else:
+            self.last_rejected_candidate = candidate
+            self.last_analysis = None
+
+        image_path = self.output_dir / str(getattr(self.cfg, "bootstrap_image_name", "bootstrap_reference.png"))
+        try:
+            camo.save_candidate_image(candidate, image_path)
+        except Exception:
+            image_path = None
+
+        self._persist_runtime_state(save_dataset=True)
+        info: Dict[str, Any] = {
+            "seed": int(candidate.seed),
+            "accepted": bool(accepted),
+            "reward": float(reward),
+            "quality": float(camo.score_candidate_quality(candidate, outcome=outcome, tolerance_profile=self.tolerance_profile)),
+            "image_path": str(image_path) if image_path is not None else None,
+            "candidate": candidate,
+            "outcome": outcome,
+            "analysis": analysis,
+            "tolerance_profile": self.tolerance_profile.to_dict() if self.tolerance_profile is not None else {},
+            "champion_state": self.champion_state.to_dict(),
+        }
+        self.bootstrap_candidate_info = info
+        return info
 
     def _save_tolerance_state(self) -> None:
         path = self.output_dir / self.cfg.tolerance_state_name
@@ -965,17 +1016,27 @@ class CamouflageMLDLGenerator:
         self._write_parallel_training_log()
 
     def warmup(self) -> None:
-        for i in range(self.cfg.warmup_samples):
+        if len(getattr(self.buffer, "features", []) or []) == 0:
+            try:
+                self.bootstrap_first_reference()
+            except Exception:
+                pass
+
+        start_idx = int(len(getattr(self.buffer, "features", []) or []))
+        for i in range(start_idx, self.cfg.warmup_samples):
             seed = camo.build_seed(0, i + 1, self.cfg.base_seed)
             candidate, outcome = camo.generate_and_validate_from_seed(seed, tolerance_profile=self.tolerance_profile)
             accepted = bool(outcome.accepted)
             reward = self._reward_from_outcome(candidate, outcome)
             with self._buffer_lock:
-                self.buffer.add(candidate, accepted, reward_override=reward)
+                reward = self.buffer.add(candidate, accepted, reward_override=reward)
             self._update_tolerance_from_candidate(candidate, outcome, i + 1)
             if not accepted:
                 self.last_rejected_candidate = candidate
                 self.last_analysis = analyze_rejection(candidate, target_index=0, local_attempt=i + 1)
+            elif self.last_rejected_candidate is None:
+                self.last_rejected_candidate = candidate
+                self.last_analysis = None
             if ((i + 1) % max(1, int(self.cfg.warmup_persist_every)) == 0) or ((i + 1) == int(self.cfg.warmup_samples)):
                 self._persist_runtime_state(save_dataset=True)
 

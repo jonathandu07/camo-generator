@@ -3254,6 +3254,10 @@ class CamouflageApp(App):
             kwargs["warmup_persist_every"] = 8
         if "tolerance_state_name" in fields:
             kwargs["tolerance_state_name"] = "adaptive_tolerance_state.json"
+        if "bootstrap_first_candidate" in fields:
+            kwargs["bootstrap_first_candidate"] = True
+        if "bootstrap_image_name" in fields:
+            kwargs["bootstrap_image_name"] = "bootstrap_reference.png"
         return camo_mldl.MLDLConfig(**kwargs)
 
     def start_generation(self, *_):
@@ -3514,6 +3518,70 @@ class CamouflageApp(App):
         )
         self._refresh_diag_labels()
 
+        bootstrap_info = None
+        if existing_samples <= 0 and hasattr(runner, "bootstrap_first_reference"):
+            try:
+                bootstrap_info = await asyncio.to_thread(runner.bootstrap_first_reference)
+            except Exception as exc:
+                self.log(f"Bootstrap premier candidat ML/DL impossible : {exc}")
+                bootstrap_info = None
+            if bootstrap_info:
+                existing_samples = int(len(getattr(getattr(runner, "buffer", None), "features", []) or []))
+                self.mldl_runtime_state["warmup_progress"] = int(existing_samples)
+                self.mldl_runtime_state["dataset_samples"] = int(existing_samples)
+                self.mldl_runtime_state["dataset_loaded"] = True
+                self.mldl_runtime_state["resume_used"] = True
+                self.mldl_runtime_state["checkpoint_loaded"] = bool((self.current_output_dir / getattr(cfg, "checkpoint_name", "surrogate_camouflage.pt")).exists())
+                if hasattr(runner, "champion_state") and getattr(runner, "champion_state", None) is not None:
+                    try:
+                        self.mldl_runtime_state["champion"] = getattr(runner, "champion_state").to_dict()
+                    except Exception:
+                        pass
+                if hasattr(runner, "tolerance_profile") and getattr(runner, "tolerance_profile", None) is not None:
+                    try:
+                        self.tolerance_profile = getattr(runner, "tolerance_profile")
+                    except Exception:
+                        pass
+                b_candidate = bootstrap_info.get("candidate")
+                b_outcome = bootstrap_info.get("outcome")
+                b_accepted = bool(bootstrap_info.get("accepted"))
+                b_quality = float(bootstrap_info.get("quality", 0.0))
+                b_image_path = bootstrap_info.get("image_path")
+                if b_candidate is not None:
+                    try:
+                        proj = await asyncio.to_thread(self.silhouette_projection_image, b_candidate.image, self.soldier_model_path, self.projection_subject)
+                        self.update_preview(b_candidate.image, proj)
+                    except Exception:
+                        pass
+                    try:
+                        self.last_rejected_payload = PendingManualReview(
+                            target_index=0,
+                            local_attempt=1,
+                            global_attempt=1,
+                            candidate=b_candidate,
+                            outcome=b_outcome,
+                            projection_img=getattr(self, "last_projection_img", b_candidate.image),
+                            metrics_text=f"bootstrap | accepted={'oui' if b_accepted else 'non'} | quality={b_quality:.4f}",
+                        )
+                    except Exception:
+                        pass
+                self.log(
+                    f"Bootstrap premier candidat ML/DL : seed={bootstrap_info.get('seed')} | accepted={'oui' if b_accepted else 'non'}"
+                    f" | quality={b_quality:.4f}"
+                    + (f" | image={b_image_path}" if b_image_path else "")
+                )
+                self._emit_runtime(
+                    "INFO",
+                    "mldl",
+                    "Bootstrap premier candidat ML/DL",
+                    seed=int(bootstrap_info.get("seed") or 0),
+                    accepted=bool(b_accepted),
+                    quality=float(b_quality),
+                    image_path=str(b_image_path) if b_image_path else None,
+                    dataset_samples=int(existing_samples),
+                )
+                self._refresh_diag_labels()
+
         try:
             for i in range(existing_samples, cfg.warmup_samples):
                 if await self._async_should_stop():
@@ -3536,8 +3604,14 @@ class CamouflageApp(App):
                     self.anti_pixel,
                 )
                 accepted = bool(getattr(outcome, "accepted", False))
+                reward = float(runner._reward_from_outcome(candidate, outcome)) if hasattr(runner, "_reward_from_outcome") else 0.0
                 with runner._buffer_lock:
-                    reward = runner.buffer.add(candidate, accepted)
+                    reward = runner.buffer.add(candidate, accepted, reward_override=reward)
+                if hasattr(runner, "_update_tolerance_from_candidate"):
+                    try:
+                        runner._update_tolerance_from_candidate(candidate, outcome, i + 1)
+                    except Exception:
+                        pass
                 self.mldl_runtime_state["warmup_progress"] = int(i + 1)
                 self.mldl_runtime_state["warmup_total"] = int(cfg.warmup_samples)
                 self.mldl_runtime_state["dataset_samples"] = int(len(getattr(runner.buffer, "features", []) or []))
@@ -3551,9 +3625,22 @@ class CamouflageApp(App):
                         self.mldl_runtime_state["champion"] = getattr(runner, "champion_state").to_dict()
                     except Exception:
                         pass
+                if hasattr(runner, "tolerance_profile") and getattr(runner, "tolerance_profile", None) is not None:
+                    try:
+                        self.tolerance_profile = getattr(runner, "tolerance_profile")
+                    except Exception:
+                        pass
+                if hasattr(runner, "champion_state") and getattr(runner, "champion_state", None) is not None:
+                    try:
+                        self.mldl_runtime_state["champion"] = getattr(runner, "champion_state").to_dict()
+                    except Exception:
+                        pass
                 if not accepted:
                     runner.last_rejected_candidate = candidate
                     runner.last_analysis = await asyncio.to_thread(camo_mldl.analyze_rejection, candidate, 0, i + 1)
+                elif runner.last_rejected_candidate is None:
+                    runner.last_rejected_candidate = candidate
+                    runner.last_analysis = None
                 if (i + 1) % int(getattr(cfg, "warmup_persist_every", 8) or 8) == 0 or (i + 1) == cfg.warmup_samples:
                     try:
                         if hasattr(runner, "_persist_runtime_state"):
