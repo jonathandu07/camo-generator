@@ -158,6 +158,8 @@ class MLDLConfig:
     random_seed: int = 12345
     parallel_train_enabled: bool = True
     parallel_train_min_interval_s: float = 3.0
+    warmup_persist_every: int = 8
+    tolerance_state_name: str = "adaptive_tolerance_state.json"
 
 
 @dataclass
@@ -679,9 +681,9 @@ class ExperienceBuffer:
         self.valid: List[float] = []
         self.rewards: List[float] = []
 
-    def add(self, candidate: camo.CandidateResult, accepted: bool) -> float:
+    def add(self, candidate: camo.CandidateResult, accepted: bool, reward_override: Optional[float] = None) -> float:
         feat = candidate_to_feature_vector(candidate)
-        reward = candidate_reward(candidate, accepted)
+        reward = float(candidate_reward(candidate, accepted) if reward_override is None else reward_override)
         self.features.append(feat)
         self.valid.append(float(1.0 if accepted else 0.0))
         self.rewards.append(float(reward))
@@ -747,6 +749,8 @@ class CamouflageMLDLGenerator:
         self.training_log: List[Dict[str, Any]] = []
         self.last_rejected_candidate: Optional[camo.CandidateResult] = None
         self.last_analysis: Optional[RejectionAnalysis] = None
+        self.tolerance_profile = camo.build_validation_tolerance_profile(0.0)
+        self.champion_state = camo.ChampionToleranceState(enabled=True)
 
         self._buffer_lock = threading.RLock()
         self._trainer_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="camo-mldl-trainer")
@@ -780,6 +784,57 @@ class CamouflageMLDLGenerator:
                 self.surrogate.load(checkpoint)
             except Exception:
                 pass
+
+        tolerance_state_path = self.output_dir / self.cfg.tolerance_state_name
+        if tolerance_state_path.exists():
+            try:
+                payload = json.loads(tolerance_state_path.read_text(encoding="utf-8"))
+                state = camo.ChampionToleranceState()
+                for name in (
+                    "enabled", "best_score", "rolling_score", "margin_scale", "best_attempt",
+                    "last_improvement_attempt", "total_seen", "accepted_seen", "champion_seed", "reopen_count",
+                ):
+                    if name in payload:
+                        setattr(state, name, payload[name])
+                state.champion_abs_errors = tuple(float(x) for x in payload.get("champion_abs_errors", [0.0, 0.0, 0.0, 0.0]))
+                state.champion_metrics = {str(k): float(v) for k, v in dict(payload.get("champion_metrics", {})).items()}
+                state.champion_fragmentation = {str(k): float(v) for k, v in dict(payload.get("champion_fragmentation", {})).items()}
+                state.recent_scores = [float(x) for x in list(payload.get("recent_scores", []))]
+                self.champion_state = state
+                profile = camo._build_profile_from_champion_state(state, base_profile=self.tolerance_profile)
+                if profile is not None:
+                    self.tolerance_profile = profile
+            except Exception:
+                pass
+
+    def _save_tolerance_state(self) -> None:
+        path = self.output_dir / self.cfg.tolerance_state_name
+        path.write_text(json.dumps(self.champion_state.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _persist_runtime_state(self, *, save_dataset: bool = True) -> None:
+        if save_dataset:
+            with self._buffer_lock:
+                self.buffer.save(self.output_dir / self.cfg.dataset_name)
+        self._save_tolerance_state()
+
+    def _reward_from_outcome(self, candidate: camo.CandidateResult, outcome: camo.ValidationOutcome) -> float:
+        accepted = bool(getattr(outcome, "accepted", False))
+        quality = float(camo.score_candidate_quality(candidate, outcome=outcome, tolerance_profile=self.tolerance_profile))
+        baseline = candidate_reward(candidate, accepted)
+        improvement = max(0.0, quality - float(getattr(self.champion_state, "best_score", 0.0)))
+        return float(baseline + 1.75 * quality + 0.90 * improvement + (0.35 if accepted else 0.0))
+
+    def _update_tolerance_from_candidate(self, candidate: camo.CandidateResult, outcome: camo.ValidationOutcome, attempt_no: int) -> None:
+        self.champion_state, profile, _runtime = camo.update_champion_tolerance_state(
+            self.champion_state,
+            candidate,
+            outcome,
+            int(attempt_no),
+            base_profile=self.tolerance_profile,
+            enabled=True,
+        )
+        if profile is not None:
+            self.tolerance_profile = profile
 
     @staticmethod
     def _resolve_device(device: str) -> str:
@@ -912,13 +967,17 @@ class CamouflageMLDLGenerator:
     def warmup(self) -> None:
         for i in range(self.cfg.warmup_samples):
             seed = camo.build_seed(0, i + 1, self.cfg.base_seed)
-            candidate, outcome = camo.generate_and_validate_from_seed(seed)
+            candidate, outcome = camo.generate_and_validate_from_seed(seed, tolerance_profile=self.tolerance_profile)
             accepted = bool(outcome.accepted)
+            reward = self._reward_from_outcome(candidate, outcome)
             with self._buffer_lock:
-                self.buffer.add(candidate, accepted)
+                self.buffer.add(candidate, accepted, reward_override=reward)
+            self._update_tolerance_from_candidate(candidate, outcome, i + 1)
             if not accepted:
                 self.last_rejected_candidate = candidate
                 self.last_analysis = analyze_rejection(candidate, target_index=0, local_attempt=i + 1)
+            if ((i + 1) % max(1, int(self.cfg.warmup_persist_every)) == 0) or ((i + 1) == int(self.cfg.warmup_samples)):
+                self._persist_runtime_state(save_dataset=True)
 
     def maybe_train(self, force: bool = False) -> Optional[Dict[str, float]]:
         x, y_valid, y_reward = self._buffer_arrays_copy()
@@ -945,6 +1004,7 @@ class CamouflageMLDLGenerator:
         self.surrogate.save(self.output_dir / self.cfg.checkpoint_name)
         with self._buffer_lock:
             self.buffer.save(self.output_dir / self.cfg.dataset_name)
+        self._save_tolerance_state()
         self._latest_train_stats = dict(stats)
         self._write_parallel_training_log()
         return stats
@@ -994,7 +1054,7 @@ class CamouflageMLDLGenerator:
 
         for rank, proposal in enumerate(proposals[: self.cfg.validate_top_k], start=1):
             self.total_attempts += 1
-            final_candidate, final_outcome = camo.generate_and_validate_from_seed(proposal.seed)
+            final_candidate, final_outcome = camo.generate_and_validate_from_seed(proposal.seed, tolerance_profile=self.tolerance_profile)
             proposal = Proposal(
                 seed=proposal.seed,
                 action_idx=proposal.action_idx,
@@ -1004,8 +1064,12 @@ class CamouflageMLDLGenerator:
                 pred_reward=proposal.pred_reward,
             )
             real_ok = bool(final_outcome.accepted)
+            reward = self._reward_from_outcome(proposal.candidate, final_outcome)
             with self._buffer_lock:
-                reward = self.buffer.add(proposal.candidate, real_ok)
+                reward = self.buffer.add(proposal.candidate, real_ok, reward_override=reward)
+            self._update_tolerance_from_candidate(proposal.candidate, final_outcome, self.total_attempts)
+            if (self.total_attempts % max(1, int(self.cfg.retrain_every))) == 0:
+                self._persist_runtime_state(save_dataset=True)
             self._schedule_background_train(force=False)
             self._poll_background_train()
 
@@ -1102,6 +1166,9 @@ class CamouflageMLDLGenerator:
             "checkpoint": str((self.output_dir / self.cfg.checkpoint_name).resolve()),
             "dataset": str((self.output_dir / self.cfg.dataset_name).resolve()),
             "actions": [name for name, _ in ACTION_LIBRARY],
+            "tolerance_state": str((self.output_dir / self.cfg.tolerance_state_name).resolve()),
+            "tolerance_profile": self.tolerance_profile.to_dict() if self.tolerance_profile is not None else {},
+            "champion_state": self.champion_state.to_dict(),
         }
         (self.output_dir / "run_summary_ml_dl.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2),
