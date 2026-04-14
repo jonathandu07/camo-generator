@@ -71,3 +71,33 @@
 2026-04-12 18:50:48 | INFO     | camo_supervisor | [start] Interface Kivy démarrée
 2026-04-12 18:54:28 | INFO     | camo_supervisor | [start] Interface Kivy démarrée
 2026-04-12 19:52:29 | INFO     | camo_supervisor | [start] Interface Kivy démarrée
+2026-04-12 19:53:31 | INFO     | camo_supervisor | [mldl] Mode ML/DL activé | payload={"candidate_pool_size": 8, "output_dir": "textures_bestof_8k", "target_count": 100, "validate_top_k": 3, "warmup_samples": 256}
+2026-04-12 22:07:40 | INFO     | camo_supervisor | [mldl] Warmup ML/DL | payload={"progress": 8, "total": 256}
+2026-04-13 00:13:57 | INFO     | camo_supervisor | [mldl] Warmup ML/DL | payload={"progress": 16, "total": 256}
+2026-04-13 02:19:27 | INFO     | camo_supervisor | [mldl] Warmup ML/DL | payload={"progress": 24, "total": 256}
+2026-04-13 04:21:02 | INFO     | camo_supervisor | [mldl] Warmup ML/DL | payload={"progress": 32, "total": 256}
+2026-04-13 06:23:06 | INFO     | camo_supervisor | [mldl] Warmup ML/DL | payload={"progress": 40, "total": 256}
+2026-04-13 07:11:53 | INFO     | camo_supervisor | [start] Interface Kivy démarrée
+2026-04-13 07:12:36 | INFO     | camo_supervisor | [mldl] Mode ML/DL activé | payload={"candidate_pool_size": 8, "output_dir": "textures_bestof_8k", "target_count": 100, "validate_top_k": 3, "warmup_samples": 256}
+2026-04-13 08:53:25 | INFO     | camo_supervisor | [mldl] Warmup ML/DL | payload={"progress": 8, "total": 256}
+2026-04-13 10:34:14 | INFO     | camo_supervisor | [mldl] Warmup ML/DL | payload={"progress": 16, "total": 256}
+2026-04-13 12:14:17 | INFO     | camo_supervisor | [mldl] Warmup ML/DL | payload={"progress": 24, "total": 256}
+2026-04-13 13:54:08 | INFO     | camo_supervisor | [mldl] Warmup ML/DL | payload={"progress": 32, "total": 256}
+2026-04-13 15:35:09 | INFO     | camo_supervisor | [mldl] Warmup ML/DL | payload={"progress": 40, "total": 256}
+2026-04-13 17:15:45 | INFO     | camo_supervisor | [mldl] Warmup ML/DL | payload={"progress": 48, "total": 256}
+2026-04-13 18:55:42 | INFO     | camo_supervisor | [mldl] Warmup ML/DL | payload={"progress": 56, "total": 256}
+2026-04-13 20:36:17 | INFO     | camo_supervisor | [mldl] Warmup ML/DL | payload={"progress": 64, "total": 256}
+2026-04-13 22:17:43 | INFO     | camo_supervisor | [mldl] Warmup ML/DL | payload={"progress": 72, "total": 256}
+2026-04-13 23:57:46 | INFO     | camo_supervisor | [mldl] Warmup ML/DL | payload={"progress": 80, "total": 256}
+2026-04-14 01:38:09 | INFO     | camo_supervisor | [mldl] Warmup ML/DL | payload={"progress": 88, "total": 256}
+2026-04-14 03:19:51 | INFO     | camo_supervisor | [mldl] Warmup ML/DL | payload={"progress": 96, "total": 256}
+2026-04-14 05:00:01 | INFO     | camo_supervisor | [mldl] Warmup ML/DL | payload={"progress": 104, "total": 256}
+2026-04-14 06:41:04 | INFO     | camo_supervisor | [mldl] Warmup ML/DL | payload={"progress": 112, "total": 256}
+2026-04-14 08:21:22 | INFO     | camo_supervisor | [mldl] Warmup ML/DL | payload={"progress": 120, "total": 256}
+2026-04-14 10:00:51 | INFO     | camo_supervisor | [mldl] Warmup ML/DL | payload={"progress": 128, "total": 256}
+2026-04-14 11:43:07 | INFO     | camo_supervisor | [mldl] Warmup ML/DL | payload={"progress": 136, "total": 256}
+2026-04-14 13:24:05 | INFO     | camo_supervisor | [mldl] Warmup ML/DL | payload={"progress": 144, "total": 256}
+2026-04-14 15:03:49 | INFO     | camo_supervisor | [mldl] Warmup ML/DL | payload={"progress": 152, "total": 256}
+2026-04-14 16:44:45 | INFO     | camo_supervisor | [mldl] Warmup ML/DL | payload={"progress": 160, "total": 256}
+2026-04-14 18:23:24 | INFO     | camo_supervisor | [mldl] Warmup ML/DL | payload={"progress": 168, "total": 256}
+2026-04-14 18:56:04 | INFO     | camo_supervisor | [start] Arrêt de l'interface Kivy

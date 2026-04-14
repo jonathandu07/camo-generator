@@ -1526,12 +1526,12 @@ def resize_long_side(img_bgr: np.ndarray, max_side: int) -> np.ndarray:
     return cv2.resize(img_bgr, (nw, nh), interpolation=cv2.INTER_AREA)
 
 
-def projection_preview_image(
+def projection_preview_with_report(
     camo_img: PILImage.Image,
     cfg: ProjectionConfig = PROJECTION_CFG,
     user_scale: float = 1.0,
     preview_mode: str = "quality",
-) -> PILImage.Image:
+) -> Tuple[PILImage.Image, ProjectionVerificationReport]:
     analysis = get_projection_subject_analysis(cfg)
     subject_bgr = analysis.subject_bgr.copy()
     camo_bgr = pil_rgb_to_bgr(camo_img)
@@ -1548,12 +1548,34 @@ def projection_preview_image(
             analysis=fast_analysis,
             fast_preview=True,
         )
-        if not report.valid:
-            raise RuntimeError(
-                f"Projection refusée : vert originel encore visible ({report.residual_pixels} px, {report.residual_ratio:.2%})."
-            )
         projected_bgr = crop_person_display_16_9(projected_bgr, subject_small, cfg=cfg)
-        return bgr_to_pil_rgb(projected_bgr)
+        return bgr_to_pil_rgb(projected_bgr), report
+
+    projected_bgr, _mask, report = apply_camo_to_reference(
+        subject_bgr,
+        camo_bgr,
+        cfg=cfg,
+        user_scale=user_scale,
+        analysis=analysis,
+        fast_preview=False,
+    )
+    projected_bgr = crop_person_display_16_9(projected_bgr, subject_bgr, cfg=cfg)
+    return bgr_to_pil_rgb(projected_bgr), report
+
+
+def projection_preview_image(
+    camo_img: PILImage.Image,
+    cfg: ProjectionConfig = PROJECTION_CFG,
+    user_scale: float = 1.0,
+    preview_mode: str = "quality",
+) -> PILImage.Image:
+    projected, _report = projection_preview_with_report(
+        camo_img,
+        cfg=cfg,
+        user_scale=user_scale,
+        preview_mode=preview_mode,
+    )
+    return projected
 
     projected_bgr, _mask, report = apply_camo_to_reference(
         subject_bgr,
@@ -2709,7 +2731,7 @@ class CamouflageApp(App):
     def _finish_manual_accept(self, saved_path: Path, mannequin_saved_path: Path, review: PendingManualReview):
         self.accepted_count = len(self.generated_rows)
         self.log(
-            f"Rejet validé manuellement -> {saved_path.name} | mannequin -> {mannequin_saved_path.name}"
+            f"Rejet validé manuellement -> {saved_path.name} | mannequin -> {(mannequin_saved_path.name if mannequin_saved_path is not None else 'non_enregistré')}"
         )
         text = f"Rejet déjà enregistré : image {review.target_index:03d} | seed {review.candidate.seed}"
         if self.manual_review_label is not None:
@@ -3766,7 +3788,7 @@ class CamouflageApp(App):
                         pil_img=projection_img,
                     )
                     self.log(
-                        f"[img={target_index:03d}] accepté -> {saved_path.name} | mannequin -> {mannequin_saved_path.name} | "
+                        f"[img={target_index:03d}] accepté -> {saved_path.name} | mannequin -> {(mannequin_saved_path.name if mannequin_saved_path is not None else 'non_enregistré')} | "
                         f"best={scores['bestof_score']:.4f}"
                     )
                     await self._adaptive_pause()
@@ -3792,7 +3814,7 @@ class CamouflageApp(App):
         outcome: Any,
         projection_img: PILImage.Image,
         manual_accept: bool = False,
-    ) -> Tuple[Path, Path]:
+    ) -> Tuple[Path, Optional[Path]]:
         filename = build_backend_compatible_output_path(
             output_dir=self.current_output_dir,
             target_index=target_index,
@@ -3801,11 +3823,27 @@ class CamouflageApp(App):
             candidate=candidate,
         )
         saved_path = await async_save_candidate_image(candidate, filename)
-        mannequin_saved_path = await async_save_mannequin_projection(
-            projection_img,
-            saved_path,
-            self.current_output_dir,
-        )
+        mannequin_saved_path: Optional[Path] = None
+        try:
+            projection_img_to_save, projection_report = await asyncio.to_thread(
+                projection_preview_with_report,
+                candidate.image,
+                PROJECTION_CFG,
+                self.projection_preview_scale,
+                "quality",
+            )
+            if bool(getattr(projection_report, "valid", False)):
+                mannequin_saved_path = await async_save_mannequin_projection(
+                    projection_img_to_save,
+                    saved_path,
+                    self.current_output_dir,
+                )
+            else:
+                self.log(
+                    f"Projection mannequin affichée mais non enregistrée : résidu vert {int(getattr(projection_report, 'residual_pixels', 0))} px | ratio {float(getattr(projection_report, 'residual_ratio', 0.0)):.2%}"
+                )
+        except Exception as exc:
+            self.log(f"Projection mannequin affichée mais non enregistrée : {exc}")
         record = CandidateRecord(
             index=target_index,
             seed=candidate.seed,
@@ -3826,8 +3864,9 @@ class CamouflageApp(App):
             saved_path=saved_path,
             manual_accept=manual_accept,
         )
-        row["mannequin_image_name"] = mannequin_saved_path.name
-        row["mannequin_image_path"] = str(mannequin_saved_path)
+        row["mannequin_saved"] = int(mannequin_saved_path is not None)
+        row["mannequin_image_name"] = mannequin_saved_path.name if mannequin_saved_path is not None else ""
+        row["mannequin_image_path"] = str(mannequin_saved_path) if mannequin_saved_path is not None else ""
         row["manual_accept"] = int(bool(manual_accept))
         row["tolerance_relax_level"] = float(self.tolerance_relax_level)
         row["tolerance_rejection_rate"] = float(self.tolerance_runtime.get("rejection_rate", 0.0))
