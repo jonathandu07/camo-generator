@@ -101,3 +101,6 @@
 2026-04-14 16:44:45 | INFO     | camo_supervisor | [mldl] Warmup ML/DL | payload={"progress": 160, "total": 256}
 2026-04-14 18:23:24 | INFO     | camo_supervisor | [mldl] Warmup ML/DL | payload={"progress": 168, "total": 256}
 2026-04-14 18:56:04 | INFO     | camo_supervisor | [start] Arrêt de l'interface Kivy
+2026-04-14 19:38:37 | INFO     | camo_supervisor | [start] Interface Kivy démarrée
+2026-04-14 19:39:06 | INFO     | camo_supervisor | [mldl] Mode ML/DL activé | payload={"candidate_pool_size": 8, "output_dir": "textures_bestof_8k", "target_count": 100, "validate_top_k": 3, "warmup_samples": 256}
+2026-04-14 20:18:49 | INFO     | camo_supervisor | [start] Arrêt de l'interface Kivy

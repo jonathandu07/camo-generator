@@ -18,5 +18,12 @@
       "candidate_pool_size": 8,
       "validate_top_k": 3
     }
+  },
+  {
+    "ts": 1776190729.9202204,
+    "level": "INFO",
+    "source": "start",
+    "message": "Arrêt de l'interface Kivy",
+    "payload": {}
   }
 ]
