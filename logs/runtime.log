@@ -136,3 +136,7 @@
 2026-04-15 05:45:42 | WARNING  | camo_supervisor | [mldl] Validation candidate ML/DL | payload={"accepted": false, "action_name": "offset_97", "dataset_samples": 20, "global_attempt": 19, "local_attempt": 49, "pred_reward": 0.0, "pred_valid": 0.5, "seed": 202604110147, "target_index": 1, "warmup_in_background": true, "warmup_progress": 20}
 2026-04-15 06:02:12 | INFO     | camo_supervisor | [start] Interface Kivy démarrée
 2026-04-15 06:02:38 | INFO     | camo_supervisor | [start] Arrêt de l'interface Kivy
+2026-04-15 06:14:20 | INFO     | camo_supervisor | [start] Interface Kivy démarrée
+2026-04-15 06:18:56 | INFO     | camo_supervisor | [start] Arrêt de l'interface Kivy
+2026-04-15 06:19:08 | INFO     | camo_supervisor | [start] Interface Kivy démarrée
+2026-04-15 06:20:51 | INFO     | camo_supervisor | [start] Arrêt de l'interface Kivy
