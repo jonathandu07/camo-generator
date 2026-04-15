@@ -1,16 +1,26 @@
 [
   {
-    "ts": 1776227502.7779164,
+    "ts": 1776229385.619597,
     "level": "INFO",
     "source": "start",
     "message": "Interface Kivy démarrée",
     "payload": {}
   },
   {
-    "ts": 1776229364.2554545,
+    "ts": 1776229394.9537363,
     "level": "INFO",
-    "source": "start",
-    "message": "Arrêt de l'interface Kivy",
-    "payload": {}
+    "source": "mldl",
+    "message": "Mode ML/DL activé",
+    "payload": {
+      "target_count": 100,
+      "output_dir": "textures_bestof_8k",
+      "warmup_samples": 192,
+      "warmup_remaining": 176,
+      "dataset_samples": 16,
+      "checkpoint_loaded": false,
+      "candidate_pool_size": 8,
+      "validate_top_k": 3,
+      "warmup_in_background": true
+    }
   }
 ]
