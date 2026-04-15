@@ -1841,26 +1841,6 @@ class CamouflageApp(App):
         self.diag_rule_counter: Counter[str] = Counter()
         self.diag_last_rules: List[str] = []
 
-        self.mldl_runtime_state: Dict[str, Any] = {
-            "device": "--",
-            "warmup_progress": 0,
-            "warmup_total": 0,
-            "warmup_remaining": 0,
-            "warmup_in_background": False,
-            "candidate_pool_size": 0,
-            "validate_top_k": 0,
-            "dataset_samples": 0,
-            "dataset_loaded": False,
-            "checkpoint_loaded": False,
-            "tolerance_state_loaded": False,
-            "resume_used": False,
-            "checkpoint_path": "",
-            "dataset_path": "",
-            "latest_stats": {},
-            "champion": {},
-            "surrogate_trained": False,
-        }
-
         self.dynamic_tolerance_enabled = bool(getattr(camo, "DEFAULT_DYNAMIC_TOLERANCE_ENABLED", True))
         self.rejection_rate_window = int(getattr(camo, "DEFAULT_REJECTION_RATE_WINDOW", 24))
         self.rejection_rate_high = float(getattr(camo, "DEFAULT_REJECTION_RATE_HIGH", 0.90))
@@ -1899,6 +1879,28 @@ class CamouflageApp(App):
         self.current_generation_mode = "classic"
         self.use_mldl = bool(camo_mldl is not None and getattr(camo_mldl, "TORCH_AVAILABLE", False))
         self.mldl_last_stats: Optional[Dict[str, Any]] = None
+        self.mldl_runtime_state: Dict[str, Any] = {
+            "device": "--",
+            "warmup_progress": 0,
+            "warmup_total": 0,
+            "warmup_remaining": 0,
+            "warmup_in_background": False,
+            "candidate_pool_size": 0,
+            "validate_top_k": 0,
+            "dataset_samples": 0,
+            "dataset_loaded": False,
+            "checkpoint_loaded": False,
+            "tolerance_state_loaded": False,
+            "resume_used": False,
+            "checkpoint_path": "",
+            "dataset_path": "",
+            "summary_path": "",
+            "training_log_path": "",
+            "latest_stats": None,
+            "latest_error": None,
+            "champion": {},
+            "surrogate_trained": False,
+        }
         self._current_preview_raw_img: Optional[PILImage.Image] = None
         self.pending_manual_review: Optional[PendingManualReview] = None
         self.generated_rows: List[dict] = []
@@ -3095,7 +3097,7 @@ class CamouflageApp(App):
     def _build_mldl_config(self, target_count: int):
         if camo_mldl is None:
             raise RuntimeError("camouflage_ml_dl.py est indisponible.")
-        warmup_samples = max(64, min(256, int(target_count) * 8))
+        warmup_samples = max(64, min(192, int(target_count) * 6))
         return camo_mldl.MLDLConfig(
             target_count=int(target_count),
             warmup_samples=int(warmup_samples),
@@ -3113,6 +3115,9 @@ class CamouflageApp(App):
             random_seed=int(getattr(camo, "DEFAULT_BASE_SEED", 202604010001) & 0x7FFF_FFFF),
             parallel_train_enabled=True,
             parallel_train_min_interval_s=3.0,
+            min_train_size=12,
+            retrain_every=8,
+            pretrain_relax_level=0.18,
         )
 
     def start_generation(self, *_):
@@ -3479,11 +3484,12 @@ class CamouflageApp(App):
                             await self._async_finish_stopped(rows)
                             return
 
+                        active_profile = getattr(runner, "tolerance_profile", None) or self.tolerance_profile
                         candidate, outcome = await asyncio.to_thread(
                             camo.generate_and_validate_from_seed,
                             proposal.seed,
                             self.max_repair_rounds,
-                            self.tolerance_profile,
+                            active_profile,
                             self.anti_pixel,
                         )
                         runner.total_attempts += 1
@@ -3492,11 +3498,20 @@ class CamouflageApp(App):
 
                         valid = bool(getattr(outcome, "accepted", False))
                         self._remember_tolerance_outcome(valid)
-                        self._update_dynamic_tolerance_profile()
+                        self._update_dynamic_tolerance_profile(candidate, outcome, total_attempts)
+                        try:
+                            runner._update_tolerance_from_candidate(candidate, outcome, total_attempts)
+                        except Exception:
+                            pass
+                        self.tolerance_profile = getattr(runner, "tolerance_profile", self.tolerance_profile)
                         self._remember_tolerance_change(total_attempts)
                         scores = extract_backend_scores(candidate.ratios, candidate.metrics, outcome)
 
-                        reward = runner.buffer.add(candidate, valid)
+                        try:
+                            reward_override = runner._reward_from_outcome(candidate, outcome)
+                        except Exception:
+                            reward_override = None
+                        reward = runner.buffer.add(candidate, valid, reward_override=reward_override)
                         dataset_samples = _buffer_len()
                         _persist_buffer_if_needed(dataset_samples)
 
@@ -3525,7 +3540,7 @@ class CamouflageApp(App):
                                     global_attempt=total_attempts,
                                     candidate=candidate,
                                     outcome=outcome,
-                                    tolerance_profile=self.tolerance_profile,
+                                    tolerance_profile=(getattr(runner, "tolerance_profile", None) or self.tolerance_profile),
                                     tolerance_runtime=self.tolerance_runtime,
                                 )
                                 self.last_validation_payload = payload
@@ -3759,7 +3774,7 @@ class CamouflageApp(App):
                                     global_attempt=total_attempts,
                                     candidate=candidate,
                                     outcome=outcome,
-                                    tolerance_profile=self.tolerance_profile,
+                                    tolerance_profile=(getattr(runner, "tolerance_profile", None) or self.tolerance_profile),
                                     tolerance_runtime=self.tolerance_runtime,
                                 )
                                 self.last_validation_payload = payload
