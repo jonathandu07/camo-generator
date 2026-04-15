@@ -2821,9 +2821,40 @@ class CamouflageApp(App):
         self.validation_event_count = 0
         self.last_validation_payload = None
 
-    def _update_dynamic_tolerance_profile(self):
+    def _update_dynamic_tolerance_profile(
+        self,
+        accepted: Optional[bool] = None,
+        global_attempt: Optional[int] = None,
+        *extra_args: Any,
+        sync_target: Optional[Any] = None,
+        **extra_kwargs: Any,
+    ):
         adapter = getattr(camo, "adapt_tolerance_relax_level", None)
         builder = getattr(camo, "build_validation_tolerance_profile", None)
+
+        normalized_accepted: Optional[bool] = None
+        normalized_global_attempt: Optional[int] = None
+
+        probe_values = [accepted, global_attempt, *extra_args]
+        outcome_obj = extra_kwargs.get("outcome")
+        if outcome_obj is not None:
+            probe_values.append(outcome_obj)
+
+        for value in probe_values:
+            if normalized_accepted is None and isinstance(value, bool):
+                normalized_accepted = bool(value)
+                continue
+            if normalized_global_attempt is None and isinstance(value, int) and not isinstance(value, bool):
+                normalized_global_attempt = int(value)
+                continue
+            if normalized_accepted is None and hasattr(value, "accepted"):
+                try:
+                    normalized_accepted = bool(getattr(value, "accepted"))
+                except Exception:
+                    pass
+
+        if normalized_accepted is not None:
+            self._remember_tolerance_outcome(normalized_accepted)
 
         if callable(adapter):
             try:
@@ -2845,15 +2876,26 @@ class CamouflageApp(App):
                     "relax_before": float(runtime.get("relax_before", 0.0)),
                     "relax_after": float(runtime.get("relax_after", 0.0)),
                 }
-                return
             except Exception:
-                pass
-
-        if callable(builder):
+                if callable(builder):
+                    try:
+                        self.tolerance_profile = builder(self.tolerance_relax_level)
+                    except Exception:
+                        self.tolerance_profile = None
+        elif callable(builder):
             try:
                 self.tolerance_profile = builder(self.tolerance_relax_level)
             except Exception:
                 self.tolerance_profile = None
+
+        if sync_target is not None:
+            try:
+                setattr(sync_target, "tolerance_profile", self.tolerance_profile)
+            except Exception:
+                pass
+
+        if normalized_global_attempt is not None:
+            self._remember_tolerance_change(normalized_global_attempt)
 
     def _remember_tolerance_outcome(self, accepted: bool):
         self.tolerance_outcomes.append(bool(accepted))
@@ -3512,21 +3554,24 @@ class CamouflageApp(App):
                         self.total_attempts = total_attempts
 
                         valid = bool(getattr(outcome, "accepted", False))
-                        self._remember_tolerance_outcome(valid)
-                        self._update_dynamic_tolerance_profile(candidate, outcome, total_attempts)
+                        self._update_dynamic_tolerance_profile(
+                            valid,
+                            total_attempts,
+                            candidate,
+                            outcome,
+                            sync_target=runner,
+                            outcome=outcome,
+                        )
                         try:
-                            runner._update_tolerance_from_candidate(candidate, outcome, total_attempts)
+                            update_tol = getattr(runner, "_update_tolerance_from_candidate", None)
+                            if callable(update_tol):
+                                update_tol(candidate, outcome, total_attempts)
                         except Exception:
                             pass
                         self.tolerance_profile = getattr(runner, "tolerance_profile", self.tolerance_profile)
-                        self._remember_tolerance_change(total_attempts)
                         scores = extract_backend_scores(candidate.ratios, candidate.metrics, outcome)
 
-                        try:
-                            reward_override = runner._reward_from_outcome(candidate, outcome)
-                        except Exception:
-                            reward_override = None
-                        reward = runner.buffer.add(candidate, valid, reward_override=reward_override)
+                        reward = runner.buffer.add(candidate, valid)
                         dataset_samples = _buffer_len()
                         _persist_buffer_if_needed(dataset_samples)
 

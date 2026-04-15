@@ -142,3 +142,6 @@
 2026-04-15 06:20:51 | INFO     | camo_supervisor | [start] Arrêt de l'interface Kivy
 2026-04-15 06:31:42 | INFO     | camo_supervisor | [start] Interface Kivy démarrée
 2026-04-15 07:02:44 | INFO     | camo_supervisor | [start] Arrêt de l'interface Kivy
+2026-04-15 07:03:05 | INFO     | camo_supervisor | [start] Interface Kivy démarrée
+2026-04-15 07:03:14 | INFO     | camo_supervisor | [mldl] Mode ML/DL activé | payload={"candidate_pool_size": 8, "checkpoint_loaded": false, "dataset_samples": 16, "output_dir": "textures_bestof_8k", "target_count": 100, "validate_top_k": 3, "warmup_in_background": true, "warmup_remaining": 176, "warmup_samples": 192}
+2026-04-15 08:00:55 | INFO     | camo_supervisor | [start] Arrêt de l'interface Kivy
