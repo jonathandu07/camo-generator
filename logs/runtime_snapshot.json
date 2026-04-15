@@ -1,13 +1,13 @@
 [
   {
-    "ts": 1776229385.619597,
+    "ts": 1776235284.9435973,
     "level": "INFO",
     "source": "start",
     "message": "Interface Kivy démarrée",
     "payload": {}
   },
   {
-    "ts": 1776229394.9537363,
+    "ts": 1776235292.6826215,
     "level": "INFO",
     "source": "mldl",
     "message": "Mode ML/DL activé",
@@ -17,17 +17,10 @@
       "warmup_samples": 192,
       "warmup_remaining": 176,
       "dataset_samples": 16,
-      "checkpoint_loaded": false,
+      "checkpoint_loaded": true,
       "candidate_pool_size": 8,
       "validate_top_k": 3,
       "warmup_in_background": true
     }
-  },
-  {
-    "ts": 1776232855.429343,
-    "level": "INFO",
-    "source": "start",
-    "message": "Arrêt de l'interface Kivy",
-    "payload": {}
   }
 ]
