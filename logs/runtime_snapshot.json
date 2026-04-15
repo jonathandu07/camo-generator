@@ -22,5 +22,366 @@
       "validate_top_k": 3,
       "warmup_in_background": true
     }
+  },
+  {
+    "ts": 1776197121.1576593,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 1,
+      "local_attempt": 1,
+      "global_attempt": 1,
+      "seed": 1013020551019,
+      "action_name": "affine_medium",
+      "pred_valid": 0.5,
+      "pred_reward": 0.0,
+      "accepted": false,
+      "dataset_samples": 2,
+      "warmup_progress": 2,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776198063.1880662,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 1,
+      "local_attempt": 2,
+      "global_attempt": 2,
+      "seed": 202604110059,
+      "action_name": "linear_step_3",
+      "pred_valid": 0.5,
+      "pred_reward": 0.0,
+      "accepted": false,
+      "dataset_samples": 3,
+      "warmup_progress": 3,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776199013.3407762,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 1,
+      "local_attempt": 3,
+      "global_attempt": 3,
+      "seed": 202604150403,
+      "action_name": "xor_low",
+      "pred_valid": 0.5,
+      "pred_reward": 0.0,
+      "accepted": false,
+      "dataset_samples": 4,
+      "warmup_progress": 4,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776201810.3716097,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 1,
+      "local_attempt": 9,
+      "global_attempt": 4,
+      "seed": 202609998560,
+      "action_name": "xor_high",
+      "pred_valid": 0.5,
+      "pred_reward": 0.0,
+      "accepted": false,
+      "dataset_samples": 5,
+      "warmup_progress": 5,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776202782.87836,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 1,
+      "local_attempt": 10,
+      "global_attempt": 5,
+      "seed": 607812330134,
+      "action_name": "affine_small",
+      "pred_valid": 0.5,
+      "pred_reward": 0.0,
+      "accepted": false,
+      "dataset_samples": 6,
+      "warmup_progress": 6,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776203723.252467,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 1,
+      "local_attempt": 11,
+      "global_attempt": 6,
+      "seed": 202604110013,
+      "action_name": "linear_step_1",
+      "pred_valid": 0.5,
+      "pred_reward": 0.0,
+      "accepted": false,
+      "dataset_samples": 7,
+      "warmup_progress": 7,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776206452.533342,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 1,
+      "local_attempt": 17,
+      "global_attempt": 7,
+      "seed": 202604117937,
+      "action_name": "offset_7919",
+      "pred_valid": 0.5,
+      "pred_reward": 0.0,
+      "accepted": false,
+      "dataset_samples": 8,
+      "warmup_progress": 8,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776207411.709434,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 1,
+      "local_attempt": 18,
+      "global_attempt": 8,
+      "seed": 202604111016,
+      "action_name": "offset_997",
+      "pred_valid": 0.5,
+      "pred_reward": 0.0,
+      "accepted": false,
+      "dataset_samples": 9,
+      "warmup_progress": 9,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776208365.0065482,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 1,
+      "local_attempt": 19,
+      "global_attempt": 9,
+      "seed": 202604110039,
+      "action_name": "linear_step_2",
+      "pred_valid": 0.5,
+      "pred_reward": 0.0,
+      "accepted": false,
+      "dataset_samples": 10,
+      "warmup_progress": 10,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776211134.634169,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 1,
+      "local_attempt": 25,
+      "global_attempt": 10,
+      "seed": 202604110123,
+      "action_name": "offset_97",
+      "pred_valid": 0.5,
+      "pred_reward": 0.0,
+      "accepted": false,
+      "dataset_samples": 11,
+      "warmup_progress": 11,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776212126.3890495,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 1,
+      "local_attempt": 26,
+      "global_attempt": 11,
+      "seed": 202609998481,
+      "action_name": "xor_high",
+      "pred_valid": 0.5,
+      "pred_reward": 0.0,
+      "accepted": false,
+      "dataset_samples": 12,
+      "warmup_progress": 12,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776213095.2011461,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 1,
+      "local_attempt": 27,
+      "global_attempt": 12,
+      "seed": 202604110029,
+      "action_name": "linear_step_1",
+      "pred_valid": 0.5,
+      "pred_reward": 0.0,
+      "accepted": false,
+      "dataset_samples": 13,
+      "warmup_progress": 13,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776215694.3907416,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 1,
+      "local_attempt": 33,
+      "global_attempt": 13,
+      "seed": 202604110090,
+      "action_name": "linear_step_3",
+      "pred_valid": 0.5,
+      "pred_reward": 0.0,
+      "accepted": false,
+      "dataset_samples": 14,
+      "warmup_progress": 14,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776216567.234079,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 1,
+      "local_attempt": 34,
+      "global_attempt": 14,
+      "seed": 202604111032,
+      "action_name": "offset_997",
+      "pred_valid": 0.5,
+      "pred_reward": 0.0,
+      "accepted": false,
+      "dataset_samples": 15,
+      "warmup_progress": 15,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776217538.5259893,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 1,
+      "local_attempt": 35,
+      "global_attempt": 15,
+      "seed": 202609998478,
+      "action_name": "xor_high",
+      "pred_valid": 0.5,
+      "pred_reward": 0.0,
+      "accepted": false,
+      "dataset_samples": 16,
+      "warmup_progress": 16,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776220042.6364594,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 1,
+      "local_attempt": 41,
+      "global_attempt": 16,
+      "seed": 202604110061,
+      "action_name": "linear_step_2",
+      "pred_valid": 0.5,
+      "pred_reward": 0.0,
+      "accepted": false,
+      "dataset_samples": 17,
+      "warmup_progress": 17,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776221022.0262928,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 1,
+      "local_attempt": 42,
+      "global_attempt": 17,
+      "seed": 607812330230,
+      "action_name": "affine_small",
+      "pred_valid": 0.5,
+      "pred_reward": 0.0,
+      "accepted": false,
+      "dataset_samples": 18,
+      "warmup_progress": 18,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776222082.5512378,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 1,
+      "local_attempt": 43,
+      "global_attempt": 18,
+      "seed": 1013020551229,
+      "action_name": "affine_medium",
+      "pred_valid": 0.5,
+      "pred_reward": 0.0,
+      "accepted": false,
+      "dataset_samples": 19,
+      "warmup_progress": 19,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776224742.7340693,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 1,
+      "local_attempt": 49,
+      "global_attempt": 19,
+      "seed": 202604110147,
+      "action_name": "offset_97",
+      "pred_valid": 0.5,
+      "pred_reward": 0.0,
+      "accepted": false,
+      "dataset_samples": 20,
+      "warmup_progress": 20,
+      "warmup_in_background": true
+    }
   }
 ]

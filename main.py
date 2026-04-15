@@ -167,16 +167,6 @@ ANTI_PIXEL_MODE_FILTER_SIZE = 3
 ANTI_PIXEL_PASSES = 1
 
 
-# Tolérance adaptative guidée par champion.
-DEFAULT_CHAMPION_TOLERANCE_ENABLED = True
-DEFAULT_CHAMPION_MIN_SCORE = 0.18
-DEFAULT_CHAMPION_RECENT_WINDOW = 12
-DEFAULT_CHAMPION_STAGNATION_ATTEMPTS = 18
-DEFAULT_CHAMPION_REOPEN_STEP = 0.04
-MIN_CHAMPION_MARGIN_SCALE = 0.08
-MAX_CHAMPION_MARGIN_SCALE = 0.45
-
-
 # ============================================================
 # STRUCTURES
 # ============================================================
@@ -258,43 +248,6 @@ class ValidationToleranceProfile:
             "bestof_min_score": float(self.bestof_min_score),
             "max_orphan_ratio": float(self.max_orphan_ratio),
             "max_micro_islands_per_mp": float(self.max_micro_islands_per_mp),
-        }
-
-
-
-@dataclass
-class ChampionToleranceState:
-    enabled: bool = True
-    best_score: float = 0.0
-    rolling_score: float = 0.0
-    margin_scale: float = MAX_CHAMPION_MARGIN_SCALE
-    best_attempt: int = 0
-    last_improvement_attempt: int = 0
-    total_seen: int = 0
-    accepted_seen: int = 0
-    champion_seed: int = 0
-    champion_abs_errors: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
-    champion_metrics: Dict[str, float] = field(default_factory=dict)
-    champion_fragmentation: Dict[str, float] = field(default_factory=dict)
-    recent_scores: List[float] = field(default_factory=list)
-    reopen_count: int = 0
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "enabled": bool(self.enabled),
-            "best_score": float(self.best_score),
-            "rolling_score": float(self.rolling_score),
-            "margin_scale": float(self.margin_scale),
-            "best_attempt": int(self.best_attempt),
-            "last_improvement_attempt": int(self.last_improvement_attempt),
-            "total_seen": int(self.total_seen),
-            "accepted_seen": int(self.accepted_seen),
-            "champion_seed": int(self.champion_seed),
-            "champion_abs_errors": [float(x) for x in self.champion_abs_errors],
-            "champion_metrics": {str(k): float(v) for k, v in self.champion_metrics.items()},
-            "champion_fragmentation": {str(k): float(v) for k, v in self.champion_fragmentation.items()},
-            "recent_scores": [float(x) for x in self.recent_scores],
-            "reopen_count": int(self.reopen_count),
         }
 
 
@@ -436,197 +389,6 @@ def _clip_float(value: float, low: float, high: float) -> float:
     return max(float(low), min(float(high), float(value)))
 
 
-
-
-def _safe_metric_value(metrics: Dict[str, Any], key: str, default: float = 0.0) -> float:
-    try:
-        return float(metrics.get(key, default))
-    except Exception:
-        return float(default)
-
-
-def score_candidate_quality(
-    candidate: CandidateResult,
-    outcome: Optional[ValidationOutcome] = None,
-    tolerance_profile: Optional[ValidationToleranceProfile] = None,
-) -> float:
-    if outcome is None:
-        outcome = validate_with_reasons(candidate, tolerance_profile=tolerance_profile)
-    score = float(getattr(outcome, "bestof_score", 0.0))
-    if bool(getattr(outcome, "passed_strict", False)):
-        score += 0.08
-    if bool(getattr(outcome, "accepted", False)):
-        score += 0.05
-    score -= 0.0125 * float(len(getattr(outcome, "reasons", []) or []))
-    return _clip_float(score, 0.0, 1.0)
-
-
-def _build_profile_from_champion_state(
-    state: ChampionToleranceState,
-    base_profile: Optional[ValidationToleranceProfile] = None,
-) -> Optional[ValidationToleranceProfile]:
-    if state.best_attempt <= 0 or not state.champion_metrics:
-        return None
-
-    base = base_profile or build_validation_tolerance_profile(0.0)
-    margin = _clip_float(float(state.margin_scale), MIN_CHAMPION_MARGIN_SCALE, MAX_CHAMPION_MARGIN_SCALE)
-    metrics = dict(state.champion_metrics)
-    frag = dict(state.champion_fragmentation)
-    abs_err = np.asarray(state.champion_abs_errors, dtype=np.float32)
-    mean_abs = float(np.mean(abs_err))
-
-    per_color: List[float] = []
-    for i in range(4):
-        strict_ref = float(MAX_ABS_ERROR_PER_COLOR[i])
-        ref = float(abs_err[i])
-        allowance = ref + max(strict_ref * (0.40 + 1.25 * margin), 0.00020)
-        cap = max(strict_ref * (1.0 + 8.0 * MAX_TOLERANCE_RELAX), strict_ref + 0.025)
-        per_color.append(_clip_float(allowance, strict_ref, cap))
-
-    strict_mean = float(MAX_MEAN_ABS_ERROR)
-    mean_allowance = mean_abs + max(strict_mean * (0.55 + 1.10 * margin), 0.00015)
-    mean_allowance = _clip_float(mean_allowance, strict_mean, max(strict_mean + 0.015, strict_mean * (1.0 + 10.0 * MAX_TOLERANCE_RELAX)))
-
-    bd = _safe_metric_value(metrics, "boundary_density", base.min_boundary_density)
-    bd_small = _safe_metric_value(metrics, "boundary_density_small", base.min_boundary_density_small)
-    bd_tiny = _safe_metric_value(metrics, "boundary_density_tiny", base.min_boundary_density_tiny)
-    mirror = _safe_metric_value(metrics, "mirror_similarity", base.max_mirror_similarity)
-    largest = _safe_metric_value(metrics, "largest_component_ratio_class_1", base.min_largest_component_ratio_class_1)
-    edge = _safe_metric_value(metrics, "edge_contact_ratio", base.max_edge_contact_ratio)
-    orphan_ratio = _safe_metric_value(frag, "orphan_ratio", base.max_orphan_ratio)
-    micro_per_mp = _safe_metric_value(frag, "micro_components_per_mp", base.max_micro_islands_per_mp)
-
-    def low_around(value: float, floor: float = 0.0, abs_floor: float = 0.0015) -> float:
-        return max(float(floor), float(value) - max(abs_floor, abs(value) * (0.35 + 0.85 * margin)))
-
-    def high_around(value: float, ceil: float = 1.0, abs_floor: float = 0.0015) -> float:
-        return min(float(ceil), float(value) + max(abs_floor, abs(value) * (0.35 + 0.85 * margin)))
-
-    quality_ref = _clip_float(float(state.best_score), 0.0, 1.0)
-    bestof_min = _clip_float(max(0.35, quality_ref - (0.06 + 0.14 * margin)), 0.35, 0.985)
-
-    orphan_cap = max(float(base.max_orphan_ratio), orphan_ratio + max(0.0001, 0.0015 * margin))
-    orphan_cap = min(orphan_cap, 0.0035)
-    micro_cap = max(float(base.max_micro_islands_per_mp), micro_per_mp + max(0.10, 1.10 * margin))
-    micro_cap = min(micro_cap, 2.5)
-
-    return ValidationToleranceProfile(
-        relax_level=float(max(base.relax_level, margin / max(1e-9, MAX_CHAMPION_MARGIN_SCALE))),
-        max_abs_error_per_color=tuple(float(x) for x in per_color),
-        max_mean_abs_error=float(mean_allowance),
-        min_boundary_density=float(low_around(bd, 0.0, 0.0025)),
-        max_boundary_density=float(high_around(bd, 1.0, 0.0100)),
-        min_boundary_density_small=float(low_around(bd_small, 0.0, 0.0030)),
-        max_boundary_density_small=float(high_around(bd_small, 1.0, 0.0120)),
-        min_boundary_density_tiny=float(low_around(bd_tiny, 0.0, 0.0040)),
-        max_boundary_density_tiny=float(high_around(bd_tiny, 1.0, 0.0150)),
-        max_mirror_similarity=float(high_around(mirror, 0.995, 0.0200)),
-        min_largest_component_ratio_class_1=float(low_around(largest, 0.0, 0.0100)),
-        max_edge_contact_ratio=float(high_around(edge, 0.995, 0.0200)),
-        bestof_min_score=float(bestof_min),
-        max_orphan_ratio=float(orphan_cap),
-        max_micro_islands_per_mp=float(micro_cap),
-    )
-
-
-def update_champion_tolerance_state(
-    state: Optional[ChampionToleranceState],
-    candidate: CandidateResult,
-    outcome: ValidationOutcome,
-    global_attempt: int,
-    *,
-    base_profile: Optional[ValidationToleranceProfile] = None,
-    enabled: bool = DEFAULT_CHAMPION_TOLERANCE_ENABLED,
-    min_score: float = DEFAULT_CHAMPION_MIN_SCORE,
-    recent_window: int = DEFAULT_CHAMPION_RECENT_WINDOW,
-    stagnation_attempts: int = DEFAULT_CHAMPION_STAGNATION_ATTEMPTS,
-    reopen_step: float = DEFAULT_CHAMPION_REOPEN_STEP,
-) -> Tuple[ChampionToleranceState, Optional[ValidationToleranceProfile], Dict[str, float]]:
-    state = state or ChampionToleranceState(enabled=bool(enabled))
-    state.enabled = bool(enabled)
-    base = base_profile or build_validation_tolerance_profile(0.0)
-
-    quality = score_candidate_quality(candidate, outcome=outcome, tolerance_profile=base)
-    state.total_seen += 1
-    if bool(getattr(outcome, "accepted", False)):
-        state.accepted_seen += 1
-    state.recent_scores.append(float(quality))
-    keep = max(4, int(recent_window))
-    if len(state.recent_scores) > keep:
-        state.recent_scores = state.recent_scores[-keep:]
-
-    if state.total_seen == 1:
-        state.rolling_score = float(quality)
-    else:
-        state.rolling_score = float(0.82 * state.rolling_score + 0.18 * quality)
-
-    runtime = {
-        "quality_score": float(quality),
-        "best_score": float(state.best_score),
-        "rolling_score": float(state.rolling_score),
-        "margin_scale": float(state.margin_scale),
-        "champion_active": 1.0 if state.best_attempt > 0 else 0.0,
-        "stagnation_count": float(max(0, int(global_attempt) - int(state.last_improvement_attempt or 0))),
-        "reopen_count": float(state.reopen_count),
-    }
-
-    if not state.enabled:
-        runtime["source"] = "rejection_rate_only"
-        return state, base, runtime
-
-    improved = bool(quality >= float(min_score) and (state.best_attempt <= 0 or quality > (state.best_score + 1e-9)))
-    if improved:
-        state.best_score = float(quality)
-        state.best_attempt = int(global_attempt)
-        state.last_improvement_attempt = int(global_attempt)
-        state.champion_seed = int(candidate.seed)
-        abs_err = np.abs(np.asarray(candidate.ratios, dtype=np.float32) - np.asarray(TARGET, dtype=np.float32))
-        state.champion_abs_errors = tuple(float(x) for x in abs_err.tolist())
-        state.champion_metrics = {
-            "boundary_density": _safe_metric_value(candidate.metrics, "boundary_density", 0.0),
-            "boundary_density_small": _safe_metric_value(candidate.metrics, "boundary_density_small", 0.0),
-            "boundary_density_tiny": _safe_metric_value(candidate.metrics, "boundary_density_tiny", 0.0),
-            "mirror_similarity": _safe_metric_value(candidate.metrics, "mirror_similarity", 1.0),
-            "largest_component_ratio_class_1": _safe_metric_value(candidate.metrics, "largest_component_ratio_class_1", 0.0),
-            "edge_contact_ratio": _safe_metric_value(candidate.metrics, "edge_contact_ratio", 1.0),
-        }
-        frag = dict(getattr(outcome, "fragmentation", {}) or {})
-        state.champion_fragmentation = {
-            "orphan_ratio": _safe_metric_value(frag, "orphan_ratio", 0.0),
-            "micro_components_per_mp": _safe_metric_value(frag, "micro_components_per_mp", 0.0),
-            "weak_ratio": _safe_metric_value(frag, "weak_ratio", 0.0),
-        }
-        target_margin = _clip_float(0.42 - 0.26 * float(quality), MIN_CHAMPION_MARGIN_SCALE, MAX_CHAMPION_MARGIN_SCALE)
-        state.margin_scale = float(target_margin)
-        runtime["source"] = "champion_improved"
-    elif state.best_attempt > 0:
-        target_margin = _clip_float(
-            0.44 - 0.24 * max(float(state.best_score), float(state.rolling_score)),
-            MIN_CHAMPION_MARGIN_SCALE,
-            MAX_CHAMPION_MARGIN_SCALE,
-        )
-        state.margin_scale = float(_clip_float(0.78 * state.margin_scale + 0.22 * target_margin, MIN_CHAMPION_MARGIN_SCALE, MAX_CHAMPION_MARGIN_SCALE))
-        stagnation = int(global_attempt) - int(state.last_improvement_attempt or 0)
-        if stagnation_attempts > 0 and stagnation >= int(stagnation_attempts):
-            state.margin_scale = float(_clip_float(state.margin_scale + float(reopen_step), MIN_CHAMPION_MARGIN_SCALE, MAX_CHAMPION_MARGIN_SCALE))
-            state.last_improvement_attempt = int(global_attempt)
-            state.reopen_count += 1
-            runtime["source"] = "champion_reopened"
-        else:
-            runtime["source"] = "champion_tracking"
-    else:
-        runtime["source"] = "pre_champion"
-        return state, base, runtime
-
-    profile = _build_profile_from_champion_state(state, base_profile=base)
-    runtime.update({
-        "best_score": float(state.best_score),
-        "rolling_score": float(state.rolling_score),
-        "margin_scale": float(state.margin_scale),
-        "champion_active": 1.0 if state.best_attempt > 0 else 0.0,
-        "champion_seed": float(state.champion_seed),
-    })
-    return state, (profile or base), runtime
 def build_validation_tolerance_profile(relax_level: float = 0.0) -> ValidationToleranceProfile:
     relax = _clip_float(float(relax_level), 0.0, MAX_TOLERANCE_RELAX)
 
@@ -647,7 +409,21 @@ def build_validation_tolerance_profile(relax_level: float = 0.0) -> ValidationTo
     max_edge = float(min(0.90, MAX_EDGE_CONTACT_RATIO + 0.10 * relax))
     bestof_min = float(max(0.90, BESTOF_MIN_SCORE - 0.03 * (relax / max(1e-9, MAX_TOLERANCE_RELAX))))
 
-    # On garde volontairement les orphelins et micro-îlots stricts.
+    relax_ratio = float(relax / max(1e-9, MAX_TOLERANCE_RELAX))
+    orphan_cap = float(MAX_ORPHAN_RATIO)
+    micro_cap = float(MAX_MICRO_ISLANDS_PER_MP)
+    if relax_ratio > 0.0:
+        orphan_cap = float(_clip_float(
+            max(float(MAX_ORPHAN_RATIO), float(PRECHAMPION_MAX_ORPHAN_RATIO) * relax_ratio),
+            float(MAX_ORPHAN_RATIO),
+            float(PRECHAMPION_MAX_ORPHAN_RATIO),
+        ))
+        micro_cap = float(_clip_float(
+            max(float(MAX_MICRO_ISLANDS_PER_MP), float(PRECHAMPION_MAX_MICRO_ISLANDS_PER_MP) * relax_ratio),
+            float(MAX_MICRO_ISLANDS_PER_MP),
+            float(PRECHAMPION_MAX_MICRO_ISLANDS_PER_MP),
+        ))
+
     return ValidationToleranceProfile(
         relax_level=relax,
         max_abs_error_per_color=tuple(float(x) for x in per_color.tolist()),
@@ -662,8 +438,8 @@ def build_validation_tolerance_profile(relax_level: float = 0.0) -> ValidationTo
         min_largest_component_ratio_class_1=min_largest,
         max_edge_contact_ratio=max_edge,
         bestof_min_score=bestof_min,
-        max_orphan_ratio=float(MAX_ORPHAN_RATIO),
-        max_micro_islands_per_mp=float(MAX_MICRO_ISLANDS_PER_MP),
+        max_orphan_ratio=orphan_cap,
+        max_micro_islands_per_mp=micro_cap,
     )
 
 
@@ -2609,7 +2385,7 @@ async def async_generate_all(
                         reason="memory_pressure",
                     ).normalized()
 
-            tolerance_relax_level, rejection_profile, rejection_runtime = adapt_tolerance_relax_level(
+            tolerance_relax_level, tolerance_profile, tolerance_runtime = adapt_tolerance_relax_level(
                 tolerance_relax_level,
                 tolerance_outcomes,
                 window=rejection_rate_window,
@@ -2619,18 +2395,6 @@ async def async_generate_all(
                 relax_step=tolerance_relax_step,
                 enabled=dynamic_tolerance_enabled,
             )
-            tolerance_profile = rejection_profile
-            tolerance_runtime = {
-                "rejection_rate": float(rejection_runtime.get("rejection_rate", 0.0)),
-                "window_count": float(rejection_runtime.get("window_count", 0.0)),
-                "relax_before": float(rejection_runtime.get("relax_before", 0.0)),
-                "relax_after": float(rejection_runtime.get("relax_after", 0.0)),
-                "quality_score": float(tolerance_runtime.get("quality_score", 0.0)),
-                "best_score": float(tolerance_runtime.get("best_score", 0.0)),
-                "rolling_score": float(tolerance_runtime.get("rolling_score", 0.0)),
-                "margin_scale": float(tolerance_runtime.get("margin_scale", float(MAX_CHAMPION_MARGIN_SCALE))),
-                "champion_active": float(tolerance_runtime.get("champion_active", 0.0)),
-            }
 
             batch = build_batch(target_index, local_attempt, tuning.attempt_batch_size, base_seed)
             use_parallel = bool(tuning.parallel_attempts and tuning.max_workers > 1 and len(batch) > 1)
@@ -2674,16 +2438,6 @@ async def async_generate_all(
                 else:
                     counters.rejected += 1
                     tolerance_outcomes.append(False)
-
-                champion_state, tolerance_profile, champion_runtime = update_champion_tolerance_state(
-                    champion_state,
-                    candidate,
-                    outcome,
-                    counters.attempts,
-                    base_profile=tolerance_profile,
-                    enabled=dynamic_tolerance_enabled,
-                )
-                tolerance_runtime.update({str(k): float(v) for k, v in champion_runtime.items() if isinstance(v, (int, float))})
 
                 ordered_results.append((attempt_no, candidate, outcome))
 
@@ -2751,7 +2505,6 @@ async def async_generate_all(
         "tolerance_relax_level_final": float(tolerance_relax_level),
         "tolerance_profile_final": tolerance_profile.to_dict(),
         "tolerance_runtime_final": {str(k): float(v) for k, v in tolerance_runtime.items()},
-        "champion_tolerance_state_final": champion_state.to_dict(),
         "anti_pixel_enabled": bool(DEFAULT_ENABLE_ANTI_PIXEL),
     }
     (Path(output_dir) / "run_summary.json").write_text(
