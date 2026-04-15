@@ -3098,7 +3098,7 @@ class CamouflageApp(App):
         if camo_mldl is None:
             raise RuntimeError("camouflage_ml_dl.py est indisponible.")
         warmup_samples = max(64, min(192, int(target_count) * 6))
-        return camo_mldl.MLDLConfig(
+        kwargs = dict(
             target_count=int(target_count),
             warmup_samples=int(warmup_samples),
             candidate_pool_size=8,
@@ -3117,8 +3117,23 @@ class CamouflageApp(App):
             parallel_train_min_interval_s=3.0,
             min_train_size=12,
             retrain_every=8,
-            pretrain_relax_level=0.18,
         )
+        fields = getattr(getattr(camo_mldl, "MLDLConfig", None), "__dataclass_fields__", {}) or {}
+        if "pretrain_relax_level" in fields:
+            kwargs["pretrain_relax_level"] = 0.18
+        if "pretrain_max_orphan_ratio" in fields:
+            kwargs["pretrain_max_orphan_ratio"] = 0.0015
+        if "pretrain_max_micro_islands_per_mp" in fields:
+            kwargs["pretrain_max_micro_islands_per_mp"] = 2.0
+        if "warmup_persist_every" in fields:
+            kwargs["warmup_persist_every"] = 8
+        if "tolerance_state_name" in fields:
+            kwargs["tolerance_state_name"] = "adaptive_tolerance_state.json"
+        if "bootstrap_first_candidate" in fields:
+            kwargs["bootstrap_first_candidate"] = True
+        if "bootstrap_image_name" in fields:
+            kwargs["bootstrap_image_name"] = "bootstrap_reference.png"
+        return camo_mldl.MLDLConfig(**kwargs)
 
     def start_generation(self, *_):
         if self.running or self.preflight_running:
