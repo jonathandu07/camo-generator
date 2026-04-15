@@ -132,6 +132,11 @@ MIN_COMPONENT_PIXELS = (12, 12, 12, 12)
 MAX_ORPHAN_RATIO = 0.0
 MAX_MICRO_ISLANDS_PER_MP = 0.0
 
+# Bornes de relaxation "pré-champion" utilisées par la tolérance dynamique
+# pour le warmup / pré-entraînement ML-DL.
+PRECHAMPION_MAX_ORPHAN_RATIO = 0.0015
+PRECHAMPION_MAX_MICRO_ISLANDS_PER_MP = 2.0
+
 # Prévention en amont.
 MACRO_GUIDE_MIN_SIDE = 96
 MACRO_GUIDE_MAX_SIDE = 192
@@ -409,19 +414,28 @@ def build_validation_tolerance_profile(relax_level: float = 0.0) -> ValidationTo
     max_edge = float(min(0.90, MAX_EDGE_CONTACT_RATIO + 0.10 * relax))
     bestof_min = float(max(0.90, BESTOF_MIN_SCORE - 0.03 * (relax / max(1e-9, MAX_TOLERANCE_RELAX))))
 
+    prechampion_max_orphan_ratio = float(globals().get(
+        "PRECHAMPION_MAX_ORPHAN_RATIO",
+        MAX_ORPHAN_RATIO,
+    ))
+    prechampion_max_micro_islands_per_mp = float(globals().get(
+        "PRECHAMPION_MAX_MICRO_ISLANDS_PER_MP",
+        MAX_MICRO_ISLANDS_PER_MP,
+    ))
+
     relax_ratio = float(relax / max(1e-9, MAX_TOLERANCE_RELAX))
     orphan_cap = float(MAX_ORPHAN_RATIO)
     micro_cap = float(MAX_MICRO_ISLANDS_PER_MP)
     if relax_ratio > 0.0:
         orphan_cap = float(_clip_float(
-            max(float(MAX_ORPHAN_RATIO), float(PRECHAMPION_MAX_ORPHAN_RATIO) * relax_ratio),
+            max(float(MAX_ORPHAN_RATIO), prechampion_max_orphan_ratio * relax_ratio),
             float(MAX_ORPHAN_RATIO),
-            float(PRECHAMPION_MAX_ORPHAN_RATIO),
+            prechampion_max_orphan_ratio,
         ))
         micro_cap = float(_clip_float(
-            max(float(MAX_MICRO_ISLANDS_PER_MP), float(PRECHAMPION_MAX_MICRO_ISLANDS_PER_MP) * relax_ratio),
+            max(float(MAX_MICRO_ISLANDS_PER_MP), prechampion_max_micro_islands_per_mp * relax_ratio),
             float(MAX_MICRO_ISLANDS_PER_MP),
-            float(PRECHAMPION_MAX_MICRO_ISLANDS_PER_MP),
+            prechampion_max_micro_islands_per_mp,
         ))
 
     return ValidationToleranceProfile(
