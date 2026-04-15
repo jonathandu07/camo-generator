@@ -158,6 +158,15 @@ class MLDLConfig:
     random_seed: int = 12345
     parallel_train_enabled: bool = True
     parallel_train_min_interval_s: float = 3.0
+    # Champs de compatibilité : ignorés si non utilisés par cette version,
+    # mais permettent d'accepter les start.py plus récents sans crash.
+    pretrain_relax_level: float = 0.0
+    pretrain_max_orphan_ratio: Optional[float] = None
+    pretrain_max_micro_islands_per_mp: Optional[float] = None
+    warmup_persist_every: int = 8
+    tolerance_state_name: str = "adaptive_tolerance_state.json"
+    bootstrap_first_candidate: bool = True
+    bootstrap_image_name: str = "bootstrap_reference.png"
 
 
 @dataclass
@@ -747,6 +756,13 @@ class CamouflageMLDLGenerator:
         self.training_log: List[Dict[str, Any]] = []
         self.last_rejected_candidate: Optional[camo.CandidateResult] = None
         self.last_analysis: Optional[RejectionAnalysis] = None
+        base_relax = float(getattr(config, "pretrain_relax_level", 0.0) or 0.0)
+        self.tolerance_profile = (
+            camo.build_validation_tolerance_profile(base_relax)
+            if hasattr(camo, "build_validation_tolerance_profile")
+            else None
+        )
+        self.bootstrap_candidate_info: Optional[Dict[str, Any]] = None
 
         self._buffer_lock = threading.RLock()
         self._trainer_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="camo-mldl-trainer")
