@@ -3271,5 +3271,499 @@
       "warmup_progress": 176,
       "warmup_in_background": true
     }
+  },
+  {
+    "ts": 1776496640.0121734,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 64,
+      "local_attempt": 2,
+      "global_attempt": 161,
+      "seed": 202610410100,
+      "action_name": "offset_97",
+      "pred_valid": 0.9948135614395142,
+      "pred_reward": 2.492631673812866,
+      "accepted": false,
+      "dataset_samples": 177,
+      "warmup_progress": 177,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776497480.728173,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 64,
+      "local_attempt": 3,
+      "global_attempt": 162,
+      "seed": 202610383919,
+      "action_name": "xor_low",
+      "pred_valid": 0.9936386942863464,
+      "pred_reward": 2.456609010696411,
+      "accepted": false,
+      "dataset_samples": 178,
+      "warmup_progress": 178,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776500227.594434,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 64,
+      "local_attempt": 9,
+      "global_attempt": 163,
+      "seed": 202616330309,
+      "action_name": "xor_high",
+      "pred_valid": 0.944897472858429,
+      "pred_reward": 2.643115997314453,
+      "accepted": false,
+      "dataset_samples": 179,
+      "warmup_progress": 179,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776501321.6736946,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 64,
+      "local_attempt": 10,
+      "global_attempt": 164,
+      "seed": 202610410018,
+      "action_name": "linear_step_1",
+      "pred_valid": 0.944871723651886,
+      "pred_reward": 2.747539520263672,
+      "accepted": false,
+      "dataset_samples": 180,
+      "warmup_progress": 180,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776502319.251011,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 64,
+      "local_attempt": 11,
+      "global_attempt": 165,
+      "seed": 607831230143,
+      "action_name": "affine_small",
+      "pred_valid": 0.9447901248931885,
+      "pred_reward": 2.5772740840911865,
+      "accepted": false,
+      "dataset_samples": 181,
+      "warmup_progress": 181,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776505364.659133,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 64,
+      "local_attempt": 17,
+      "global_attempt": 166,
+      "seed": 1013052051129,
+      "action_name": "affine_medium",
+      "pred_valid": 0.9428436160087585,
+      "pred_reward": 2.7252163887023926,
+      "accepted": false,
+      "dataset_samples": 182,
+      "warmup_progress": 182,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776506434.5071793,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 64,
+      "local_attempt": 18,
+      "global_attempt": 167,
+      "seed": 202616330364,
+      "action_name": "xor_high",
+      "pred_valid": 0.9372592568397522,
+      "pred_reward": 2.6292057037353516,
+      "accepted": false,
+      "dataset_samples": 183,
+      "warmup_progress": 183,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776507448.5707755,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 64,
+      "local_attempt": 19,
+      "global_attempt": 168,
+      "seed": 202610410026,
+      "action_name": "linear_step_1",
+      "pred_valid": 0.9363167881965637,
+      "pred_reward": 2.502408742904663,
+      "accepted": false,
+      "dataset_samples": 184,
+      "warmup_progress": 184,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776507448.6144407,
+    "level": "INFO",
+    "source": "mldl",
+    "message": "Checkpoint DL mis à jour",
+    "payload": {
+      "stats": {
+        "epoch": 14.0,
+        "train_loss": 0.3373579780260722,
+        "train_loss_valid": 0.17981724441051483,
+        "train_loss_reward": 0.22505820638094193,
+        "val_loss": 0.5548272728919983,
+        "val_loss_valid": 0.2441629320383072,
+        "val_loss_reward": 0.4438062310218811,
+        "best_epoch": 8.0,
+        "best_val_loss": 0.5049920678138733
+      }
+    }
+  },
+  {
+    "ts": 1776510477.4824631,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 64,
+      "local_attempt": 25,
+      "global_attempt": 169,
+      "seed": 202610410033,
+      "action_name": "linear_step_1",
+      "pred_valid": 0.9924771189689636,
+      "pred_reward": 2.802849292755127,
+      "accepted": false,
+      "dataset_samples": 185,
+      "warmup_progress": 185,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776511508.0708706,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 64,
+      "local_attempt": 26,
+      "global_attempt": 170,
+      "seed": 202610410127,
+      "action_name": "offset_97",
+      "pred_valid": 0.9891451001167297,
+      "pred_reward": 2.8355984687805176,
+      "accepted": false,
+      "dataset_samples": 186,
+      "warmup_progress": 186,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776512579.0798242,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 64,
+      "local_attempt": 27,
+      "global_attempt": 171,
+      "seed": 202616330347,
+      "action_name": "xor_high",
+      "pred_valid": 0.9792491793632507,
+      "pred_reward": 2.5676660537719727,
+      "accepted": false,
+      "dataset_samples": 187,
+      "warmup_progress": 187,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776515577.5926044,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 64,
+      "local_attempt": 33,
+      "global_attempt": 172,
+      "seed": 202610383887,
+      "action_name": "xor_low",
+      "pred_valid": 0.9923451542854309,
+      "pred_reward": 2.8226170539855957,
+      "accepted": false,
+      "dataset_samples": 188,
+      "warmup_progress": 188,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776516599.6363966,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 64,
+      "local_attempt": 34,
+      "global_attempt": 173,
+      "seed": 202610417954,
+      "action_name": "offset_7919",
+      "pred_valid": 0.985742449760437,
+      "pred_reward": 2.757312297821045,
+      "accepted": false,
+      "dataset_samples": 189,
+      "warmup_progress": 189,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776517646.693822,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 64,
+      "local_attempt": 35,
+      "global_attempt": 174,
+      "seed": 202610410057,
+      "action_name": "linear_step_2",
+      "pred_valid": 0.9852762818336487,
+      "pred_reward": 2.6338114738464355,
+      "accepted": false,
+      "dataset_samples": 190,
+      "warmup_progress": 190,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776520667.0194016,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 64,
+      "local_attempt": 41,
+      "global_attempt": 175,
+      "seed": 607831230230,
+      "action_name": "affine_small",
+      "pred_valid": 0.990908682346344,
+      "pred_reward": 2.768439769744873,
+      "accepted": false,
+      "dataset_samples": 191,
+      "warmup_progress": 191,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776521760.7574646,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 64,
+      "local_attempt": 42,
+      "global_attempt": 176,
+      "seed": 202610410100,
+      "action_name": "linear_step_3",
+      "pred_valid": 0.9900218844413757,
+      "pred_reward": 2.773632287979126,
+      "accepted": false,
+      "dataset_samples": 192,
+      "warmup_progress": 192,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776522832.7818162,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 64,
+      "local_attempt": 43,
+      "global_attempt": 177,
+      "seed": 202610411039,
+      "action_name": "offset_997",
+      "pred_valid": 0.9890617728233337,
+      "pred_reward": 2.7040390968322754,
+      "accepted": false,
+      "dataset_samples": 193,
+      "warmup_progress": 192,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776525903.492576,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 64,
+      "local_attempt": 49,
+      "global_attempt": 178,
+      "seed": 202610417970,
+      "action_name": "offset_7919",
+      "pred_valid": 0.9923545122146606,
+      "pred_reward": 2.673722982406616,
+      "accepted": false,
+      "dataset_samples": 194,
+      "warmup_progress": 192,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776526975.907426,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 64,
+      "local_attempt": 50,
+      "global_attempt": 179,
+      "seed": 202610410109,
+      "action_name": "linear_step_3",
+      "pred_valid": 0.981754720211029,
+      "pred_reward": 2.6342732906341553,
+      "accepted": false,
+      "dataset_samples": 195,
+      "warmup_progress": 192,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776528059.148766,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 64,
+      "local_attempt": 51,
+      "global_attempt": 180,
+      "seed": 202616330259,
+      "action_name": "xor_high",
+      "pred_valid": 0.9813158512115479,
+      "pred_reward": 2.4603569507598877,
+      "accepted": false,
+      "dataset_samples": 196,
+      "warmup_progress": 192,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776531044.7251606,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 64,
+      "local_attempt": 57,
+      "global_attempt": 181,
+      "seed": 202610417980,
+      "action_name": "offset_7919",
+      "pred_valid": 0.9917367100715637,
+      "pred_reward": 2.769639492034912,
+      "accepted": false,
+      "dataset_samples": 197,
+      "warmup_progress": 192,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776532079.3454666,
+    "level": "WARNING",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 64,
+      "local_attempt": 58,
+      "global_attempt": 182,
+      "seed": 202610411057,
+      "action_name": "offset_997",
+      "pred_valid": 0.9887950420379639,
+      "pred_reward": 2.709864616394043,
+      "accepted": false,
+      "dataset_samples": 198,
+      "warmup_progress": 192,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776532587.3622725,
+    "level": "INFO",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 64,
+      "local_attempt": 59,
+      "global_attempt": 183,
+      "seed": 202610410059,
+      "action_name": "linear_step_1",
+      "pred_valid": 0.9868721961975098,
+      "pred_reward": 2.703108549118042,
+      "accepted": true,
+      "dataset_samples": 199,
+      "warmup_progress": 192,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776535201.5488276,
+    "level": "INFO",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 65,
+      "local_attempt": 1,
+      "global_attempt": 184,
+      "seed": 607831530119,
+      "action_name": "affine_small",
+      "pred_valid": 0.9916844367980957,
+      "pred_reward": 2.700141429901123,
+      "accepted": true,
+      "dataset_samples": 200,
+      "warmup_progress": 192,
+      "warmup_in_background": true
+    }
+  },
+  {
+    "ts": 1776535210.3656738,
+    "level": "INFO",
+    "source": "mldl",
+    "message": "Checkpoint DL mis à jour",
+    "payload": {
+      "stats": {
+        "epoch": 12.0,
+        "train_loss": 0.44101306971381693,
+        "train_loss_valid": 0.2320391488425872,
+        "train_loss_reward": 0.29853416891659007,
+        "val_loss": 0.5845011472702026,
+        "val_loss_valid": 0.26790982484817505,
+        "val_loss_reward": 0.4522733688354492,
+        "best_epoch": 6.0,
+        "best_val_loss": 0.4918587803840637
+      }
+    }
   }
 ]
