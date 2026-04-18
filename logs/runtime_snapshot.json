@@ -3765,5 +3765,24 @@
         "best_val_loss": 0.4918587803840637
       }
     }
+  },
+  {
+    "ts": 1776537668.8768258,
+    "level": "INFO",
+    "source": "mldl",
+    "message": "Validation candidate ML/DL",
+    "payload": {
+      "target_index": 66,
+      "local_attempt": 1,
+      "global_attempt": 185,
+      "seed": 202610577774,
+      "action_name": "xor_low",
+      "pred_valid": 0.9897810220718384,
+      "pred_reward": 2.7808291912078857,
+      "accepted": true,
+      "dataset_samples": 201,
+      "warmup_progress": 192,
+      "warmup_in_background": true
+    }
   }
 ]

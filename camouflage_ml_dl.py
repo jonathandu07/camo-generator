@@ -4,14 +4,15 @@ camouflage_ml_dl.py
 
 Pipeline hybride ML + DL compatible avec le main.py réel.
 
-Approche :
-1) Warmup : génération de candidats par seed, extraction des features réelles,
-   validation et constitution du dataset supervisé.
-2) Deep Learning : surrogate léger qui prédit probabilité de validation et reward.
-3) Bandit contextuel LinUCB : choisit des politiques de recherche de seed.
-4) Recherche guidée : pour chaque image cible, on génère un petit pool de seeds,
-   on classe les propositions avec le surrogate, puis on valide réellement les
-   meilleures candidates via main.py.
+Extensions de cette version :
+- guidage ML/DL de la génération des seeds ;
+- guidage optionnel de la projection mannequin si un backend de projection
+  compatible (start_corrected.py ou start.py) est disponible ;
+- sélection conjointe seed + projection_scale ;
+- reward combiné backend + projection.
+
+Le motif_scale, la palette et les proportions couleur restent fixés par
+l'utilisateur et/ou le backend principal. Le ML/DL ne modifie pas ces choix.
 """
 
 from __future__ import annotations
@@ -35,7 +36,6 @@ try:
     import torch
     from torch import nn
     from torch.utils.data import DataLoader, TensorDataset, random_split
-
     TORCH_AVAILABLE = True
 except Exception as exc:  # pragma: no cover
     torch = None
@@ -50,10 +50,6 @@ else:
 
 
 def _resolve_camo_module():
-    """
-    Résout le module de génération sans dupliquer `main` lorsqu'il est lancé
-    comme script (`__main__`).
-    """
     for name in ("main", "__main__"):
         mod = sys.modules.get(name)
         if mod is not None and hasattr(mod, "generate_and_validate_from_seed") and hasattr(mod, "validate_with_reasons"):
@@ -62,6 +58,34 @@ def _resolve_camo_module():
 
 
 camo = _resolve_camo_module()
+
+
+# ============================================================
+# PROJECTION BACKEND OPTIONNEL
+# ============================================================
+
+
+def _resolve_projection_module() -> Optional[Any]:
+    for name in ("start_corrected", "start"):
+        mod = sys.modules.get(name)
+        if mod is not None and hasattr(mod, "projection_preview_with_report"):
+            return mod
+
+    for name in ("start_corrected", "start"):
+        try:
+            mod = importlib.import_module(name)
+        except Exception:
+            continue
+        if hasattr(mod, "projection_preview_with_report"):
+            return mod
+    return None
+
+
+projection_mod = _resolve_projection_module()
+PROJECTION_AVAILABLE = bool(
+    projection_mod is not None
+    and hasattr(projection_mod, "projection_preview_with_report")
+)
 
 
 # ============================================================
@@ -93,6 +117,17 @@ FEATURE_KEYS: tuple[str, ...] = (
     "macro_prior_agreement",
     "macro_guide_agreement",
     "anti_pixel_enabled",
+)
+
+PROJECTION_FEATURE_KEYS: tuple[str, ...] = (
+    "projection_scale",
+    "projection_valid",
+    "projection_uniform_pixels_norm",
+    "projection_residual_pixels_norm",
+    "projection_still_green_pixels_norm",
+    "projection_residual_ratio",
+    "projection_mean_lab_distance",
+    "projection_mean_rgb_delta",
 )
 
 FAILURE_KEYS: tuple[str, ...] = (
@@ -156,7 +191,6 @@ class MLDLConfig:
     parallel_train_enabled: bool = True
     parallel_train_min_interval_s: float = 3.0
 
-    # Compatibilité avec des frontends plus récents.
     pretrain_relax_level: float = 0.0
     pretrain_max_orphan_ratio: Optional[float] = None
     pretrain_max_micro_islands_per_mp: Optional[float] = None
@@ -165,9 +199,16 @@ class MLDLConfig:
     bootstrap_first_candidate: bool = True
     bootstrap_image_name: str = "bootstrap_reference.png"
 
-    # Alignement avec main.py réel
     max_repair_rounds: int = getattr(camo, "MAX_REPAIR_ROUNDS", 3)
     anti_pixel: bool = bool(getattr(camo, "DEFAULT_ENABLE_ANTI_PIXEL", True))
+
+    # Projection ML/DL
+    projection_ml_enabled: bool = True
+    projection_base_scale: float = 1.0
+    projection_scale_candidates: Tuple[float, ...] = (0.82, 0.92, 1.00, 1.08, 1.18)
+    projection_preview_mode: str = "fast"
+    projection_final_mode: str = "quality"
+    projection_reward_weight: float = 0.65
 
 
 @dataclass
@@ -182,6 +223,31 @@ class RejectionAnalysis:
 
 
 @dataclass
+class ProjectionStats:
+    scale: float = 1.0
+    valid: bool = False
+    uniform_pixels: int = 0
+    residual_pixels: int = 0
+    still_green_pixels: int = 0
+    residual_ratio: float = 1.0
+    mean_lab_distance: float = 0.0
+    mean_rgb_delta: float = 0.0
+
+    def to_feature_dict(self) -> Dict[str, float]:
+        uniform = max(1, int(self.uniform_pixels))
+        return {
+            "projection_scale": float(self.scale),
+            "projection_valid": float(1.0 if self.valid else 0.0),
+            "projection_uniform_pixels_norm": float(min(1.0, uniform / 500000.0)),
+            "projection_residual_pixels_norm": float(min(1.0, self.residual_pixels / 50000.0)),
+            "projection_still_green_pixels_norm": float(min(1.0, self.still_green_pixels / 50000.0)),
+            "projection_residual_ratio": float(self.residual_ratio),
+            "projection_mean_lab_distance": float(min(5.0, self.mean_lab_distance / 30.0)),
+            "projection_mean_rgb_delta": float(min(5.0, self.mean_rgb_delta / 25.0)),
+        }
+
+
+@dataclass
 class Proposal:
     seed: int
     action_idx: int
@@ -189,11 +255,14 @@ class Proposal:
     candidate: Any
     pred_valid: float
     pred_reward: float
+    projection_scale: float = 1.0
+    projection_stats: Optional[ProjectionStats] = None
 
 
 # ============================================================
 # OUTILS FEATURES / REWARD
 # ============================================================
+
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -239,9 +308,17 @@ def candidate_to_feature_dict(candidate: Any) -> Dict[str, float]:
     }
 
 
-def candidate_to_feature_vector(candidate: Any) -> np.ndarray:
+def projection_stats_to_feature_dict(stats: Optional[ProjectionStats]) -> Dict[str, float]:
+    if stats is None:
+        return ProjectionStats().to_feature_dict()
+    return stats.to_feature_dict()
+
+
+def candidate_to_feature_vector(candidate: Any, projection_stats: Optional[ProjectionStats] = None) -> np.ndarray:
     feat = candidate_to_feature_dict(candidate)
-    return np.array([feat.get(name, 0.0) for name in FEATURE_KEYS], dtype=np.float32)
+    pfeat = projection_stats_to_feature_dict(projection_stats)
+    ordered = [feat.get(name, 0.0) for name in FEATURE_KEYS] + [pfeat.get(name, 0.0) for name in PROJECTION_FEATURE_KEYS]
+    return np.array(ordered, dtype=np.float32)
 
 
 def analyze_rejection(candidate: Any, target_index: int, local_attempt: int) -> RejectionAnalysis:
@@ -256,22 +333,18 @@ def analyze_rejection(candidate: Any, target_index: int, local_attempt: int) -> 
 
     if feat["mean_abs_error"] > float(camo.MAX_MEAN_ABS_ERROR):
         failures.append("mean_abs_error")
-
     if feat["boundary_density"] < float(camo.MIN_BOUNDARY_DENSITY):
         failures.append("boundary_density_low")
     if feat["boundary_density"] > float(camo.MAX_BOUNDARY_DENSITY):
         failures.append("boundary_density_high")
-
     if feat["boundary_density_small"] < float(camo.MIN_BOUNDARY_DENSITY_SMALL):
         failures.append("boundary_density_small_low")
     if feat["boundary_density_small"] > float(camo.MAX_BOUNDARY_DENSITY_SMALL):
         failures.append("boundary_density_small_high")
-
     if feat["boundary_density_tiny"] < float(camo.MIN_BOUNDARY_DENSITY_TINY):
         failures.append("boundary_density_tiny_low")
     if feat["boundary_density_tiny"] > float(camo.MAX_BOUNDARY_DENSITY_TINY):
         failures.append("boundary_density_tiny_high")
-
     if feat["mirror_similarity"] > float(camo.MAX_MIRROR_SIMILARITY):
         failures.append("mirror_similarity_high")
     if feat["largest_component_ratio_class_1"] < float(camo.MIN_LARGEST_COMPONENT_RATIO_CLASS_1):
@@ -317,8 +390,8 @@ def analysis_to_failure_vector(analysis: Optional[RejectionAnalysis]) -> np.ndar
     return np.array([1.0 if name in names else 0.0 for name in FAILURE_KEYS], dtype=np.float32)
 
 
-def build_context_vector(candidate: Any, analysis: Optional[RejectionAnalysis]) -> np.ndarray:
-    feat = candidate_to_feature_vector(candidate)
+def build_context_vector(candidate: Any, analysis: Optional[RejectionAnalysis], projection_stats: Optional[ProjectionStats] = None) -> np.ndarray:
+    feat = candidate_to_feature_vector(candidate, projection_stats=projection_stats)
     fail = analysis_to_failure_vector(analysis)
     return np.concatenate([feat, fail], axis=0)
 
@@ -353,6 +426,26 @@ def candidate_reward(candidate: Any, accepted: bool) -> float:
     return float(score)
 
 
+def projection_reward(stats: Optional[ProjectionStats]) -> float:
+    if stats is None:
+        return 0.0
+    uniform = max(1, int(stats.uniform_pixels))
+    residual_ratio = float(stats.residual_ratio)
+    still_ratio = float(stats.still_green_pixels / uniform)
+    reward = 0.0
+    reward += 1.0 if stats.valid else -0.25
+    reward -= 18.0 * residual_ratio
+    reward -= 10.0 * still_ratio
+    reward -= 2.5 * min(1.0, stats.residual_pixels / 5000.0)
+    reward += 0.20 * min(3.0, stats.mean_lab_distance / 20.0)
+    reward += 0.10 * min(3.0, stats.mean_rgb_delta / 20.0)
+    return float(reward)
+
+
+def combined_reward(candidate: Any, accepted: bool, projection_stats: Optional[ProjectionStats], weight: float) -> float:
+    return float(candidate_reward(candidate, accepted) + float(weight) * projection_reward(projection_stats))
+
+
 # ============================================================
 # NORMALISATION
 # ============================================================
@@ -378,11 +471,7 @@ class Standardizer:
         return (x - self.mean) / self.std
 
     def state_dict(self) -> Dict[str, Any]:
-        return {
-            "mean": self.mean.tolist(),
-            "std": self.std.tolist(),
-            "fitted": bool(self.fitted),
-        }
+        return {"mean": self.mean.tolist(), "std": self.std.tolist(), "fitted": bool(self.fitted)}
 
     def load_state_dict(self, state: Dict[str, Any]) -> None:
         self.mean = np.array(state["mean"], dtype=np.float32)
@@ -684,16 +773,17 @@ class ExperienceBuffer:
         self.valid: List[float] = []
         self.rewards: List[float] = []
 
-    def add(self, candidate: Any, accepted: bool) -> float:
-        feat = candidate_to_feature_vector(candidate)
-        reward = candidate_reward(candidate, accepted)
+    def add(self, candidate: Any, accepted: bool, projection_stats: Optional[ProjectionStats], projection_weight: float) -> float:
+        feat = candidate_to_feature_vector(candidate, projection_stats=projection_stats)
+        reward = combined_reward(candidate, accepted, projection_stats, projection_weight)
         self.features.append(feat)
         self.valid.append(float(1.0 if accepted else 0.0))
         self.rewards.append(float(reward))
         return reward
 
     def as_arrays(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        x = np.stack(self.features, axis=0).astype(np.float32) if self.features else np.zeros((0, len(FEATURE_KEYS)), dtype=np.float32)
+        dim = len(FEATURE_KEYS) + len(PROJECTION_FEATURE_KEYS)
+        x = np.stack(self.features, axis=0).astype(np.float32) if self.features else np.zeros((0, dim), dtype=np.float32)
         y_valid = np.array(self.valid, dtype=np.float32)
         y_reward = np.array(self.rewards, dtype=np.float32)
         return x, y_valid, y_reward
@@ -736,6 +826,41 @@ def propose_seed(base_seed: int, action: Dict[str, Any]) -> int:
 
 
 # ============================================================
+# PROJECTION HELPERS
+# ============================================================
+
+
+def _extract_projection_stats(report: Any, scale: float) -> ProjectionStats:
+    if report is None:
+        return ProjectionStats(scale=float(scale))
+    return ProjectionStats(
+        scale=float(scale),
+        valid=bool(getattr(report, "valid", False)),
+        uniform_pixels=int(getattr(report, "uniform_pixels", 0) or 0),
+        residual_pixels=int(getattr(report, "residual_pixels", 0) or 0),
+        still_green_pixels=int(getattr(report, "still_green_pixels", 0) or 0),
+        residual_ratio=float(getattr(report, "residual_ratio", 1.0) or 1.0),
+        mean_lab_distance=float(getattr(report, "mean_lab_distance", 0.0) or 0.0),
+        mean_rgb_delta=float(getattr(report, "mean_rgb_delta", 0.0) or 0.0),
+    )
+
+
+def evaluate_projection(candidate: Any, scale: float, mode: str = "fast") -> ProjectionStats:
+    if not PROJECTION_AVAILABLE or projection_mod is None:
+        return ProjectionStats(scale=float(scale), valid=False)
+    try:
+        _, report = projection_mod.projection_preview_with_report(
+            candidate.image,
+            cfg=getattr(projection_mod, "PROJECTION_CFG"),
+            user_scale=float(scale),
+            preview_mode=str(mode),
+        )
+        return _extract_projection_stats(report, scale=float(scale))
+    except Exception:
+        return ProjectionStats(scale=float(scale), valid=False)
+
+
+# ============================================================
 # ORCHESTRATEUR HYBRIDE ML + DL
 # ============================================================
 
@@ -748,13 +873,14 @@ class CamouflageMLDLGenerator:
         self.rng = random.Random(config.random_seed)
 
         self.buffer = ExperienceBuffer()
+        input_dim = len(FEATURE_KEYS) + len(PROJECTION_FEATURE_KEYS)
         self.surrogate = DeepSurrogate(
-            input_dim=len(FEATURE_KEYS),
+            input_dim=input_dim,
             hidden_dim=config.hidden_dim,
             lr=config.learning_rate,
             device=self.device,
         )
-        context_dim = len(FEATURE_KEYS) + len(FAILURE_KEYS)
+        context_dim = input_dim + len(FAILURE_KEYS)
         self.bandit = LinUCBBandit(n_actions=len(ACTION_LIBRARY), context_dim=context_dim, alpha=config.alpha_ucb)
 
         self.rows: List[Dict[str, object]] = []
@@ -762,6 +888,7 @@ class CamouflageMLDLGenerator:
         self.training_log: List[Dict[str, Any]] = []
         self.last_rejected_candidate: Optional[Any] = None
         self.last_analysis: Optional[RejectionAnalysis] = None
+        self.last_projection_stats: Optional[ProjectionStats] = None
 
         base_relax = float(getattr(config, "pretrain_relax_level", 0.0) or 0.0)
         self.tolerance_profile = (
@@ -783,13 +910,11 @@ class CamouflageMLDLGenerator:
     def _maybe_load_existing_state(self) -> None:
         checkpoint = self.output_dir / self.cfg.checkpoint_name
         dataset = self.output_dir / self.cfg.dataset_name
-
         try:
             if dataset.exists():
                 self.buffer.load(dataset)
         except Exception:
             pass
-
         try:
             if checkpoint.exists():
                 self.surrogate.load(checkpoint)
@@ -812,6 +937,8 @@ class CamouflageMLDLGenerator:
             "training_log": self.training_log,
             "latest_stats": self._latest_train_stats,
             "latest_error": self._latest_train_error,
+            "projection_available": bool(PROJECTION_AVAILABLE),
+            "projection_ml_enabled": bool(self.cfg.projection_ml_enabled),
         }
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -827,7 +954,7 @@ class CamouflageMLDLGenerator:
         sample_count: int,
     ) -> Dict[str, Any]:
         surrogate = DeepSurrogate(
-            input_dim=len(FEATURE_KEYS),
+            input_dim=len(FEATURE_KEYS) + len(PROJECTION_FEATURE_KEYS),
             hidden_dim=self.cfg.hidden_dim,
             lr=self.cfg.learning_rate,
             device=self.device,
@@ -866,9 +993,7 @@ class CamouflageMLDLGenerator:
     def _schedule_background_train(self, force: bool = False) -> Optional[Future]:
         if not self.cfg.parallel_train_enabled:
             return None
-
         self._poll_background_train()
-
         if self._train_future is not None and not self._train_future.done():
             return self._train_future
 
@@ -904,17 +1029,12 @@ class CamouflageMLDLGenerator:
         fut = self._train_future
         if fut is None or not fut.done():
             return None
-
         self._train_future = None
         try:
             payload = fut.result()
         except Exception as exc:
             self._latest_train_error = str(exc)
-            self.training_log.append({
-                "ts": time.time(),
-                "error": self._latest_train_error,
-                "n_samples": int(self._last_train_request_samples),
-            })
+            self.training_log.append({"ts": time.time(), "error": self._latest_train_error, "n_samples": int(self._last_train_request_samples)})
             self._write_parallel_training_log()
             return None
 
@@ -957,19 +1077,54 @@ class CamouflageMLDLGenerator:
             anti_pixel=self.cfg.anti_pixel,
         )
 
+    def _projection_scales(self) -> Tuple[float, ...]:
+        base = max(0.05, float(self.cfg.projection_base_scale))
+        vals = []
+        for mult in self.cfg.projection_scale_candidates:
+            vals.append(float(np.clip(base * float(mult), 0.05, 2.0)))
+        uniq = []
+        for v in vals:
+            if v not in uniq:
+                uniq.append(v)
+        return tuple(uniq)
+
+    def _choose_projection_for_candidate(self, candidate: Any) -> ProjectionStats:
+        if not (self.cfg.projection_ml_enabled and PROJECTION_AVAILABLE):
+            return ProjectionStats(scale=float(self.cfg.projection_base_scale), valid=False)
+
+        best_stats: Optional[ProjectionStats] = None
+        best_key = (-1e18, -1e18)
+        for scale in self._projection_scales():
+            stats = evaluate_projection(candidate, scale=scale, mode=self.cfg.projection_preview_mode)
+            if self.surrogate.trained:
+                feat = candidate_to_feature_vector(candidate, projection_stats=stats)
+                pred_valid, pred_reward = self.surrogate.predict(feat)
+                key = (float(pred_valid[0]), float(pred_reward[0]))
+            else:
+                key = (1.0 if stats.valid else 0.0, projection_reward(stats))
+            if key > best_key:
+                best_key = key
+                best_stats = stats
+
+        return best_stats or ProjectionStats(scale=float(self.cfg.projection_base_scale), valid=False)
+
     def warmup(self) -> None:
         for i in range(self.cfg.warmup_samples):
             seed = camo.build_seed(0, i + 1, self.cfg.base_seed)
             candidate, outcome = self._generate_and_validate(seed)
-            accepted = bool(getattr(outcome, "accepted", False))
+            projection_stats = self._choose_projection_for_candidate(candidate)
+            backend_ok = bool(getattr(outcome, "accepted", False))
+            accepted = bool(backend_ok and ((projection_stats.valid) if (self.cfg.projection_ml_enabled and PROJECTION_AVAILABLE) else True))
+
             with self._buffer_lock:
-                self.buffer.add(candidate, accepted)
+                self.buffer.add(candidate, accepted, projection_stats, self.cfg.projection_reward_weight)
                 sample_count = len(self.buffer.features)
             self._persist_warmup_if_needed(sample_count)
 
             if not accepted:
                 self.last_rejected_candidate = candidate
                 self.last_analysis = analyze_rejection(candidate, target_index=0, local_attempt=i + 1)
+                self.last_projection_stats = projection_stats
 
         self._save_buffer_now()
 
@@ -991,11 +1146,7 @@ class CamouflageMLDLGenerator:
             min_delta=self.cfg.early_stopping_min_delta,
             random_seed=self.cfg.random_seed,
         )
-        self.training_log.append({
-            "n_samples": int(len(x)),
-            "stats": stats,
-            "ts": time.time(),
-        })
+        self.training_log.append({"n_samples": int(len(x)), "stats": stats, "ts": time.time()})
         self.surrogate.save(self.output_dir / self.cfg.checkpoint_name)
         self._save_buffer_now()
         self._latest_train_stats = dict(stats)
@@ -1008,7 +1159,7 @@ class CamouflageMLDLGenerator:
             self.rng.shuffle(action_indexes)
             return action_indexes[: self.cfg.candidate_pool_size]
 
-        context = build_context_vector(self.last_rejected_candidate, analysis)
+        context = build_context_vector(self.last_rejected_candidate, analysis, projection_stats=self.last_projection_stats)
         ranked = self.bandit.select_top_k(context, k=max(1, self.cfg.candidate_pool_size - 2))
         others = [i for i in range(len(ACTION_LIBRARY)) if i not in ranked]
         self.rng.shuffle(others)
@@ -1024,14 +1175,16 @@ class CamouflageMLDLGenerator:
             base_seed = camo.build_seed(target_index, local_attempt + offset, self.cfg.base_seed)
             seed = propose_seed(base_seed, action)
             candidate = self._generate_candidate(seed)
+            projection_stats = self._choose_projection_for_candidate(candidate)
 
             if self.surrogate.trained:
-                prob_valid, pred_reward = self.surrogate.predict(candidate_to_feature_vector(candidate))
+                feat = candidate_to_feature_vector(candidate, projection_stats=projection_stats)
+                prob_valid, pred_reward = self.surrogate.predict(feat)
                 pred_valid_f = float(prob_valid[0])
                 pred_reward_f = float(pred_reward[0])
             else:
-                pred_valid_f = 0.5
-                pred_reward_f = 0.0
+                pred_valid_f = 0.5 + (0.10 if projection_stats.valid else 0.0)
+                pred_reward_f = combined_reward(candidate, False, projection_stats, self.cfg.projection_reward_weight)
 
             proposals.append(Proposal(
                 seed=int(seed),
@@ -1040,10 +1193,34 @@ class CamouflageMLDLGenerator:
                 candidate=candidate,
                 pred_valid=pred_valid_f,
                 pred_reward=pred_reward_f,
+                projection_scale=float(projection_stats.scale),
+                projection_stats=projection_stats,
             ))
 
         proposals.sort(key=lambda p: (p.pred_valid, p.pred_reward), reverse=True)
         return proposals
+
+    def _final_projection_refine(self, candidate: Any, initial_stats: Optional[ProjectionStats]) -> ProjectionStats:
+        if not (self.cfg.projection_ml_enabled and PROJECTION_AVAILABLE):
+            return initial_stats or ProjectionStats(scale=float(self.cfg.projection_base_scale), valid=False)
+
+        candidate_scales = sorted(set([
+            float(self.cfg.projection_base_scale),
+            float(initial_stats.scale if initial_stats is not None else self.cfg.projection_base_scale),
+            float((initial_stats.scale if initial_stats is not None else self.cfg.projection_base_scale) * 0.94),
+            float((initial_stats.scale if initial_stats is not None else self.cfg.projection_base_scale) * 1.06),
+        ]))
+
+        best_stats: Optional[ProjectionStats] = None
+        best_key = (-1e18, -1e18)
+        for scale in candidate_scales:
+            stats = evaluate_projection(candidate, scale=scale, mode=self.cfg.projection_final_mode)
+            score = projection_reward(stats)
+            key = (1.0 if stats.valid else 0.0, score)
+            if key > best_key:
+                best_key = key
+                best_stats = stats
+        return best_stats or ProjectionStats(scale=float(self.cfg.projection_base_scale), valid=False)
 
     def _validate_top_candidates(self, proposals: Sequence[Proposal], target_index: int, local_attempt: int) -> Tuple[Optional[Proposal], Optional[RejectionAnalysis]]:
         accepted: Optional[Proposal] = None
@@ -1053,6 +1230,12 @@ class CamouflageMLDLGenerator:
         for rank, proposal in enumerate(proposals[: self.cfg.validate_top_k], start=1):
             self.total_attempts += 1
             final_candidate, final_outcome = self._generate_and_validate(proposal.seed)
+            projection_stats = self._final_projection_refine(final_candidate, proposal.projection_stats)
+
+            backend_ok = bool(getattr(final_outcome, "accepted", False))
+            projection_ok = bool(projection_stats.valid) if (self.cfg.projection_ml_enabled and PROJECTION_AVAILABLE) else True
+            real_ok = bool(backend_ok and projection_ok)
+
             proposal = Proposal(
                 seed=proposal.seed,
                 action_idx=proposal.action_idx,
@@ -1060,35 +1243,32 @@ class CamouflageMLDLGenerator:
                 candidate=final_candidate,
                 pred_valid=proposal.pred_valid,
                 pred_reward=proposal.pred_reward,
+                projection_scale=float(projection_stats.scale),
+                projection_stats=projection_stats,
             )
 
-            real_ok = bool(getattr(final_outcome, "accepted", False))
             with self._buffer_lock:
-                reward = self.buffer.add(proposal.candidate, real_ok)
+                reward = self.buffer.add(proposal.candidate, real_ok, projection_stats, self.cfg.projection_reward_weight)
             self._save_buffer_now()
-
             self._schedule_background_train(force=False)
             self._poll_background_train()
 
             if real_ok:
                 accepted = proposal
-                context = build_context_vector(proposal.candidate, None)
+                context = build_context_vector(proposal.candidate, None, projection_stats=projection_stats)
                 self.bandit.update(proposal.action_idx, context, reward)
                 break
 
-            analysis = analyze_rejection(
-                proposal.candidate,
-                target_index=target_index,
-                local_attempt=local_attempt + rank - 1,
-            )
+            analysis = analyze_rejection(proposal.candidate, target_index=target_index, local_attempt=local_attempt + rank - 1)
             if reward > best_reward:
                 best_reward = reward
                 best_analysis = analysis
 
-            context = build_context_vector(proposal.candidate, analysis)
+            context = build_context_vector(proposal.candidate, analysis, projection_stats=projection_stats)
             self.bandit.update(proposal.action_idx, context, reward)
             self.last_rejected_candidate = proposal.candidate
             self.last_analysis = analysis
+            self.last_projection_stats = projection_stats
 
         return accepted, best_analysis
 
@@ -1101,6 +1281,7 @@ class CamouflageMLDLGenerator:
             if self.last_rejected_candidate is None:
                 self.last_rejected_candidate = self._generate_candidate(self.cfg.base_seed)
                 self.last_analysis = None
+                self.last_projection_stats = self._choose_projection_for_candidate(self.last_rejected_candidate)
 
             for target_index in range(1, self.cfg.target_count + 1):
                 local_attempt = 1
@@ -1109,31 +1290,38 @@ class CamouflageMLDLGenerator:
 
                 while local_attempt <= self.cfg.max_attempts_per_target:
                     self._poll_background_train()
-                    proposals = self._propose_candidates(
-                        target_index=target_index,
-                        local_attempt=local_attempt,
-                        analysis=current_analysis,
-                    )
-                    accepted_proposal, best_analysis = self._validate_top_candidates(
-                        proposals,
-                        target_index=target_index,
-                        local_attempt=local_attempt,
-                    )
+                    proposals = self._propose_candidates(target_index=target_index, local_attempt=local_attempt, analysis=current_analysis)
+                    accepted_proposal, best_analysis = self._validate_top_candidates(proposals, target_index=target_index, local_attempt=local_attempt)
                     current_analysis = best_analysis
 
                     if accepted_proposal is not None:
                         filename = self.output_dir / f"camouflage_{target_index:03d}.png"
                         saved_path = camo.save_candidate_image(accepted_proposal.candidate, filename)
-                        self.rows.append(camo.candidate_row(
+                        backend_outcome = camo.validate_with_reasons(accepted_proposal.candidate, tolerance_profile=self.tolerance_profile)
+                        row = camo.candidate_row(
                             target_index,
                             local_attempt,
                             self.total_attempts,
                             accepted_proposal.candidate,
-                            accepted_proposal.candidate and camo.validate_with_reasons(accepted_proposal.candidate, tolerance_profile=self.tolerance_profile),
+                            backend_outcome,
                             image_name=saved_path.name,
                             image_path=str(saved_path),
                             tolerance_profile=self.tolerance_profile,
-                        ))
+                        )
+                        row["projection_ml_enabled"] = int(bool(self.cfg.projection_ml_enabled and PROJECTION_AVAILABLE))
+                        row["projection_scale"] = float(accepted_proposal.projection_scale)
+                        if accepted_proposal.projection_stats is not None:
+                            row["projection_valid"] = int(bool(accepted_proposal.projection_stats.valid))
+                            row["projection_uniform_pixels"] = int(accepted_proposal.projection_stats.uniform_pixels)
+                            row["projection_residual_pixels"] = int(accepted_proposal.projection_stats.residual_pixels)
+                            row["projection_still_green_pixels"] = int(accepted_proposal.projection_stats.still_green_pixels)
+                            row["projection_residual_ratio"] = float(accepted_proposal.projection_stats.residual_ratio)
+                            row["projection_mean_lab_distance"] = float(accepted_proposal.projection_stats.mean_lab_distance)
+                            row["projection_mean_rgb_delta"] = float(accepted_proposal.projection_stats.mean_rgb_delta)
+                        row["mldl_action_name"] = accepted_proposal.action_name
+                        row["mldl_pred_valid"] = float(accepted_proposal.pred_valid)
+                        row["mldl_pred_reward"] = float(accepted_proposal.pred_reward)
+                        self.rows.append(row)
                         break
 
                     local_attempt += max(1, self.cfg.candidate_pool_size)
@@ -1156,6 +1344,8 @@ class CamouflageMLDLGenerator:
             "config": asdict(self.cfg),
             "device": self.device,
             "torch_available": TORCH_AVAILABLE,
+            "projection_available": bool(PROJECTION_AVAILABLE),
+            "projection_ml_enabled": bool(self.cfg.projection_ml_enabled),
             "total_rows": len(self.rows),
             "total_attempts": self.total_attempts,
             "training_log": self.training_log,
@@ -1167,10 +1357,7 @@ class CamouflageMLDLGenerator:
             "dataset": str((self.output_dir / self.cfg.dataset_name).resolve()),
             "actions": [name for name, _ in ACTION_LIBRARY],
         }
-        (self.output_dir / "run_summary_ml_dl.json").write_text(
-            json.dumps(summary, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        (self.output_dir / "run_summary_ml_dl.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 # ============================================================
@@ -1206,7 +1393,21 @@ def parse_args() -> MLDLConfig:
     parser.add_argument("--max-repair-rounds", type=int, default=getattr(camo, "MAX_REPAIR_ROUNDS", 3))
     parser.add_argument("--disable-anti-pixel", action="store_true")
 
+    parser.add_argument("--projection-ml", dest="projection_ml_enabled", action="store_true")
+    parser.add_argument("--no-projection-ml", dest="projection_ml_enabled", action="store_false")
+    parser.set_defaults(projection_ml_enabled=True)
+    parser.add_argument("--projection-base-scale", type=float, default=1.0)
+    parser.add_argument("--projection-scales", type=str, default="0.82,0.92,1.00,1.08,1.18")
+    parser.add_argument("--projection-preview-mode", type=str, default="fast")
+    parser.add_argument("--projection-final-mode", type=str, default="quality")
+    parser.add_argument("--projection-reward-weight", type=float, default=0.65)
+
     args = parser.parse_args()
+    try:
+        proj_scales = tuple(float(x.strip()) for x in str(args.projection_scales).split(",") if x.strip())
+    except Exception:
+        proj_scales = (0.82, 0.92, 1.00, 1.08, 1.18)
+
     return MLDLConfig(
         target_count=args.target_count,
         warmup_samples=args.warmup_samples,
@@ -1232,10 +1433,22 @@ def parse_args() -> MLDLConfig:
         pretrain_relax_level=float(args.pretrain_relax_level),
         max_repair_rounds=int(args.max_repair_rounds),
         anti_pixel=not bool(args.disable_anti_pixel),
+        projection_ml_enabled=bool(args.projection_ml_enabled),
+        projection_base_scale=float(args.projection_base_scale),
+        projection_scale_candidates=tuple(proj_scales),
+        projection_preview_mode=str(args.projection_preview_mode),
+        projection_final_mode=str(args.projection_final_mode),
+        projection_reward_weight=float(args.projection_reward_weight),
     )
 
 
 def build_config_from_main_args(args: Any) -> MLDLConfig:
+    projection_scales = getattr(args, "mldl_projection_scales", (0.82, 0.92, 1.00, 1.08, 1.18))
+    if isinstance(projection_scales, str):
+        try:
+            projection_scales = tuple(float(x.strip()) for x in projection_scales.split(",") if x.strip())
+        except Exception:
+            projection_scales = (0.82, 0.92, 1.00, 1.08, 1.18)
     return MLDLConfig(
         target_count=int(getattr(args, "target_count", 20)),
         warmup_samples=int(getattr(args, "mldl_warmup_samples", 128)),
@@ -1261,6 +1474,12 @@ def build_config_from_main_args(args: Any) -> MLDLConfig:
         pretrain_relax_level=float(getattr(args, "mldl_pretrain_relax_level", 0.0)),
         max_repair_rounds=int(getattr(args, "mldl_max_repair_rounds", getattr(camo, "MAX_REPAIR_ROUNDS", 3))),
         anti_pixel=bool(getattr(args, "mldl_anti_pixel", getattr(camo, "DEFAULT_ENABLE_ANTI_PIXEL", True))),
+        projection_ml_enabled=bool(getattr(args, "mldl_projection_ml_enabled", True)),
+        projection_base_scale=float(getattr(args, "mldl_projection_base_scale", 1.0)),
+        projection_scale_candidates=tuple(float(x) for x in projection_scales),
+        projection_preview_mode=str(getattr(args, "mldl_projection_preview_mode", "fast")),
+        projection_final_mode=str(getattr(args, "mldl_projection_final_mode", "quality")),
+        projection_reward_weight=float(getattr(args, "mldl_projection_reward_weight", 0.65)),
     )
 
 
@@ -1296,6 +1515,7 @@ def main() -> None:
     print("Terminé.")
     print(f"Camouflages validés : {len(rows)}/{cfg.target_count}")
     print(f"Tentatives totales : {int(summary.get('total_attempts', 0))}")
+    print(f"Projection ML dispo : {bool(summary.get('projection_available', False))}")
     print(f"Dossier : {Path(cfg.output_dir).resolve()}")
     print(f"Rapport : {(Path(cfg.output_dir) / cfg.report_name).resolve()}")
 
