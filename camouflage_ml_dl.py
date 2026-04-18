@@ -4,10 +4,6 @@ camouflage_ml_dl.py
 
 Pipeline hybride ML + DL compatible avec le main.py réel.
 
-Ce script ne suppose plus l'existence d'API absentes dans main.py
-(comme correction_state, deep_rejection_analysis, RejectionAnalysis,
-_guided_state_init, _merge_guided_generation_state, etc.).
-
 Approche :
 1) Warmup : génération de candidats par seed, extraction des features réelles,
    validation et constitution du dataset supervisé.
@@ -39,6 +35,7 @@ try:
     import torch
     from torch import nn
     from torch.utils.data import DataLoader, TensorDataset, random_split
+
     TORCH_AVAILABLE = True
 except Exception as exc:  # pragma: no cover
     torch = None
@@ -50,6 +47,7 @@ except Exception as exc:  # pragma: no cover
     TORCH_IMPORT_ERROR = exc
 else:
     TORCH_IMPORT_ERROR = None
+
 
 def _resolve_camo_module():
     """
@@ -117,7 +115,6 @@ FAILURE_KEYS: tuple[str, ...] = (
     "orphan_ratio_high",
 )
 
-# Chaque action représente une politique déterministe de dérivation de seed.
 ACTION_LIBRARY: tuple[Tuple[str, Dict[str, Any]], ...] = (
     ("linear_step_1", {"mode": "linear", "offset": 0, "step": 1}),
     ("linear_step_2", {"mode": "linear", "offset": 17, "step": 2}),
@@ -158,8 +155,8 @@ class MLDLConfig:
     random_seed: int = 12345
     parallel_train_enabled: bool = True
     parallel_train_min_interval_s: float = 3.0
-    # Champs de compatibilité : ignorés si non utilisés par cette version,
-    # mais permettent d'accepter les start.py plus récents sans crash.
+
+    # Compatibilité avec des frontends plus récents.
     pretrain_relax_level: float = 0.0
     pretrain_max_orphan_ratio: Optional[float] = None
     pretrain_max_micro_islands_per_mp: Optional[float] = None
@@ -167,6 +164,10 @@ class MLDLConfig:
     tolerance_state_name: str = "adaptive_tolerance_state.json"
     bootstrap_first_candidate: bool = True
     bootstrap_image_name: str = "bootstrap_reference.png"
+
+    # Alignement avec main.py réel
+    max_repair_rounds: int = getattr(camo, "MAX_REPAIR_ROUNDS", 3)
+    anti_pixel: bool = bool(getattr(camo, "DEFAULT_ENABLE_ANTI_PIXEL", True))
 
 
 @dataclass
@@ -185,7 +186,7 @@ class Proposal:
     seed: int
     action_idx: int
     action_name: str
-    candidate: camo.CandidateResult
+    candidate: Any
     pred_valid: float
     pred_reward: float
 
@@ -193,7 +194,6 @@ class Proposal:
 # ============================================================
 # OUTILS FEATURES / REWARD
 # ============================================================
-
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
@@ -205,7 +205,7 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
     return out
 
 
-def candidate_to_feature_dict(candidate: camo.CandidateResult) -> Dict[str, float]:
+def candidate_to_feature_dict(candidate: Any) -> Dict[str, float]:
     rs = np.asarray(candidate.ratios, dtype=float)
     abs_err = np.abs(rs - camo.TARGET)
     m = dict(candidate.metrics)
@@ -239,19 +239,21 @@ def candidate_to_feature_dict(candidate: camo.CandidateResult) -> Dict[str, floa
     }
 
 
-def candidate_to_feature_vector(candidate: camo.CandidateResult) -> np.ndarray:
+def candidate_to_feature_vector(candidate: Any) -> np.ndarray:
     feat = candidate_to_feature_dict(candidate)
     return np.array([feat.get(name, 0.0) for name in FEATURE_KEYS], dtype=np.float32)
 
 
-def analyze_rejection(candidate: camo.CandidateResult, target_index: int, local_attempt: int) -> RejectionAnalysis:
+def analyze_rejection(candidate: Any, target_index: int, local_attempt: int) -> RejectionAnalysis:
     feat = candidate_to_feature_dict(candidate)
     failures: List[str] = []
     notes: List[str] = []
 
-    for name in ("abs_err_coyote", "abs_err_olive", "abs_err_terre", "abs_err_gris"):
-        if feat[name] > float(camo.MAX_ABS_ERROR_PER_COLOR[["abs_err_coyote", "abs_err_olive", "abs_err_terre", "abs_err_gris"].index(name)]):
+    per_color_names = ("abs_err_coyote", "abs_err_olive", "abs_err_terre", "abs_err_gris")
+    for idx, name in enumerate(per_color_names):
+        if feat[name] > float(camo.MAX_ABS_ERROR_PER_COLOR[idx]):
             failures.append(name)
+
     if feat["mean_abs_error"] > float(camo.MAX_MEAN_ABS_ERROR):
         failures.append("mean_abs_error")
 
@@ -315,19 +317,18 @@ def analysis_to_failure_vector(analysis: Optional[RejectionAnalysis]) -> np.ndar
     return np.array([1.0 if name in names else 0.0 for name in FAILURE_KEYS], dtype=np.float32)
 
 
-def build_context_vector(candidate: camo.CandidateResult, analysis: Optional[RejectionAnalysis]) -> np.ndarray:
+def build_context_vector(candidate: Any, analysis: Optional[RejectionAnalysis]) -> np.ndarray:
     feat = candidate_to_feature_vector(candidate)
     fail = analysis_to_failure_vector(analysis)
     return np.concatenate([feat, fail], axis=0)
 
 
-def candidate_reward(candidate: camo.CandidateResult, accepted: bool) -> float:
+def candidate_reward(candidate: Any, accepted: bool) -> float:
     feat = candidate_to_feature_dict(candidate)
     score = 0.0
     score += 2.0 if accepted else 0.0
     score -= 140.0 * feat["mean_abs_error"]
 
-    # Bonus si les métriques sont proches du centre de leur intervalle valide.
     def interval_score(value: float, low: float, high: float) -> float:
         if high <= low:
             return 0.0
@@ -355,7 +356,6 @@ def candidate_reward(candidate: camo.CandidateResult, accepted: bool) -> float:
 # ============================================================
 # NORMALISATION
 # ============================================================
-
 
 class Standardizer:
     def __init__(self, dim: int) -> None:
@@ -393,7 +393,6 @@ class Standardizer:
 # ============================================================
 # DEEP LEARNING : SURROGATE
 # ============================================================
-
 
 if TORCH_AVAILABLE:
     class SurrogateNet(nn.Module):
@@ -433,10 +432,9 @@ class DeepSurrogate:
         self.reward_mean = 0.0
         self.reward_std = 1.0
         self.trained = False
-        self.torch_enabled = True
         self.device = device if device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
-
         self._torch_device = torch.device(self.device)
+
         self.model = SurrogateNet(input_dim=input_dim, hidden_dim=hidden_dim).to(self._torch_device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-4)
         self.loss_bce = nn.BCEWithLogitsLoss()
@@ -609,27 +607,27 @@ class DeepSurrogate:
             logit_valid, pred_reward = self.model(xt)
             prob_valid = torch.sigmoid(logit_valid).cpu().numpy()
             reward = pred_reward.cpu().numpy() * self.reward_std + self.reward_mean
+
         if one:
             return prob_valid[0:1], reward[0:1]
         return prob_valid, reward
 
     def save(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "scaler": self.scaler.state_dict(),
             "reward_mean": self.reward_mean,
             "reward_std": self.reward_std,
             "trained": self.trained,
-            "torch_enabled": self.torch_enabled,
+            "model": self.model.state_dict(),
         }
-        if self.torch_enabled and self.model is not None:
-            payload["model"] = self.model.state_dict()
         torch.save(payload, path)
 
     def load(self, path: Path) -> None:
         if not path.exists():
             return
         payload = torch.load(path, map_location=self._torch_device)
-        if "model" in payload and self.model is not None:
+        if "model" in payload:
             self.model.load_state_dict(payload["model"])
         self.scaler.load_state_dict(payload["scaler"])
         self.reward_mean = float(payload.get("reward_mean", 0.0))
@@ -640,7 +638,6 @@ class DeepSurrogate:
 # ============================================================
 # MACHINE LEARNING : BANDIT CONTEXTUEL
 # ============================================================
-
 
 class LinUCBBandit:
     def __init__(self, n_actions: int, context_dim: int, alpha: float = 1.25) -> None:
@@ -681,14 +678,13 @@ class LinUCBBandit:
 # DATASET / BUFFERS
 # ============================================================
 
-
 class ExperienceBuffer:
     def __init__(self) -> None:
         self.features: List[np.ndarray] = []
         self.valid: List[float] = []
         self.rewards: List[float] = []
 
-    def add(self, candidate: camo.CandidateResult, accepted: bool) -> float:
+    def add(self, candidate: Any, accepted: bool) -> float:
         feat = candidate_to_feature_vector(candidate)
         reward = candidate_reward(candidate, accepted)
         self.features.append(feat)
@@ -703,14 +699,25 @@ class ExperienceBuffer:
         return x, y_valid, y_reward
 
     def save(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
         x, y_valid, y_reward = self.as_arrays()
         np.savez_compressed(path, x=x, y_valid=y_valid, y_reward=y_reward)
+
+    def load(self, path: Path) -> None:
+        if not path.exists():
+            return
+        data = np.load(path, allow_pickle=False)
+        x = np.asarray(data["x"], dtype=np.float32)
+        y_valid = np.asarray(data["y_valid"], dtype=np.float32)
+        y_reward = np.asarray(data["y_reward"], dtype=np.float32)
+        self.features = [row.astype(np.float32, copy=True) for row in x]
+        self.valid = [float(v) for v in y_valid.tolist()]
+        self.rewards = [float(v) for v in y_reward.tolist()]
 
 
 # ============================================================
 # POLITIQUES DE SEED
 # ============================================================
-
 
 def propose_seed(base_seed: int, action: Dict[str, Any]) -> int:
     mode = str(action.get("mode", "linear"))
@@ -724,8 +731,6 @@ def propose_seed(base_seed: int, action: Dict[str, Any]) -> int:
         seed = seed * int(action.get("mul", 1)) + int(action.get("add", 0))
     elif mode == "xor":
         seed = seed ^ int(action.get("mask", 0))
-    else:
-        seed = seed
 
     return int(seed & 0x7FFF_FFFF_FFFF_FFFF)
 
@@ -734,7 +739,6 @@ def propose_seed(base_seed: int, action: Dict[str, Any]) -> int:
 # ORCHESTRATEUR HYBRIDE ML + DL
 # ============================================================
 
-
 class CamouflageMLDLGenerator:
     def __init__(self, config: MLDLConfig) -> None:
         self.cfg = config
@@ -742,6 +746,7 @@ class CamouflageMLDLGenerator:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.device = self._resolve_device(config.device)
         self.rng = random.Random(config.random_seed)
+
         self.buffer = ExperienceBuffer()
         self.surrogate = DeepSurrogate(
             input_dim=len(FEATURE_KEYS),
@@ -751,18 +756,19 @@ class CamouflageMLDLGenerator:
         )
         context_dim = len(FEATURE_KEYS) + len(FAILURE_KEYS)
         self.bandit = LinUCBBandit(n_actions=len(ACTION_LIBRARY), context_dim=context_dim, alpha=config.alpha_ucb)
+
         self.rows: List[Dict[str, object]] = []
         self.total_attempts = 0
         self.training_log: List[Dict[str, Any]] = []
-        self.last_rejected_candidate: Optional[camo.CandidateResult] = None
+        self.last_rejected_candidate: Optional[Any] = None
         self.last_analysis: Optional[RejectionAnalysis] = None
+
         base_relax = float(getattr(config, "pretrain_relax_level", 0.0) or 0.0)
         self.tolerance_profile = (
             camo.build_validation_tolerance_profile(base_relax)
             if hasattr(camo, "build_validation_tolerance_profile")
             else None
         )
-        self.bootstrap_candidate_info: Optional[Dict[str, Any]] = None
 
         self._buffer_lock = threading.RLock()
         self._trainer_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="camo-mldl-trainer")
@@ -778,24 +784,17 @@ class CamouflageMLDLGenerator:
         checkpoint = self.output_dir / self.cfg.checkpoint_name
         dataset = self.output_dir / self.cfg.dataset_name
 
-        if dataset.exists():
-            try:
-                data = np.load(dataset)
-                x = np.asarray(data["x"], dtype=np.float32)
-                y_valid = np.asarray(data["y_valid"], dtype=np.float32)
-                y_reward = np.asarray(data["y_reward"], dtype=np.float32)
-                if len(x):
-                    self.buffer.features = [row.astype(np.float32) for row in x]
-                    self.buffer.valid = [float(v) for v in y_valid.tolist()]
-                    self.buffer.rewards = [float(v) for v in y_reward.tolist()]
-            except Exception:
-                pass
+        try:
+            if dataset.exists():
+                self.buffer.load(dataset)
+        except Exception:
+            pass
 
-        if checkpoint.exists():
-            try:
+        try:
+            if checkpoint.exists():
                 self.surrogate.load(checkpoint)
-            except Exception:
-                pass
+        except Exception:
+            pass
 
     @staticmethod
     def _resolve_device(device: str) -> str:
@@ -815,6 +814,10 @@ class CamouflageMLDLGenerator:
             "latest_error": self._latest_train_error,
         }
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _save_buffer_now(self) -> None:
+        with self._buffer_lock:
+            self.buffer.save(self.output_dir / self.cfg.dataset_name)
 
     def _train_snapshot_worker(
         self,
@@ -840,14 +843,18 @@ class CamouflageMLDLGenerator:
             min_delta=self.cfg.early_stopping_min_delta,
             random_seed=self.cfg.random_seed,
         )
+
         checkpoint_tmp = self.output_dir / f"{self.cfg.checkpoint_name}.tmp"
         dataset_tmp = self.output_dir / f"{self.cfg.dataset_name}.tmp.npz"
-        surrogate.save(checkpoint_tmp)
-        np.savez_compressed(dataset_tmp, x=x, y_valid=y_valid, y_reward=y_reward)
         checkpoint_final = self.output_dir / self.cfg.checkpoint_name
         dataset_final = self.output_dir / self.cfg.dataset_name
+
+        surrogate.save(checkpoint_tmp)
+        np.savez_compressed(dataset_tmp, x=x, y_valid=y_valid, y_reward=y_reward)
+
         checkpoint_tmp.replace(checkpoint_final)
         dataset_tmp.replace(dataset_final)
+
         return {
             "n_samples": int(sample_count),
             "stats": stats,
@@ -859,7 +866,9 @@ class CamouflageMLDLGenerator:
     def _schedule_background_train(self, force: bool = False) -> Optional[Future]:
         if not self.cfg.parallel_train_enabled:
             return None
+
         self._poll_background_train()
+
         if self._train_future is not None and not self._train_future.done():
             return self._train_future
 
@@ -895,6 +904,7 @@ class CamouflageMLDLGenerator:
         fut = self._train_future
         if fut is None or not fut.done():
             return None
+
         self._train_future = None
         try:
             payload = fut.result()
@@ -925,16 +935,43 @@ class CamouflageMLDLGenerator:
         self.training_log.append(payload)
         self._write_parallel_training_log()
 
+    def _shutdown_trainer_pool(self) -> None:
+        try:
+            self._trainer_pool.shutdown(wait=True, cancel_futures=False)
+        except Exception:
+            pass
+
+    def _persist_warmup_if_needed(self, sample_count: int) -> None:
+        every = max(1, int(self.cfg.warmup_persist_every))
+        if sample_count > 0 and (sample_count % every == 0):
+            self._save_buffer_now()
+
+    def _generate_candidate(self, seed: int) -> Any:
+        return camo.generate_candidate_from_seed(seed, anti_pixel=self.cfg.anti_pixel)
+
+    def _generate_and_validate(self, seed: int) -> Tuple[Any, Any]:
+        return camo.generate_and_validate_from_seed(
+            seed,
+            max_repair_rounds=self.cfg.max_repair_rounds,
+            tolerance_profile=self.tolerance_profile,
+            anti_pixel=self.cfg.anti_pixel,
+        )
+
     def warmup(self) -> None:
         for i in range(self.cfg.warmup_samples):
             seed = camo.build_seed(0, i + 1, self.cfg.base_seed)
-            candidate, outcome = camo.generate_and_validate_from_seed(seed)
-            accepted = bool(outcome.accepted)
+            candidate, outcome = self._generate_and_validate(seed)
+            accepted = bool(getattr(outcome, "accepted", False))
             with self._buffer_lock:
                 self.buffer.add(candidate, accepted)
+                sample_count = len(self.buffer.features)
+            self._persist_warmup_if_needed(sample_count)
+
             if not accepted:
                 self.last_rejected_candidate = candidate
                 self.last_analysis = analyze_rejection(candidate, target_index=0, local_attempt=i + 1)
+
+        self._save_buffer_now()
 
     def maybe_train(self, force: bool = False) -> Optional[Dict[str, float]]:
         x, y_valid, y_reward = self._buffer_arrays_copy()
@@ -942,6 +979,7 @@ class CamouflageMLDLGenerator:
             return None
         if not force and (len(x) % self.cfg.retrain_every != 0):
             return None
+
         stats = self.surrogate.fit(
             x,
             y_valid,
@@ -959,8 +997,7 @@ class CamouflageMLDLGenerator:
             "ts": time.time(),
         })
         self.surrogate.save(self.output_dir / self.cfg.checkpoint_name)
-        with self._buffer_lock:
-            self.buffer.save(self.output_dir / self.cfg.dataset_name)
+        self._save_buffer_now()
         self._latest_train_stats = dict(stats)
         self._write_parallel_training_log()
         return stats
@@ -970,6 +1007,7 @@ class CamouflageMLDLGenerator:
             action_indexes = list(range(len(ACTION_LIBRARY)))
             self.rng.shuffle(action_indexes)
             return action_indexes[: self.cfg.candidate_pool_size]
+
         context = build_context_vector(self.last_rejected_candidate, analysis)
         ranked = self.bandit.select_top_k(context, k=max(1, self.cfg.candidate_pool_size - 2))
         others = [i for i in range(len(ACTION_LIBRARY)) if i not in ranked]
@@ -980,11 +1018,13 @@ class CamouflageMLDLGenerator:
         self._poll_background_train()
         proposals: List[Proposal] = []
         action_indexes = self._select_action_indexes(analysis)
+
         for offset, action_idx in enumerate(action_indexes, start=0):
             action_name, action = ACTION_LIBRARY[action_idx]
             base_seed = camo.build_seed(target_index, local_attempt + offset, self.cfg.base_seed)
             seed = propose_seed(base_seed, action)
-            candidate = camo.generate_candidate_from_seed(seed)
+            candidate = self._generate_candidate(seed)
+
             if self.surrogate.trained:
                 prob_valid, pred_reward = self.surrogate.predict(candidate_to_feature_vector(candidate))
                 pred_valid_f = float(prob_valid[0])
@@ -992,14 +1032,16 @@ class CamouflageMLDLGenerator:
             else:
                 pred_valid_f = 0.5
                 pred_reward_f = 0.0
+
             proposals.append(Proposal(
-                seed=seed,
-                action_idx=action_idx,
-                action_name=action_name,
+                seed=int(seed),
+                action_idx=int(action_idx),
+                action_name=str(action_name),
                 candidate=candidate,
                 pred_valid=pred_valid_f,
                 pred_reward=pred_reward_f,
             ))
+
         proposals.sort(key=lambda p: (p.pred_valid, p.pred_reward), reverse=True)
         return proposals
 
@@ -1010,7 +1052,7 @@ class CamouflageMLDLGenerator:
 
         for rank, proposal in enumerate(proposals[: self.cfg.validate_top_k], start=1):
             self.total_attempts += 1
-            final_candidate, final_outcome = camo.generate_and_validate_from_seed(proposal.seed)
+            final_candidate, final_outcome = self._generate_and_validate(proposal.seed)
             proposal = Proposal(
                 seed=proposal.seed,
                 action_idx=proposal.action_idx,
@@ -1019,9 +1061,12 @@ class CamouflageMLDLGenerator:
                 pred_valid=proposal.pred_valid,
                 pred_reward=proposal.pred_reward,
             )
-            real_ok = bool(final_outcome.accepted)
+
+            real_ok = bool(getattr(final_outcome, "accepted", False))
             with self._buffer_lock:
                 reward = self.buffer.add(proposal.candidate, real_ok)
+            self._save_buffer_now()
+
             self._schedule_background_train(force=False)
             self._poll_background_train()
 
@@ -1039,6 +1084,7 @@ class CamouflageMLDLGenerator:
             if reward > best_reward:
                 best_reward = reward
                 best_analysis = analysis
+
             context = build_context_vector(proposal.candidate, analysis)
             self.bandit.update(proposal.action_idx, context, reward)
             self.last_rejected_candidate = proposal.candidate
@@ -1047,61 +1093,63 @@ class CamouflageMLDLGenerator:
         return accepted, best_analysis
 
     def generate(self) -> List[Dict[str, object]]:
-        self.warmup()
-        # Bootstrap synchrone pour obtenir un premier modèle utile,
-        # puis entraînement continu en arrière-plan pendant la génération.
-        self.maybe_train(force=True)
-        self._schedule_background_train(force=True)
+        try:
+            self.warmup()
+            self.maybe_train(force=True)
+            self._schedule_background_train(force=True)
 
-        if self.last_rejected_candidate is None:
-            self.last_rejected_candidate = camo.generate_candidate_from_seed(self.cfg.base_seed)
-            self.last_analysis = None
+            if self.last_rejected_candidate is None:
+                self.last_rejected_candidate = self._generate_candidate(self.cfg.base_seed)
+                self.last_analysis = None
 
-        for target_index in range(1, self.cfg.target_count + 1):
-            local_attempt = 1
-            accepted_proposal: Optional[Proposal] = None
-            current_analysis = self.last_analysis
+            for target_index in range(1, self.cfg.target_count + 1):
+                local_attempt = 1
+                accepted_proposal: Optional[Proposal] = None
+                current_analysis = self.last_analysis
 
-            while local_attempt <= self.cfg.max_attempts_per_target:
-                self._poll_background_train()
-                proposals = self._propose_candidates(
-                    target_index=target_index,
-                    local_attempt=local_attempt,
-                    analysis=current_analysis,
-                )
-                accepted_proposal, best_analysis = self._validate_top_candidates(
-                    proposals,
-                    target_index=target_index,
-                    local_attempt=local_attempt,
-                )
-                current_analysis = best_analysis
+                while local_attempt <= self.cfg.max_attempts_per_target:
+                    self._poll_background_train()
+                    proposals = self._propose_candidates(
+                        target_index=target_index,
+                        local_attempt=local_attempt,
+                        analysis=current_analysis,
+                    )
+                    accepted_proposal, best_analysis = self._validate_top_candidates(
+                        proposals,
+                        target_index=target_index,
+                        local_attempt=local_attempt,
+                    )
+                    current_analysis = best_analysis
 
-                if accepted_proposal is not None:
-                    filename = self.output_dir / f"camouflage_{target_index:03d}.png"
-                    saved_path = camo.save_candidate_image(accepted_proposal.candidate, filename)
-                    self.rows.append(camo.candidate_row(
-                        target_index,
-                        local_attempt,
-                        self.total_attempts,
-                        accepted_proposal.candidate,
-                        image_name=saved_path.name,
-                        image_path=str(saved_path),
-                    ))
-                    break
+                    if accepted_proposal is not None:
+                        filename = self.output_dir / f"camouflage_{target_index:03d}.png"
+                        saved_path = camo.save_candidate_image(accepted_proposal.candidate, filename)
+                        self.rows.append(camo.candidate_row(
+                            target_index,
+                            local_attempt,
+                            self.total_attempts,
+                            accepted_proposal.candidate,
+                            accepted_proposal.candidate and camo.validate_with_reasons(accepted_proposal.candidate, tolerance_profile=self.tolerance_profile),
+                            image_name=saved_path.name,
+                            image_path=str(saved_path),
+                            tolerance_profile=self.tolerance_profile,
+                        ))
+                        break
 
-                local_attempt += max(1, self.cfg.candidate_pool_size)
+                    local_attempt += max(1, self.cfg.candidate_pool_size)
 
-            if accepted_proposal is None:
-                raise RuntimeError(
-                    f"Impossible d'obtenir un camouflage valide pour target_index={target_index} "
-                    f"dans la limite de {self.cfg.max_attempts_per_target} tentatives locales."
-                )
+                if accepted_proposal is None:
+                    raise RuntimeError(
+                        f"Impossible d'obtenir un camouflage valide pour target_index={target_index} "
+                        f"dans la limite de {self.cfg.max_attempts_per_target} tentatives locales."
+                    )
 
-        self._flush_background_train()
-        camo.write_report(self.rows, self.output_dir, filename=self.cfg.report_name)
-        self._write_summary()
-        self._trainer_pool.shutdown(wait=False, cancel_futures=False)
-        return self.rows
+            self._flush_background_train()
+            camo.write_report(self.rows, self.output_dir, filename=self.cfg.report_name)
+            self._write_summary()
+            return self.rows
+        finally:
+            self._shutdown_trainer_pool()
 
     def _write_summary(self) -> None:
         summary = {
@@ -1129,7 +1177,6 @@ class CamouflageMLDLGenerator:
 # CLI
 # ============================================================
 
-
 def parse_args() -> MLDLConfig:
     parser = argparse.ArgumentParser(description="Générateur de camouflage guidé par ML + DL")
     parser.add_argument("--target-count", type=int, default=20)
@@ -1145,14 +1192,20 @@ def parse_args() -> MLDLConfig:
     parser.add_argument("--base-seed", type=int, default=camo.DEFAULT_BASE_SEED)
     parser.add_argument("--output-dir", type=str, default="camouflages_ml_dl")
     parser.add_argument("--alpha-ucb", type=float, default=1.25)
-    parser.add_argument("--min-train-size", type=int, default=32)
-    parser.add_argument("--retrain-every", type=int, default=24)
+    parser.add_argument("--min-train-size", type=int, default=12)
+    parser.add_argument("--retrain-every", type=int, default=8)
     parser.add_argument("--val-split", type=float, default=0.15)
     parser.add_argument("--early-stopping-patience", type=int, default=6)
     parser.add_argument("--early-stopping-min-delta", type=float, default=1e-4)
     parser.add_argument("--random-seed", type=int, default=12345)
-    parser.add_argument("--parallel-train-enabled", action="store_true", default=True)
     parser.add_argument("--parallel-train-min-interval-s", type=float, default=3.0)
+    parser.add_argument("--parallel-train", dest="parallel_train_enabled", action="store_true")
+    parser.add_argument("--no-parallel-train", dest="parallel_train_enabled", action="store_false")
+    parser.set_defaults(parallel_train_enabled=True)
+    parser.add_argument("--pretrain-relax-level", type=float, default=0.0)
+    parser.add_argument("--max-repair-rounds", type=int, default=getattr(camo, "MAX_REPAIR_ROUNDS", 3))
+    parser.add_argument("--disable-anti-pixel", action="store_true")
+
     args = parser.parse_args()
     return MLDLConfig(
         target_count=args.target_count,
@@ -1176,6 +1229,9 @@ def parse_args() -> MLDLConfig:
         random_seed=args.random_seed,
         parallel_train_enabled=bool(args.parallel_train_enabled),
         parallel_train_min_interval_s=float(args.parallel_train_min_interval_s),
+        pretrain_relax_level=float(args.pretrain_relax_level),
+        max_repair_rounds=int(args.max_repair_rounds),
+        anti_pixel=not bool(args.disable_anti_pixel),
     )
 
 
@@ -1194,14 +1250,17 @@ def build_config_from_main_args(args: Any) -> MLDLConfig:
         base_seed=int(getattr(args, "base_seed", camo.DEFAULT_BASE_SEED)),
         output_dir=str(getattr(args, "output_dir", "camouflages_ml_dl")),
         alpha_ucb=float(getattr(args, "mldl_alpha_ucb", 1.25)),
-        min_train_size=int(getattr(args, "mldl_min_train_size", 32)),
-        retrain_every=int(getattr(args, "mldl_retrain_every", 24)),
+        min_train_size=int(getattr(args, "mldl_min_train_size", 12)),
+        retrain_every=int(getattr(args, "mldl_retrain_every", 8)),
         val_split=float(getattr(args, "mldl_val_split", 0.15)),
         early_stopping_patience=int(getattr(args, "mldl_early_stopping_patience", 6)),
         early_stopping_min_delta=float(getattr(args, "mldl_early_stopping_min_delta", 1e-4)),
         random_seed=int(getattr(args, "random_seed", 12345)),
         parallel_train_enabled=bool(getattr(args, "mldl_parallel_train_enabled", True)),
         parallel_train_min_interval_s=float(getattr(args, "mldl_parallel_train_min_interval_s", 3.0)),
+        pretrain_relax_level=float(getattr(args, "mldl_pretrain_relax_level", 0.0)),
+        max_repair_rounds=int(getattr(args, "mldl_max_repair_rounds", getattr(camo, "MAX_REPAIR_ROUNDS", 3))),
+        anti_pixel=bool(getattr(args, "mldl_anti_pixel", getattr(camo, "DEFAULT_ENABLE_ANTI_PIXEL", True))),
     )
 
 
@@ -1215,13 +1274,15 @@ def run_guided_generation(config: MLDLConfig) -> Tuple[List[Dict[str, object]], 
 
     runner = CamouflageMLDLGenerator(config)
     rows = runner.generate()
+
     summary_path = Path(config.output_dir) / "run_summary_ml_dl.json"
-    summary = {}
+    summary: Dict[str, Any] = {}
     if summary_path.exists():
         try:
             summary = json.loads(summary_path.read_text(encoding="utf-8"))
         except Exception:
             summary = {}
+
     summary.setdefault("target_count", config.target_count)
     summary.setdefault("total_attempts", runner.total_attempts)
     summary.setdefault("output_dir", str(Path(config.output_dir).resolve()))
