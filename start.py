@@ -3411,11 +3411,60 @@ class CamouflageApp(App):
         self.current_report_name = str(cfg.report_name)
         self.mldl_last_stats = None
 
-        def _buffer_len() -> int:
+        def _expected_mldl_feature_dim() -> int:
             try:
-                return int(len(getattr(getattr(runner, "buffer", None), "features", []) or []))
+                return int(len(getattr(camo_mldl, 'FEATURE_KEYS', ())) + len(getattr(camo_mldl, 'PROJECTION_FEATURE_KEYS', ())))
             except Exception:
                 return 0
+
+        def _normalize_mldl_feature_row(row: Any) -> np.ndarray:
+            dim = _expected_mldl_feature_dim()
+            arr = np.asarray(row, dtype=np.float32).reshape(-1)
+            if dim <= 0:
+                return arr.astype(np.float32, copy=True)
+            if arr.size == dim:
+                return arr.astype(np.float32, copy=True)
+            if arr.size > dim:
+                return arr[:dim].astype(np.float32, copy=True)
+            out = np.zeros((dim,), dtype=np.float32)
+            out[:arr.size] = arr
+            return out
+
+        def _normalize_runner_buffer(force_save: bool = False) -> int:
+            try:
+                buffer_obj = getattr(runner, 'buffer', None)
+                if buffer_obj is None:
+                    return 0
+                normalize = getattr(buffer_obj, 'normalize_in_place', None)
+                if callable(normalize):
+                    normalize()
+                else:
+                    features = list(getattr(buffer_obj, 'features', []) or [])
+                    valid = list(getattr(buffer_obj, 'valid', []) or [])
+                    rewards = list(getattr(buffer_obj, 'rewards', []) or [])
+                    features = [_normalize_mldl_feature_row(row) for row in features]
+                    n = len(features)
+                    if len(valid) < n:
+                        valid.extend([0.0] * (n - len(valid)))
+                    if len(rewards) < n:
+                        rewards.extend([0.0] * (n - len(rewards)))
+                    buffer_obj.features = features
+                    buffer_obj.valid = [float(v) for v in valid[:n]]
+                    buffer_obj.rewards = [float(v) for v in rewards[:n]]
+                if force_save:
+                    try:
+                        getattr(buffer_obj, 'save')(self.current_output_dir / getattr(cfg, 'dataset_name', 'dataset_camouflage_ml_dl.npz'))
+                    except Exception as exc:
+                        self.log(f'Persist dataset ML/DL impossible : {exc}')
+                return int(len(getattr(buffer_obj, 'features', []) or []))
+            except Exception as exc:
+                self.log(f'Normalisation dataset ML/DL impossible : {exc}')
+                return 0
+
+        _normalize_runner_buffer(force_save=False)
+
+        def _buffer_len() -> int:
+            return _normalize_runner_buffer(force_save=False)
 
         async def _refresh_mldl_runtime_state() -> None:
             dataset_samples = _buffer_len()
@@ -3440,10 +3489,7 @@ class CamouflageApp(App):
             every = max(1, int(getattr(cfg, "warmup_persist_every", 8) or 8))
             if sample_count <= 0 or (sample_count % every != 0):
                 return
-            try:
-                getattr(runner, "buffer").save(self.current_output_dir / getattr(cfg, "dataset_name", "dataset_camouflage_ml_dl.npz"))
-            except Exception as exc:
-                self.log(f"Persist dataset ML/DL impossible : {exc}")
+            _normalize_runner_buffer(force_save=True)
 
         existing_samples = _buffer_len()
         await _refresh_mldl_runtime_state()
@@ -3644,7 +3690,7 @@ class CamouflageApp(App):
                             projection_stats,
                             float(getattr(cfg, "projection_reward_weight", 0.65)),
                         )
-                        dataset_samples = _buffer_len()
+                        dataset_samples = _normalize_runner_buffer(force_save=False)
                         _persist_buffer_if_needed(dataset_samples)
 
                         if dataset_samples >= int(getattr(cfg, "min_train_size", 32) or 32) and not bool(getattr(runner.surrogate, "trained", False)):

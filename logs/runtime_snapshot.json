@@ -22,5 +22,12 @@
       "validate_top_k": 3,
       "warmup_in_background": true
     }
+  },
+  {
+    "ts": 1776769413.9253528,
+    "level": "INFO",
+    "source": "start",
+    "message": "Arrêt de l'interface Kivy",
+    "payload": {}
   }
 ]
