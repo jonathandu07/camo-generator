@@ -3519,18 +3519,42 @@ class CamouflageApp(App):
 
                     action_indexes = runner._select_action_indexes(current_analysis)
                     proposals: List[Any] = []
+                    projection_ml_enabled = bool(getattr(cfg, "projection_ml_enabled", True))
+                    projection_available = bool(getattr(camo_mldl, "PROJECTION_AVAILABLE", False))
+                    projection_base_scale = float(getattr(cfg, "projection_base_scale", 1.0))
+
                     for offset, action_idx in enumerate(action_indexes, start=0):
                         action_name, action = camo_mldl.ACTION_LIBRARY[action_idx]
                         base_seed = camo.build_seed(target_index, local_attempt + offset, cfg.base_seed)
                         seed = camo_mldl.propose_seed(base_seed, action)
                         candidate = await asyncio.to_thread(camo.generate_candidate_from_seed, seed, self.anti_pixel)
+
+                        projection_stats = None
+                        if projection_ml_enabled and projection_available:
+                            try:
+                                chooser = getattr(runner, "_choose_projection_for_candidate", None)
+                                if callable(chooser):
+                                    projection_stats = chooser(candidate)
+                                else:
+                                    projection_stats = await asyncio.to_thread(
+                                        camo_mldl.evaluate_projection,
+                                        candidate,
+                                        projection_base_scale,
+                                        "fast",
+                                    )
+                            except Exception:
+                                projection_stats = getattr(camo_mldl, "ProjectionStats")(scale=projection_base_scale, valid=False)
+
                         if runner.surrogate.trained:
-                            pred_valid, pred_reward = runner.surrogate.predict(camo_mldl.candidate_to_feature_vector(candidate))
+                            pred_valid, pred_reward = runner.surrogate.predict(
+                                camo_mldl.candidate_to_feature_vector(candidate, projection_stats=projection_stats)
+                            )
                             pred_valid_f = float(pred_valid[0])
                             pred_reward_f = float(pred_reward[0])
                         else:
                             pred_valid_f = 0.5
                             pred_reward_f = 0.0
+
                         proposals.append(camo_mldl.Proposal(
                             seed=int(seed),
                             action_idx=int(action_idx),
@@ -3538,6 +3562,8 @@ class CamouflageApp(App):
                             candidate=candidate,
                             pred_valid=pred_valid_f,
                             pred_reward=pred_reward_f,
+                            projection_scale=float(getattr(projection_stats, "scale", projection_base_scale)),
+                            projection_stats=projection_stats,
                         ))
                     proposals.sort(key=lambda p: (p.pred_valid, p.pred_reward), reverse=True)
 
@@ -3572,7 +3598,29 @@ class CamouflageApp(App):
                         total_attempts = int(runner.total_attempts)
                         self.total_attempts = total_attempts
 
-                        valid = bool(getattr(outcome, "accepted", False))
+                        backend_valid = bool(getattr(outcome, "accepted", False))
+                        projection_stats = getattr(proposal, "projection_stats", None)
+                        if projection_ml_enabled and projection_available:
+                            try:
+                                refiner = getattr(runner, "_final_projection_refine", None)
+                                if callable(refiner):
+                                    projection_stats = refiner(candidate, projection_stats)
+                                else:
+                                    projection_stats = await asyncio.to_thread(
+                                        camo_mldl.evaluate_projection,
+                                        candidate,
+                                        float(getattr(projection_stats, "scale", projection_base_scale)),
+                                        "quality" if backend_valid else "fast",
+                                    )
+                            except Exception:
+                                projection_stats = getattr(camo_mldl, "ProjectionStats")(
+                                    scale=float(getattr(proposal, "projection_scale", projection_base_scale)),
+                                    valid=False,
+                                )
+
+                        projection_valid = bool(getattr(projection_stats, "valid", False)) if (projection_ml_enabled and projection_available) else True
+                        valid = bool(backend_valid and projection_valid)
+
                         self._update_dynamic_tolerance_profile(
                             valid,
                             total_attempts,
@@ -3590,7 +3638,12 @@ class CamouflageApp(App):
                         self.tolerance_profile = getattr(runner, "tolerance_profile", self.tolerance_profile)
                         scores = extract_backend_scores(candidate.ratios, candidate.metrics, outcome)
 
-                        reward = runner.buffer.add(candidate, valid)
+                        reward = runner.buffer.add(
+                            candidate,
+                            valid,
+                            projection_stats,
+                            float(getattr(cfg, "projection_reward_weight", 0.65)),
+                        )
                         dataset_samples = _buffer_len()
                         _persist_buffer_if_needed(dataset_samples)
 
@@ -3679,8 +3732,11 @@ class CamouflageApp(App):
                         )
 
                         if valid:
-                            context = camo_mldl.build_context_vector(candidate, None)
+                            context = camo_mldl.build_context_vector(candidate, None, projection_stats=projection_stats)
                             runner.bandit.update(proposal.action_idx, context, reward)
+                            runner.last_projection_stats = projection_stats
+                            proposal.projection_stats = projection_stats
+                            proposal.projection_scale = float(getattr(projection_stats, "scale", getattr(proposal, "projection_scale", projection_base_scale)))
                             accepted_payload = (proposal, candidate, outcome, projection_img, scores)
                             self.update_live_stage("accepté ML/DL", target_index, local_attempt + rank - 1, proposal.seed, metrics_text=metrics_text, pil_img=projection_img)
                             break
@@ -3694,10 +3750,13 @@ class CamouflageApp(App):
                         if reward > best_reward:
                             best_reward = reward
                             best_analysis = analysis
-                        context = camo_mldl.build_context_vector(candidate, analysis)
+                        context = camo_mldl.build_context_vector(candidate, analysis, projection_stats=projection_stats)
                         runner.bandit.update(proposal.action_idx, context, reward)
                         runner.last_rejected_candidate = candidate
                         runner.last_analysis = analysis
+                        runner.last_projection_stats = projection_stats
+                        proposal.projection_stats = projection_stats
+                        proposal.projection_scale = float(getattr(projection_stats, "scale", getattr(proposal, "projection_scale", projection_base_scale)))
 
                         review = PendingManualReview(
                             target_index=target_index,
