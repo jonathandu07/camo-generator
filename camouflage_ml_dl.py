@@ -773,8 +773,39 @@ class ExperienceBuffer:
         self.valid: List[float] = []
         self.rewards: List[float] = []
 
+    @staticmethod
+    def expected_dim() -> int:
+        return int(len(FEATURE_KEYS) + len(PROJECTION_FEATURE_KEYS))
+
+    @classmethod
+    def _normalize_feature_row(cls, row: Any) -> np.ndarray:
+        dim = cls.expected_dim()
+        arr = np.asarray(row, dtype=np.float32).reshape(-1)
+        if arr.size == dim:
+            return arr.astype(np.float32, copy=True)
+        if arr.size > dim:
+            return arr[:dim].astype(np.float32, copy=True)
+        out = np.zeros((dim,), dtype=np.float32)
+        out[:arr.size] = arr
+        return out
+
+    def normalize_in_place(self) -> None:
+        dim = self.expected_dim()
+        self.features = [self._normalize_feature_row(row) for row in self.features]
+        n = len(self.features)
+        if len(self.valid) < n:
+            self.valid.extend([0.0] * (n - len(self.valid)))
+        if len(self.rewards) < n:
+            self.rewards.extend([0.0] * (n - len(self.rewards)))
+        self.valid = [float(v) for v in self.valid[:n]]
+        self.rewards = [float(v) for v in self.rewards[:n]]
+        if n == 0:
+            self.features = []
+            self.valid = []
+            self.rewards = []
+
     def add(self, candidate: Any, accepted: bool, projection_stats: Optional[ProjectionStats], projection_weight: float) -> float:
-        feat = candidate_to_feature_vector(candidate, projection_stats=projection_stats)
+        feat = self._normalize_feature_row(candidate_to_feature_vector(candidate, projection_stats=projection_stats))
         reward = combined_reward(candidate, accepted, projection_stats, projection_weight)
         self.features.append(feat)
         self.valid.append(float(1.0 if accepted else 0.0))
@@ -782,7 +813,8 @@ class ExperienceBuffer:
         return reward
 
     def as_arrays(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        dim = len(FEATURE_KEYS) + len(PROJECTION_FEATURE_KEYS)
+        self.normalize_in_place()
+        dim = self.expected_dim()
         x = np.stack(self.features, axis=0).astype(np.float32) if self.features else np.zeros((0, dim), dtype=np.float32)
         y_valid = np.array(self.valid, dtype=np.float32)
         y_reward = np.array(self.rewards, dtype=np.float32)
@@ -798,11 +830,19 @@ class ExperienceBuffer:
             return
         data = np.load(path, allow_pickle=False)
         x = np.asarray(data["x"], dtype=np.float32)
-        y_valid = np.asarray(data["y_valid"], dtype=np.float32)
-        y_reward = np.asarray(data["y_reward"], dtype=np.float32)
-        self.features = [row.astype(np.float32, copy=True) for row in x]
-        self.valid = [float(v) for v in y_valid.tolist()]
-        self.rewards = [float(v) for v in y_reward.tolist()]
+        y_valid = np.asarray(data["y_valid"], dtype=np.float32).reshape(-1)
+        y_reward = np.asarray(data["y_reward"], dtype=np.float32).reshape(-1)
+
+        if x.ndim == 1:
+            x = x.reshape(1, -1)
+        elif x.ndim == 0:
+            x = np.zeros((0, self.expected_dim()), dtype=np.float32)
+
+        self.features = [self._normalize_feature_row(row) for row in x]
+        n = len(self.features)
+        self.valid = [float(v) for v in y_valid[:n].tolist()]
+        self.rewards = [float(v) for v in y_reward[:n].tolist()]
+        self.normalize_in_place()
 
 
 # ============================================================
